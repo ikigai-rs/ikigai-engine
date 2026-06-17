@@ -1,6 +1,6 @@
 [package]
-name = "transport-core"
-description = "The Backend seam the REPL drives — a local or remote kernel — plus shared wire types."
+name = "ikigai-resolve"
+description = "The Resolver seam the ikigai REPL engine drives: issue a request against a kernel — local or remote — and report how the cache served it."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,4 +11,3 @@ repository.workspace = true
 ikigai-core = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
-postcard = { workspace = true }
