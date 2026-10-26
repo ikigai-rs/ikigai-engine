@@ -1,0 +1,43 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # never cancel main
+jobs:
+  ci:
+    uses: ikigai-rs/.github/.github/workflows/rust.yml@main
+    with:
+      # `--all-features` reaches the engine's `plan-reader` (the stored-plan reader, its
+      # Turtle stack and the plan conformance test), which is OFF by default; without it
+      # nothing here lints or tests the reader.
+      features: "*"
+      # `ikigai-engine` is documented as compiling to wasm32 (ikigai-web-demo runs the
+      # kernel in a browser). It does not hold for the whole workspace (`ikigai-intray` is
+      # native-only: notify, std::fs, oxigraph), so the job is scoped to the one member that
+      # claims it, under its DEFAULT features: the plan reader's Turtle stack pulls
+      # getrandom, which does not build for wasm32, and that is exactly why it is behind
+      # `plan-reader` rather than unconditional. ikigai-resolve comes along as its dependency.
+      wasm-lib: true
+      wasm-packages: "ikigai-engine"
+      # No `macos`: nothing in these crates is gated on macOS (the platform gates are
+      # `cfg(unix)` / `cfg(windows)`, which the Linux job and the Windows job below cover).
+  # The ecosystem's one rule for a request-derived name joined under a directory
+  # (`ikigai_resolve::is_plain_file_name`, ledger #1307) is the WINDOWS rule applied on every
+  # platform, and its premise (`Path::join("C:x")` REPLACES the base) only holds on Windows.
+  # This job is where that premise is observed rather than cited: the resolve crate's
+  # file-name tests, including the `cfg(windows)` one, on a Windows runner. Scoped to that
+  # one crate's lib tests on purpose: ikigai-resolve needs only ikigai-core, so this stays
+  # cheap. The `home` filter adds the shared `~` rule's tests (ledger #1379), whose `~\x` case
+  # differs by platform. No `--locked`: this workspace commits no lockfile (it publishes
+  # libraries), so the job resolves what every other job here resolves.
+  # ⚠ Inline cargo beside the shared caller: ci-drift reads this repo as `caller+inline`.
+  windows-file-names:
+    name: file-name rule (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ikigai-resolve --lib -- file_name home

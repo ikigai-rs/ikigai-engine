@@ -1,0 +1,78 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# ikigai-resolve, ikigai-engine and ikigai-intray left the ikigai-cli workspace with their
+# history (ledger #2316). They released there in lockstep with the `ikigai` binary, and that
+# made a cycle at the REPO level: the cli links modules whose tests dev-depend on these
+# crates, so no order of publishes could move the ecosystem to a new core. Between the
+# CRATES there is no cycle, and none of the three depends on a module the cli embeds.
+#
+# The three still release together, at one version: engine and intray take resolve by path
+# AND version, and intray's tests take the engine the same way.
+[workspace.package]
+# 0.1.70 is the first release from this repository: the next number after cli's lockstep
+# 0.1.69, and new, since engine and intray changed after `ikigai-cli-v0.1.69` (the
+# `run <spec>` → `execute <spec>` rename, ikigai-rs/ikigai-cli#585, ledger #104; intray's
+# reencoded settled stages, a file mode and the tuple id on decode, ikigai-rs/ikigai-cli#579,
+# ledger #2126).
+version = "0.1.70"
+edition = "2021"
+# Measured 2026-10-26, not assumed: 1.89 is the first toolchain that builds the workspace.
+# `ikigai-intray` takes the lease with `std::fs::File::try_lock` (stable in 1.89; 1.88 refuses
+# it as the unstable `file_lock`), and below that `encoding_rs` 0.8.42 requires 1.88.
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+authors = ["Brian Sletten <brian.sletten@gmail.com>"]
+repository = "https://github.com/ikigai-rs/ikigai-engine"
+homepage = "https://github.com/ikigai-rs/ikigai-engine"
+
+# Every external entry below is the same requirement ikigai-cli's root declares (copied at
+# ikigai-cli 94e0a73, 2026-10-26), so the crates resolve here what they resolved there. The
+# move to core 0.2.0 is a later wave of the re-pin sweep (ledger #2261), not this repo's first
+# commit. cli's root carries the full history of each floor; the comments here keep the part
+# that binds THESE crates.
+[workspace.dependencies]
+# 0.1.108 = the failure classes (ledger #1546): `FailureClass`, `Error::class()`, the
+# `RetryAfter` / `OverBudget` / `Refused` / `Unsupported` variants, `ActionSpec::fails` and the
+# run context (`IssueContext`, `Kernel::issue_with_context`). An API floor for `ikigai-resolve`.
+# Beneath it, each still binding here:
+# - 0.1.107: the cache-status probe (`Kernel::is_cached`) keys a served name without resolving
+#   it; `ikigai-resolve`'s `the_cache_probe_asks_a_mounts_peer_once_per_resolver_read` pins it.
+# - 0.1.106: the ArgSpec shape (ledger #1547). The engine routes by `pipe_slots` /
+#   `excluded_by_groups` and joins repeats with `join_repeats`.
+# - 0.1.89: `space_iri` / `SPACE_PREFIX`, which `plan_space::space()` names itself with.
+# - 0.1.87: `urn:kernel:explain` and `urn:kernel:dependents`; the engine's `explain`, `why` and
+#   `dependents` are thin views over them, and its tests source both.
+# - 0.1.75: the temporal corridor (`Scope::with_named_at`), which `as-of=` injects per request.
+# - 0.1.64: `Resolved.canonical` (no default in a struct literal, so a hard floor).
+# - 0.1.60: `Spawner::width()`, which the engine's fan-out routing reads; the method is
+#   defaulted, so an older core compiles and silently answers width 1.
+# ⚠ `^0.1.108` is also a ceiling below 0.2.0.
+ikigai-core = "0.1.108"
+# Raised with core, in lockstep. 0.1.70 is the first version carrying the PROCESS vocabulary
+# (`ik:Process`/`ik:Step`/`ik:Argument`/`ik:Fork`, the plan shapes in `SHAPES`, and the
+# `ikigai_vocab::plan` IRI builders) that the engine's `plan.rs` renders and reads; the tests
+# validate against the vocabulary the resolve picks. ⚠ `^0.1.108` is also a ceiling below 0.2.0.
+ikigai-vocab = "0.1.108"
+# Dev-dependency of the engine (its end-to-end tests mount the real file module). 0.1.8 is a
+# SECURITY floor (audit round 3, ledger #856): the jail authorizes the file it actually opens.
+ikigai-fs = "0.1.8"
+# Dev-dependency of the engine: every rendered `ik:Process` graph is validated against the
+# published shapes. Default features stay on, so the validator is rudof, as on a cli host.
+# 0.3.4 is a SECURITY floor (ledger #1326) and 0.3.6 is cli's pin. `"0.3.6"` is `<0.4.0`.
+ikigai-shacl = "0.3.6"
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.70" }
+futures = "0.3"
+# Turtle parsing for the engine's plan face, reading a stored `ik:Process` graph back.
+# Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins
+# `oxrdf = "=0.3.4"` and re-exports none of its types, so the oxrdf pin is that version
+# exactly: a looser one would resolve a second oxrdf that oxttl's triples are not from.
+oxttl = "0.2.4"
+oxrdf = "0.3.4"
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` makes `serde_json::Map` keep insertion order. In ikigai-cli it keeps a
+# declared contract's inputs in their authored order wherever this workspace's JSON reaches a
+# person or an agent; it is kept here so these crates build with the same `serde_json` the cli
+# links, and their tests see the order the host produces.
+serde_json = { version = "1", features = ["preserve_order"] }

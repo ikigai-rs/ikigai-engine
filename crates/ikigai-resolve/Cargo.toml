@@ -3,6 +3,7 @@ name = "ikigai-resolve"
 description = "The Resolver seam the ikigai REPL engine drives: issue a request against a kernel — local or remote — and report how the cache served it."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -3,6 +3,7 @@ name = "ikigai-intray"
 description = "The intray as a tuplespace: urn:space:{name} — Sink drops a tuple (out), Source lists/reads/filters (rd), Delete atomically takes one (in), associative match via SPARQL ASK. A physical, capability-gated space; later slices add the reactive engine and encrypt-on-drop."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -75,5 +76,5 @@ oxigraph = { version = "0.5", features = ["http-client", "rdf-12"] }
 # engine's write path, and a hand-built request would only restate what we believe it sends.
 # serde_json renders the Meta the engine reads to route named arguments (without a JSON Meta
 # renderer the engine fails open and a routing defect is invisible — field guide).
-ikigai-engine = { path = "../ikigai-engine", version = "0.1.69" }
+ikigai-engine = { path = "../ikigai-engine", version = "0.1.70" }
 serde_json = { workspace = true }

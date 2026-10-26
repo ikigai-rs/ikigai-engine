@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+.DS_Store
+.cargo/config.toml
+
+# editor backup / undo artifacts
+*~
+*.swp
+*.swo
+*~undo-tree~
+\#*\#
+.\#*
+
+# Claude Code session state — local to a machine, never shared
+.claude/settings.local.json
+.claude/worktrees/
+
+# A library workspace: no lockfile, so CI resolves what a fresh `cargo add` would.
+Cargo.lock
