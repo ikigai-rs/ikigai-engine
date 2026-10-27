@@ -57,10 +57,12 @@ spargebra = { version = "0.4", features = ["sep-0006"] }
 # a GRAPH block and three planner-erasable wrappers hid join operands from `check_query`'s MAX_JOIN_OPERANDS,
 # so an in-bounds `match=` could plan uncancellably for minutes, and the overdue cap now reserves its slot
 # at start. A real FILTER closing a group now counts that group into the enclosing join. No signature changed.
-ikigai-store = "0.2.21"
+# 0.3.0 is the newest release and the one on core 0.2 (ledger #2349); it carries every floor above.
+ikigai-store = "0.3.0"
 # 0.2.1 first exports check_turtle_nesting and MAX_TURTLE_NESTING.
 # The host already resolves 0.2.6; intray needs only this API floor.
-ikigai-rdf = "0.2.1"
+# 0.3.0 is the newest release and the one on core 0.2 (ledger #2349), the line ikigai-store 0.3 takes.
+ikigai-rdf = "0.3.0"
 
 [dev-dependencies]
 futures = { workspace = true }
@@ -76,5 +78,5 @@ oxigraph = { version = "0.5", features = ["http-client", "rdf-12"] }
 # engine's write path, and a hand-built request would only restate what we believe it sends.
 # serde_json renders the Meta the engine reads to route named arguments (without a JSON Meta
 # renderer the engine fails open and a routing defect is invisible — field guide).
-ikigai-engine = { path = "../ikigai-engine", version = "0.1.70" }
+ikigai-engine = { path = "../ikigai-engine", version = "0.2.0" }
 serde_json = { workspace = true }
