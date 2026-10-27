@@ -1160,8 +1160,16 @@ impl Engine {
         prov: Provenance,
     ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
         Box::pin(async move {
-            let mut staged = self.run_node(&pipeline.first, incoming, prov).await?;
-            for step in &pipeline.rest {
+            let mut rest = pipeline.rest.iter();
+            let mut staged = match self.pipe_by_reference(pipeline, incoming).await? {
+                // The first two stages ran as one request: carry on after the second.
+                Some(staged) => {
+                    rest.next();
+                    staged
+                }
+                None => self.run_node(&pipeline.first, incoming, prov).await?,
+            };
+            for step in rest {
                 // Each `|` hands the prior stage's provenance down as the next stage's
                 // upstream, so cacheability flows along the pipe; `..` does the same per
                 // mapped item.
@@ -1175,6 +1183,74 @@ impl Engine {
             }
             Ok(staged)
         })
+    }
+
+    /// `source <iri> | <stage> …` with the upstream handed on **by reference** (ledger #2286),
+    /// when the second stage reads its `content` as a body: it is issued with
+    /// `content=<iri>` and reads the upstream's body through `content_body` as far as it
+    /// wants, so a one-shot producer is polled only that far and nothing is collected
+    /// between the two. `None` leaves the line to the by-value pipe, which every other line
+    /// keeps.
+    ///
+    /// Taken only where the two are the same resolution, so the answer is the by-value
+    /// pipe's:
+    ///
+    /// - The upstream is a bare `source <iri>` at the top of the line: no argument, nothing
+    ///   piped in, and no batch stdin that could become its value (the `-c` stdin rules
+    ///   stay as they were). A request with arguments has no name to refer to it by.
+    /// - The stage declares itself an **incremental transreptor**
+    ///   ([`Transreption::incremental`](ikigai_core::Transreption::incremental)), core's one
+    ///   declared promise that an endpoint reads `content` with `content_body` rather than
+    ///   as inline bytes (a stage that reads `inline_arg` would refuse a reference), and the
+    ///   pipe routes to `content`.
+    ///
+    /// The kernel records the reference as the stage's dependency, so its cacheability is
+    /// no greater than the upstream's, as the by-value pipe's folded provenance made it;
+    /// the read is a sub-request under the session capability, in the line's chain.
+    async fn pipe_by_reference(
+        &self,
+        pipeline: &Pipeline,
+        incoming: Option<&[u8]>,
+    ) -> Result<Option<Staged>, String> {
+        if incoming.is_some() || self.stdin_may_offer() {
+            return Ok(None);
+        }
+        let (Node::Source(first), Some(step)) = (&pipeline.first, pipeline.rest.first()) else {
+            return Ok(None);
+        };
+        let ([upstream], Connector::Pipe, Node::Source(words)) =
+            (first.as_slice(), step.connector, &step.node)
+        else {
+            return Ok(None);
+        };
+        let Some((target, args)) = words.split_first() else {
+            return Ok(None);
+        };
+        // A bad name is reported by the by-value path, in the words it always used.
+        let (Ok(upstream), Ok(iri)) = (parse_target(upstream), parse_target(target)) else {
+            return Ok(None);
+        };
+        // Without the note `describe_struct` records: a contract this probe could not read
+        // is noted by the by-value path that then routes without it, exactly as before.
+        let incremental = self
+            .fetch_contract(&iri)
+            .await
+            .ok()
+            .and_then(|description| description.transreption().map(|t| t.is_incremental()))
+            .unwrap_or(false);
+        if !incremental || args.iter().any(|arg| arg.starts_with("content=")) {
+            return Ok(None);
+        }
+        // Route as the by-value pipe would, with an empty placeholder for the piped value:
+        // when it lands on `content`, the upstream's name takes its place.
+        let request = self.source_request(target, args, Some(&[])).await?;
+        if !matches!(request.args.get("content"), Some(ArgRef::Inline(value)) if value.is_empty()) {
+            return Ok(None);
+        }
+        let request = request.with_arg("content", ArgRef::Reference(upstream));
+        self.run_staged(request, Some(root_provenance()))
+            .await
+            .map(Some)
     }
 
     /// Run one stage. A `Source` is a `source` request; a `Fork` fans `incoming`
