@@ -34,7 +34,8 @@ oxrdf = { workspace = true, optional = true }
 # version is the root's and `ikigai-intray`'s so the pins cannot resolve apart. No features:
 # `persistent` (RocksDB) is the host's, and nothing here opens a store. Optional with the
 # reader, so a wasm build (plan-reader off) does not get oxigraph.
-ikigai-store = { version = "0.2.21", optional = true }
+# 0.3.0 is the newest release and the one on core 0.2 (ledger #2349); it carries every 0.2 floor.
+ikigai-store = { version = "0.3.0", optional = true }
 # Only for the `RdfFormat` that scan takes (the store re-exports none of oxigraph's io types),
 # so it is the store's own oxigraph line. Without default features: the default is RocksDB.
 oxigraph = { version = "0.5", default-features = false, optional = true }
@@ -79,5 +80,7 @@ serde_json = { workspace = true }
 # ⚠ `^0.9.1` is also a ceiling below 0.10.0.
 # 0.10.0 (ledger #1546): the FAILURES check (declared failure classes = produced, core 0.1.108's
 # `ActionSpec::fails` over `Error::class()`), opt-in through `Suite::check_failures()` in 0.10 and the
-# default from 0.11.0; `Suite::fails_under` probes. ⚠ `^0.10.0` is also a ceiling below 0.11.0.
-ikigai-conformance = "0.10.0"
+# default from 0.11.0; `Suite::fails_under` probes.
+# 0.11.0 (ledger #2349): the release on core 0.2.0, required by the re-pin (0.10 links core 0.1).
+# FAILURES and DATATYPES run by default. ⚠ `^0.11.0` is also a ceiling below 0.12.0.
+ikigai-conformance = "0.11.0"

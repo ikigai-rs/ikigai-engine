@@ -16,7 +16,9 @@ members = ["crates/*"]
 # `run <spec>` → `execute <spec>` rename, ikigai-rs/ikigai-cli#585, ledger #104; intray's
 # reencoded settled stages, a file mode and the tuple id on decode, ikigai-rs/ikigai-cli#579,
 # ledger #2126).
-version = "0.1.70"
+# 0.2.0 (ledger #2349): the re-pin onto ikigai-core 0.2.0. Core's types are in all three
+# crates' APIs, so linking a new core is a breaking change for their consumers: the next minor.
+version = "0.2.0"
 edition = "2021"
 # Measured 2026-10-26, not assumed: 1.89 is the first toolchain that builds the workspace.
 # `ikigai-intray` takes the lease with `std::fs::File::try_lock` (stable in 1.89; 1.88 refuses
@@ -28,11 +30,15 @@ repository = "https://github.com/ikigai-rs/ikigai-engine"
 homepage = "https://github.com/ikigai-rs/ikigai-engine"
 
 # Every external entry below is the same requirement ikigai-cli's root declares (copied at
-# ikigai-cli 94e0a73, 2026-10-26), so the crates resolve here what they resolved there. The
-# move to core 0.2.0 is a later wave of the re-pin sweep (ledger #2261), not this repo's first
-# commit. cli's root carries the full history of each floor; the comments here keep the part
-# that binds THESE crates.
+# ikigai-cli 94e0a73, 2026-10-26), so the crates resolve here what they resolved there, until
+# the core 0.2.0 re-pin sweep (ledger #2261, wave 4, ledger #2349) moved the ikigai entries on.
+# cli's root carries the full history of each floor; the comments here keep the part that binds
+# THESE crates.
 [workspace.dependencies]
+# 0.2.0 is the streams release (ledger #2261), taken by the re-pin sweep (wave 4, ledger #2349).
+# The old pin, "0.1.108", meant <0.2.0 under 0.x rules, so a crate on it could not share a core
+# with an ecosystem on 0.2. Every floor below was reached on 0.1 and 0.2.0 carries them all.
+# `ikigai-fs` 0.2.2 requires ^0.2.1, so the workspace resolves 0.2.1.
 # 0.1.108 = the failure classes (ledger #1546): `FailureClass`, `Error::class()`, the
 # `RetryAfter` / `OverBudget` / `Refused` / `Unsupported` variants, `ActionSpec::fails` and the
 # run context (`IssueContext`, `Kernel::issue_with_context`). An API floor for `ikigai-resolve`.
@@ -48,21 +54,25 @@ homepage = "https://github.com/ikigai-rs/ikigai-engine"
 # - 0.1.64: `Resolved.canonical` (no default in a struct literal, so a hard floor).
 # - 0.1.60: `Spawner::width()`, which the engine's fan-out routing reads; the method is
 #   defaulted, so an older core compiles and silently answers width 1.
-# ⚠ `^0.1.108` is also a ceiling below 0.2.0.
-ikigai-core = "0.1.108"
+# ⚠ `^0.2.0` is also a ceiling below 0.3.0.
+ikigai-core = "0.2.0"
 # Raised with core, in lockstep. 0.1.70 is the first version carrying the PROCESS vocabulary
 # (`ik:Process`/`ik:Step`/`ik:Argument`/`ik:Fork`, the plan shapes in `SHAPES`, and the
 # `ikigai_vocab::plan` IRI builders) that the engine's `plan.rs` renders and reads; the tests
-# validate against the vocabulary the resolve picks. ⚠ `^0.1.108` is also a ceiling below 0.2.0.
-ikigai-vocab = "0.1.108"
+# validate against the vocabulary the resolve picks.
+# 0.2.0 is the streams release (ledger #2261), in lockstep with core; the old "0.1.108" pin
+# meant <0.2.0 under 0.x rules. ⚠ `^0.2.0` is also a ceiling below 0.3.0.
+ikigai-vocab = "0.2.0"
 # Dev-dependency of the engine (its end-to-end tests mount the real file module). 0.1.8 is a
 # SECURITY floor (audit round 3, ledger #856): the jail authorizes the file it actually opens.
-ikigai-fs = "0.1.8"
+# 0.2.2 is the newest release and the one on core 0.2 (ledger #2349); it carries that floor.
+ikigai-fs = "0.2.2"
 # Dev-dependency of the engine: every rendered `ik:Process` graph is validated against the
 # published shapes. Default features stay on, so the validator is rudof, as on a cli host.
-# 0.3.4 is a SECURITY floor (ledger #1326) and 0.3.6 is cli's pin. `"0.3.6"` is `<0.4.0`.
-ikigai-shacl = "0.3.6"
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.70" }
+# 0.3.4 is a SECURITY floor (ledger #1326) and 0.3.6 was cli's pin. 0.5.0 is the newest
+# release and the one on core 0.2 (ledger #2349). `"0.5.0"` is `<0.6.0`.
+ikigai-shacl = "0.5.0"
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.2.0" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face, reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins
