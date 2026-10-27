@@ -61,6 +61,9 @@ default = []
 plan-reader = ["dep:oxttl", "dep:oxrdf", "dep:ikigai-store", "dep:oxigraph"]
 
 [dev-dependencies]
+# The pipe tests' counting producer overrides `Endpoint::invoke_body`, an `async_trait`
+# method; core's own trait is declared with it, so this adds nothing to the graph.
+async-trait = "0.1"
 # End-to-end `sink`/`source`/`cap` tests mount the real file module.
 ikigai-fs = { workspace = true }
 # The plan round-trip validates every rendered `ik:Process` graph against the published

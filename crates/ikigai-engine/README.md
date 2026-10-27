@@ -35,6 +35,12 @@ its own crate for the browser build to reuse unchanged.
 
   `compose` (`$a{<iri>}` transclusion) markers assemble nested resources in one pull.
 
+  A pipe passes its value by value, with one exception: `source <iri> | <stage>`, where
+  `<stage>` declares itself an incremental transreptor, hands the stage its upstream by
+  reference (`content=<iri>`). The stage reads the upstream's body as it comes and stops
+  where it likes, so nothing between the two is collected, and the line resolves as one
+  request (one entry in the cache summary).
+
 - **Execution traces.** `trace <iri> [args]` resolves a resource and shows its
   execution tree, including cache status, timing, authority and endpoint notes.
   Default traces omit the `defaulted=` note so adding an optional input does not
