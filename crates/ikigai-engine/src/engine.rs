@@ -25,8 +25,9 @@ use futures::executor::block_on;
 use futures::future::join_all;
 use futures::FutureExt;
 use ikigai_core::{
-    ArgRef, BoxFuture, Capability, Description, Expiry, FixedClock, InputSource, Iri, Provenance,
-    ReprType, Representation, Request, Scope, Space, Spawner, Thread, TraceEvent, Tracer, Verb,
+    ArgRef, Body, BoxFuture, Capability, Description, Expiry, FixedClock, InputSource, Iri,
+    Provenance, ReprType, Representation, Request, Scope, Space, Spawner, Thread, TraceEvent,
+    Tracer, Verb,
 };
 use ikigai_resolve::{CacheStatus, Resolver};
 use std::panic::AssertUnwindSafe;
@@ -84,6 +85,60 @@ impl Staged {
             )
         })
     }
+}
+
+/// A pipe stage's output handed on as the body its endpoint produced (ledger #2286): to
+/// be ATTACHED to the next stage's request, never collected by the engine in between.
+/// Only a stage whose next stage is one request (`source` or `sink`) answers one
+/// ([`hands_on_a_body`]); a stage feeding a fork, a `..` map or the end of the line answers
+/// a collected [`Staged`].
+pub(crate) struct Piped {
+    body: Body,
+    expiry: Expiry,
+    threads: BTreeSet<Thread>,
+}
+
+impl From<Representation<Body>> for Piped {
+    fn from(representation: Representation<Body>) -> Self {
+        Piped {
+            expiry: representation.expiry,
+            threads: representation.threads().clone(),
+            body: representation.bytes,
+        }
+    }
+}
+
+impl Piped {
+    /// The provenance this stage hands to the next, as [`Staged::provenance`].
+    fn provenance(&self) -> Provenance {
+        Provenance::new(self.expiry, self.threads.clone())
+    }
+}
+
+/// What flows along a pipe between two stages: collected bytes, or a body to attach.
+pub(crate) enum Flow {
+    Staged(Staged),
+    Piped(Piped),
+}
+
+/// Whether a stage followed by `next` answers its body for `next` to be handed
+/// ([`Piped`]) rather than collected bytes: only when `next` is a `|` into one request, a
+/// `source` or a `sink`.
+///
+/// ★ A fork's branches and a `..` map's items each read the value, so a one-shot body would
+/// be read once and refused (`Conflict`) for the rest. The value is COLLECTED ONCE instead,
+/// by the kernel under the run's byte budget as the upstream answers, rather than spilled:
+/// every branch is then handed the same bytes (the fork's join and the map's item split
+/// read them whole anyway), refused `OverBudget` past the budget, and nothing depends on a
+/// spill store being bound. So is the line's last answer, which the printer shows.
+fn hands_on_a_body(next: Option<&Step>) -> bool {
+    matches!(
+        next,
+        Some(Step {
+            connector: Connector::Pipe,
+            node: Node::Source(_) | Node::Sink(_),
+        })
+    )
 }
 
 /// The neutral upstream for the first stage of a pipeline (no pipe feeds it): a
@@ -1160,29 +1215,157 @@ impl Engine {
         prov: Provenance,
     ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
         Box::pin(async move {
-            let mut rest = pipeline.rest.iter();
-            let mut staged = match self.pipe_by_reference(pipeline, incoming).await? {
+            let mut rest = pipeline.rest.iter().peekable();
+            let mut flow = match self.pipe_by_reference(pipeline, incoming).await? {
                 // The first two stages ran as one request: carry on after the second.
                 Some(staged) => {
                     rest.next();
-                    staged
+                    Flow::Staged(staged)
                 }
-                None => self.run_node(&pipeline.first, incoming, prov).await?,
+                None if hands_on_a_body(rest.peek().copied()) => {
+                    self.run_node_body(&pipeline.first, incoming, prov).await?
+                }
+                None => Flow::Staged(self.run_node(&pipeline.first, incoming, prov).await?),
             };
-            for step in rest {
+            while let Some(step) = rest.next() {
                 // Each `|` hands the prior stage's provenance down as the next stage's
                 // upstream, so cacheability flows along the pipe; `..` does the same per
                 // mapped item.
-                staged = match step.connector {
-                    Connector::Pipe => {
-                        self.run_node(&step.node, Some(&staged.bytes), staged.provenance())
+                let body_out = hands_on_a_body(rest.peek().copied());
+                flow = match (step.connector, flow) {
+                    (Connector::Pipe, Flow::Staged(staged)) if body_out => {
+                        self.run_node_body(&step.node, Some(&staged.bytes), staged.provenance())
                             .await?
                     }
-                    Connector::Map => self.run_map(&step.node, &staged).await?,
+                    (Connector::Pipe, Flow::Staged(staged)) => Flow::Staged(
+                        self.run_node(&step.node, Some(&staged.bytes), staged.provenance())
+                            .await?,
+                    ),
+                    (Connector::Pipe, Flow::Piped(piped)) => {
+                        self.run_attached(&step.node, piped, body_out).await?
+                    }
+                    (Connector::Map, Flow::Staged(staged)) => {
+                        Flow::Staged(self.run_map(&step.node, &staged).await?)
+                    }
+                    (Connector::Map, Flow::Piped(_)) => {
+                        unreachable!("a stage feeding `..` answers collected bytes")
+                    }
                 };
             }
-            Ok(staged)
+            match flow {
+                Flow::Staged(staged) => Ok(staged),
+                Flow::Piped(_) => unreachable!("a line's last stage answers collected bytes"),
+            }
         })
+    }
+
+    /// Issue a one-request stage (a `source` or `sink` leaf) fed `incoming`, answering its
+    /// body as the endpoint produced it, so the stage after it can be handed the body
+    /// (ledger #2286). A fork joins several answers, so it answers them collected.
+    async fn run_node_body(
+        &self,
+        node: &Node,
+        incoming: Option<&[u8]>,
+        prov: Provenance,
+    ) -> Result<Flow, String> {
+        let request = match node {
+            Node::Source(words) => {
+                let (target, args) = words.split_first().ok_or("expected an IRI")?;
+                self.source_request(target, args, incoming).await?
+            }
+            Node::Sink(words) => {
+                let (target, args) = words.split_first().ok_or("`sink` needs a target IRI")?;
+                self.sink_request(target, args, incoming).await?
+            }
+            Node::Fork(_) => return Ok(Flow::Staged(self.run_node(node, incoming, prov).await?)),
+        };
+        self.issue_stage(request, prov, None, true).await
+    }
+
+    /// Run `node` with the previous stage's body `piped` as the value the pipe fills
+    /// (ledger #2286): ATTACHED to the request as that argument (`content` for a `sink`,
+    /// the routed argument for a `source`), so a stage that declares it
+    /// [`reads_body`](ikigai_core::ArgSpec::reads_body) reads the upstream as it comes and
+    /// one that does not is handed it collected by the kernel, under the run's byte budget.
+    ///
+    /// A body that is already a buffer goes by value, exactly as before: nothing would be
+    /// gained by attaching it, and a by-value request keeps its cache entry. `body_out`
+    /// answers this stage's own body for the stage after it; otherwise the answer is
+    /// collected under the run's byte budget (`OverBudget` past it, never shorter).
+    async fn run_attached(
+        &self,
+        node: &Node,
+        piped: Piped,
+        body_out: bool,
+    ) -> Result<Flow, String> {
+        let prov = piped.provenance();
+        let body = match piped.body {
+            Body::Bytes(bytes) => {
+                return if body_out {
+                    self.run_node_body(node, Some(&bytes), prov).await
+                } else {
+                    Ok(Flow::Staged(self.run_node(node, Some(&bytes), prov).await?))
+                };
+            }
+            body => body,
+        };
+        let (request, name) = match node {
+            Node::Source(words) => {
+                let (target, args) = words.split_first().ok_or("expected an IRI")?;
+                let (request, routed) = self.source_request_routed(target, args, Some(&[])).await?;
+                (request, routed)
+            }
+            Node::Sink(words) => {
+                let (target, args) = words.split_first().ok_or("`sink` needs a target IRI")?;
+                (
+                    self.sink_request(target, args, Some(&[])).await?,
+                    Some("content".to_string()),
+                )
+            }
+            Node::Fork(_) => unreachable!("a stage feeding a fork answers collected bytes"),
+        };
+        let name = name.ok_or("the piped value has no argument to fill")?;
+        let mut request = request;
+        // The empty placeholder the pipe's routing left: the body takes its place.
+        request.args.remove(&name);
+        self.issue_stage(request, prov, Some((name, body)), body_out)
+            .await
+    }
+
+    /// [`run_repr`](Self::run_repr) for a pipe stage: `attach` hands it a body as one named
+    /// argument, and `body_out` answers its body unread ([`Flow::Piped`]) instead of
+    /// collected under the run's byte budget ([`Flow::Staged`]).
+    async fn issue_stage(
+        &self,
+        request: Request,
+        prov: Provenance,
+        attach: Option<(String, Body)>,
+        body_out: bool,
+    ) -> Result<Flow, String> {
+        let capability = self.capability.borrow().clone();
+        let shape = RequestShape::of(&request);
+        let scope = self.line_scope();
+        let answer = if body_out {
+            self.resolver
+                .issue_body_attached_in(request, &capability, Some(prov), scope, attach)
+                .await
+                .map(|(representation, status)| (Flow::Piped(Piped::from(representation)), status))
+        } else {
+            self.resolver
+                .issue_attached_in(request, &capability, Some(prov), scope, attach)
+                .await
+                .map(|(representation, status)| {
+                    (Flow::Staged(Staged::from(representation)), status)
+                })
+        };
+        let (flow, status) = match answer {
+            Ok(answer) => answer,
+            Err(e) => return Err(self.explain_failure(&shape, &e).await),
+        };
+        let mut stats = self.cache.get();
+        stats.record(status);
+        self.cache.set(stats);
+        Ok(flow)
     }
 
     /// `source <iri> | <stage> …` with the upstream handed on **by reference** (ledger #2286),
@@ -1745,6 +1928,17 @@ impl Engine {
         args: &[String],
         incoming: Option<&[u8]>,
     ) -> Result<Request, String> {
+        Ok(self.source_request_routed(target, args, incoming).await?.0)
+    }
+
+    /// [`source_request`](Self::source_request), with the name of the argument the piped or
+    /// positional value was routed to, when one was.
+    async fn source_request_routed(
+        &self,
+        target: &str,
+        args: &[String],
+        incoming: Option<&[u8]>,
+    ) -> Result<(Request, Option<String>), String> {
         let iri = parse_target(target)?;
 
         // The contract is only needed to recognise named arguments and route the
@@ -1815,12 +2009,14 @@ impl Engine {
             request = request.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
         }
 
+        let mut routed = None;
         if let Some(value) = value {
             let names: Vec<&str> = named.iter().map(|(name, _)| *name).collect();
             let name = route_value_name(&iri, description.as_ref(), &names)?;
+            routed = Some(name.to_string());
             request = request.with_arg(name, ArgRef::Inline(value.to_vec()));
         }
-        Ok(request)
+        Ok((request, routed))
     }
 
     /// The batch's one-shot piped stdin, taken for a `source` stage that would otherwise
