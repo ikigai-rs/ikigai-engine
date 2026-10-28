@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::executor::block_on;
 use ikigai_core::{
-    ArgRef, Bindings, Capability, Clock, Description, Endpoint, Error, Expiry, Grammar, Invocation,
-    Iri, IssueContext, Kernel, Limit, Provenance, Representation, Request, Resolution, Resolved,
-    Scope, Space, SpaceEntry, Time, TraceEvent, Tracer, UriTemplate, Verb,
+    ArgRef, Bindings, Body, Capability, Clock, Description, Endpoint, Error, Expiry, Grammar,
+    Invocation, Iri, IssueContext, Kernel, Limit, Provenance, Representation, Request, Resolution,
+    Resolved, Scope, Space, SpaceEntry, Time, TraceEvent, Tracer, UriTemplate, Verb,
 };
 use serde::{Deserialize, Serialize};
 
@@ -512,6 +512,37 @@ impl Endpoint for ForwardingEndpoint {
         Ok(as_held_here(representation))
     }
 
+    /// [`invoke`](Endpoint::invoke) for a body (ledger #2287): the same forward, under the
+    /// same capability and run, through
+    /// [`Resolver::issue_body_as_in_run`], so a peer's streamed answer passes through the
+    /// mount as the peer produced it instead of being collected here. The kernel calls this,
+    /// and collects under the run's byte pool only when its caller asked for bytes.
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>, Error> {
+        let run = RunContext::of(inv);
+        if inv.trace_span().is_none() {
+            let result = self
+                .resolver
+                .issue_body_as_in_run(self.request.clone(), inv.capability, &run)
+                .await;
+            self.distrust_on_refusal(&result);
+            return result.map(|(representation, _status)| as_held_here(representation));
+        }
+        // Traced as `invoke` is. The peer's subtree is complete when its answer arrives: an
+        // endpoint makes every sub-request before it returns its body, so nothing is left
+        // to record while the body is read.
+        let collector = Arc::new(SpanCollector::default());
+        self.resolver.set_tracer(collector.clone());
+        let result = self
+            .resolver
+            .issue_body_as_in_run(self.request.clone(), inv.capability, &run)
+            .await;
+        self.resolver.clear_tracer();
+        self.distrust_on_refusal(&result);
+        let (representation, _status) = result?;
+        inv.record_subtree(collector.take());
+        Ok(as_held_here(representation))
+    }
+
     fn name(&self) -> &str {
         self.name.as_deref().unwrap_or("remote")
     }
@@ -596,7 +627,7 @@ impl Endpoint for ForwardingEndpoint {
 /// on the peer, and a wire call that streamed them to the mounting side, which would cut the
 /// threads it hung its copies on, is the shape. It is a protocol addition, not a fix, and it is
 /// not built.
-fn as_held_here(representation: Representation) -> Representation {
+fn as_held_here<B>(representation: Representation<B>) -> Representation<B> {
     representation.with_expiry(Expiry::Always)
 }
 
@@ -1406,6 +1437,29 @@ pub trait Resolver: Send + Sync {
         self.issue_as(request, capability)
     }
 
+    /// [`issue_as_in_run`](Resolver::issue_as_in_run), answering with the peer's body **as
+    /// it produced it** (ledger #2287): a buffer, a body that can be read again, or a one-shot
+    /// stream, never collected on the way. What a mount's
+    /// [`invoke_body`](Endpoint::invoke_body) forwards through, so a peer's streamed reply
+    /// passes through the mount, under the same capability and run its `invoke` carries.
+    ///
+    /// The default resolves through [`issue_as_in_run`](Resolver::issue_as_in_run) and wraps
+    /// the collected answer as [`Body::Bytes`], so a resolver that cannot stream answers a body
+    /// request exactly as it answered a bytes one, and inherits that method's refusal of a
+    /// capability it cannot carry. The in-process kernel overrides it with
+    /// [`Kernel::issue_body`]. A WRAPPER forwards it like
+    /// [`issue_as_in_run`](Resolver::issue_as_in_run), or it silently collects the inner
+    /// resolver's stream.
+    async fn issue_body_as_in_run(
+        &self,
+        request: Request,
+        capability: &Capability,
+        run: &RunContext,
+    ) -> Result<(Representation<Body>, CacheStatus), Error> {
+        self.issue_as_in_run(request, capability, run)
+            .map(|(representation, status)| (representation.into_body(), status))
+    }
+
     /// Async resolution of a request whose input came from an upstream pipe stage,
     /// folding that upstream's [`Provenance`] into the result's cacheability — so
     /// `source <X> | transform` is no more cacheable than `X`. The default *ignores*
@@ -1557,6 +1611,27 @@ impl Resolver for Kernel {
         let was_cached = Kernel::is_cached(self, &request, capability);
         let representation = Kernel::issue(self, request, capability).await?;
         let status = cache_status(was_cached, &representation);
+        Ok((representation, status))
+    }
+
+    async fn issue_body_as_in_run(
+        &self,
+        request: Request,
+        capability: &Capability,
+        run: &RunContext,
+    ) -> Result<(Representation<Body>, CacheStatus), Error> {
+        // The run is dropped as `issue_as_in_run` drops it here (the kernel takes the trait's
+        // default): the time left is relative, and the kernel exposes no clock to rebase it
+        // on. The body is awaited directly, with no `block_on`, and handed over unread.
+        let _ = run;
+        let was_cached = Kernel::is_cached(self, &request, capability);
+        let representation = Kernel::issue_body(self, request, capability).await?;
+        let status = if representation.bytes.is_one_shot() {
+            // A one-shot body is never stored, whatever its expiry says.
+            CacheStatus::Uncacheable
+        } else {
+            cache_status(was_cached, &representation)
+        };
         Ok((representation, status))
     }
 
@@ -1727,7 +1802,7 @@ pub fn issue_traced_as(
 /// The cache-status label for a resolved representation. Only `Always` is truly
 /// uncacheable; `Never` and a time-based `At` deadline are both cacheable (so an
 /// `At` read reports Hit/Miss, not Uncacheable).
-fn cache_status(was_cached: bool, representation: &Representation) -> CacheStatus {
+fn cache_status<B>(was_cached: bool, representation: &Representation<B>) -> CacheStatus {
     if representation.expiry == Expiry::Always {
         CacheStatus::Uncacheable
     } else if was_cached {
@@ -1764,6 +1839,18 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
     ) -> Result<(Representation, CacheStatus), Error> {
         // Forwarded for the same reason as the chain methods: the default drops the run.
         (**self).issue_as_in_run(request, capability, run)
+    }
+
+    async fn issue_body_as_in_run(
+        &self,
+        request: Request,
+        capability: &Capability,
+        run: &RunContext,
+    ) -> Result<(Representation<Body>, CacheStatus), Error> {
+        // Forwarded, or the default would collect the inner resolver's stream.
+        (**self)
+            .issue_body_as_in_run(request, capability, run)
+            .await
     }
 
     async fn issue_as_async(
@@ -3289,5 +3376,205 @@ mod tests {
         assert!(!within(at, Some(Time::from_millis(15_000)), window));
         assert!(!within(at, Some(Time::from_millis(9_999)), window));
         assert!(!within(at, None, window));
+    }
+
+    /// How many chunks [`Chunked`] streams, and how large each is: together
+    /// larger than any one chunk, so a body that arrives as ONE chunk was collected.
+    const CHUNKS: usize = 3;
+    const CHUNK_BYTES: usize = 16 * 1024;
+
+    /// An endpoint that answers with a one-shot body of [`CHUNKS`] chunks, counting each chunk
+    /// as it is PRODUCED, so a test can tell a body handed over unread from one collected on
+    /// the way.
+    struct Chunked {
+        made: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Endpoint for Chunked {
+        async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+            let body = self.invoke_body(inv).await?;
+            body.collect(CHUNKS * CHUNK_BYTES).await
+        }
+
+        async fn invoke_body(&self, _inv: &Invocation<'_>) -> Result<Representation<Body>, Error> {
+            use futures::StreamExt;
+            let made = self.made.clone();
+            let chunks = futures::stream::iter(0..CHUNKS).map(move |n| {
+                made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ikigai_core::Bytes::from(vec![b'a' + n as u8; CHUNK_BYTES]))
+            });
+            Ok(Representation::from_body(
+                ReprType::new("text/plain"),
+                Body::once(chunks),
+            ))
+        }
+
+        fn describe(&self) -> Description {
+            Description::new("stream").verb(Verb::Source)
+        }
+    }
+
+    /// A peer kernel binding [`Chunked`] at `urn:peer:stream`, with the counter it bumps.
+    fn chunked_peer() -> (Arc<Kernel>, Arc<std::sync::atomic::AtomicUsize>) {
+        let made = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let space = EndpointSpace::new().bind(
+            Exact::new("urn:peer:stream"),
+            Chunked { made: made.clone() },
+        );
+        (Arc::new(Kernel::new(Arc::new(space))), made)
+    }
+
+    /// [`Forwarding`], which also forwards the BODY path to the peer kernel: the shape of a
+    /// resolver that can stream. Its synchronous methods cross a thread, as `Forwarding`'s
+    /// do; its body path is awaited, so it needs no thread.
+    struct StreamingPeer(Forwarding);
+
+    #[async_trait]
+    impl Resolver for StreamingPeer {
+        fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
+            self.0.issue(request)
+        }
+
+        fn issue_as(
+            &self,
+            request: Request,
+            capability: &Capability,
+        ) -> Result<(Representation, CacheStatus), Error> {
+            self.0.issue_as(request, capability)
+        }
+
+        async fn issue_body_as_in_run(
+            &self,
+            request: Request,
+            capability: &Capability,
+            run: &RunContext,
+        ) -> Result<(Representation<Body>, CacheStatus), Error> {
+            Resolver::issue_body_as_in_run(&*self.0 .0, request, capability, run).await
+        }
+
+        fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
+            self.0.is_cached(request, capability)
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            self.0.entries()
+        }
+    }
+
+    fn stream_read() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:peer:stream").unwrap())
+    }
+
+    /// Every chunk of `body`, read in order.
+    fn chunks_of(body: Body) -> Vec<ikigai_core::Bytes> {
+        use futures::StreamExt;
+        block_on(body.into_stream().collect::<Vec<_>>())
+            .into_iter()
+            .map(|chunk| chunk.expect("a chunk"))
+            .collect()
+    }
+
+    /// ★ Ledger #2287. A mount forwards `invoke_body`, so a peer's streamed answer passes
+    /// through it as the peer produced it. Before the fix `ForwardingEndpoint` answered only
+    /// `invoke`, the kernel's default `invoke_body` wrapped that collected buffer, and the
+    /// body below arrived as ONE chunk with every chunk already produced before anyone read.
+    #[test]
+    fn a_mount_passes_a_peers_streamed_body_through_uncollected() {
+        let (peer, made) = chunked_peer();
+        let local = mounting(Arc::new(StreamingPeer(Forwarding(peer))));
+        let answer = block_on(local.issue_body(stream_read(), &Capability::root()))
+            .expect("a streamed read through the mount");
+        assert!(
+            answer.bytes.is_one_shot(),
+            "the peer's stream, not a buffer"
+        );
+        assert_eq!(answer.expiry, Expiry::Always, "held here as uncacheable");
+        assert_eq!(
+            made.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing was read on the way: the mount handed the body over unread"
+        );
+        let chunks = chunks_of(answer.bytes);
+        assert_eq!(
+            chunks.len(),
+            CHUNKS,
+            "every chunk crossed the mount as a chunk"
+        );
+        for (n, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.len(), CHUNK_BYTES);
+            assert!(
+                chunk.iter().all(|byte| *byte == b'a' + n as u8),
+                "chunk {n} in order"
+            );
+        }
+        assert_eq!(made.load(std::sync::atomic::Ordering::SeqCst), CHUNKS);
+    }
+
+    /// The bytes path through the mount is unchanged: the kernel collects the body for a
+    /// caller that asked for bytes, and the mount's own `invoke` still forwards through
+    /// `issue_as_in_run` and answers with the whole buffer, uncacheable here.
+    #[test]
+    fn invoke_through_a_mount_is_unchanged_by_the_body_path() {
+        let (peer, _made) = chunked_peer();
+        let mut whole = Vec::new();
+        for n in 0..CHUNKS {
+            whole.extend(std::iter::repeat_n(b'a' + n as u8, CHUNK_BYTES));
+        }
+
+        let local = mounting(Arc::new(StreamingPeer(Forwarding(peer.clone()))));
+        let collected = block_on(local.issue(stream_read(), &Capability::root())).unwrap();
+        assert_eq!(
+            collected.bytes, whole,
+            "the kernel's bytes API collects the stream"
+        );
+        assert_eq!(collected.expiry, Expiry::Always);
+
+        // The endpoint's `invoke` itself, off the kernel: the mount resolves the name to its
+        // forwarding endpoint, and invoking that collects nothing new and loses nothing.
+        let mount =
+            MountedRemote::overriding(Arc::new(Forwarding(peer)), "urn:peer:", "test://peer");
+        let read = stream_read();
+        let Resolution::Hit(resolved) = mount.resolve(&read, &Scope::empty()) else {
+            panic!("the mount claims urn:peer:stream");
+        };
+        let root = Capability::root();
+        let inv = Invocation::detached(&read, &resolved.bindings, &root);
+        let invoked = block_on(resolved.endpoint.invoke(&inv)).expect("invoke forwards");
+        assert_eq!(invoked.bytes, whole);
+        assert_eq!(invoked.expiry, Expiry::Always);
+    }
+
+    /// The body path carries the caller's capability exactly as `invoke` does: a capability
+    /// the peer refuses is refused BY THE PEER through `invoke_body`, a sufficient one reaches
+    /// the peer as itself (not root), and a resolver that cannot carry a narrowed capability
+    /// still refuses it rather than resolving as root (ledger #849).
+    #[test]
+    fn a_capability_the_peer_refuses_still_refuses_through_the_body_path() {
+        let local = mounting(Arc::new(StreamingPeer(Forwarding(
+            peer_checking_at_runtime(),
+        ))));
+        let refused = block_on(local.issue_body(scoped_read(), &Capability::scoped(["urn:x"])));
+        assert!(
+            matches!(&refused, Err(Error::Denied(message)) if message.contains("the peer wants")),
+            "refused by the peer through the body path: {:?}",
+            refused.as_ref().map(|_| "a body")
+        );
+        let served = block_on(local.issue_body(scoped_read(), &Capability::scoped([SECRET])))
+            .expect("a sufficient capability crosses the body path");
+        let bytes: Vec<u8> = chunks_of(served.bytes).concat();
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            SECRET,
+            "the peer saw the caller's capability, not root"
+        );
+
+        let forgetting = mounting(Arc::new(IssueOnly(peer_checking_at_runtime())));
+        let refused = block_on(forgetting.issue_body(scoped_read(), &Capability::scoped([SECRET])));
+        assert!(
+            matches!(&refused, Err(Error::Denied(message)) if message.contains("IssueOnly")),
+            "the body path's default inherits the refusal: {:?}",
+            refused.as_ref().map(|_| "a body")
+        );
     }
 }
