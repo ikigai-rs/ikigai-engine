@@ -1844,6 +1844,7 @@ async fn run_step<H: PlanHost>(
     }
 
     // `..` — the same newline-item convention `run_map` uses, item for item.
+    // A final newline terminates the last item rather than adding an empty one.
     let text = std::str::from_utf8(&upstream).map_err(|_| {
         RunError::Plan(
             "`..` maps over newline-separated text items, but the piped value is not \
@@ -1851,9 +1852,9 @@ async fn run_step<H: PlanHost>(
                 .to_string(),
         )
     })?;
-    host.fan_out(text.split('\n').count());
+    host.fan_out(text.split_terminator('\n').count());
     let mut outputs = Vec::new();
-    for item in text.split('\n') {
+    for item in text.split_terminator('\n') {
         outputs.push(
             host.issue(request(Some(item.as_bytes())), provenance.clone())
                 .await

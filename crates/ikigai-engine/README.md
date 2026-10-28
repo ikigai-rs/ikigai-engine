@@ -33,6 +33,9 @@ its own crate for the browser build to reuse unchanged.
   | `( a ; b )` | fork/join — fan the same input to each branch, join their outputs |
   | `"…"` | quote an operator or whitespace so it's data, not structure |
 
+  For `..`, a final newline terminates the last item; blank items within the list
+  are preserved. Empty input has no items.
+
   `compose` (`$a{<iri>}` transclusion) markers assemble nested resources in one pull.
 
   A pipe passes its value by value, with one exception: `source <iri> | <stage>`, where

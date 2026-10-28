@@ -1494,7 +1494,9 @@ impl Engine {
     /// Map a stage over the newline-separated items of `value`: run the node once
     /// per item (feeding the item in) and rejoin the outputs with newlines. This
     /// is the list convention used across the kernel (e.g. `reverseList`), so `..`
-    /// threads a list through a per-item transform. An error on any item aborts.
+    /// threads a list through a per-item transform. A final newline terminates the
+    /// last item; interior blank items are preserved, and empty input has no items.
+    /// An error on any item aborts.
     fn run_map<'a>(
         &'a self,
         node: &'a Node,
@@ -1517,7 +1519,7 @@ impl Engine {
             if let (Node::Source(words), Some(spawner)) = (node, &self.spawner) {
                 let (target, args) = words.split_first().ok_or("expected an IRI")?;
                 let mut requests = Vec::new();
-                for item in text.split('\n') {
+                for item in text.split_terminator('\n') {
                     requests.push(
                         self.source_request(target, args, Some(item.as_bytes()))
                             .await?,
@@ -1528,9 +1530,9 @@ impl Engine {
             }
             // Sequential per-item mapping (no spawner, or a stage that isn't a lone
             // `source`): one item at a time, so the achieved width is 1.
-            self.record_sequential_fan_out(text.split('\n').count());
+            self.record_sequential_fan_out(text.split_terminator('\n').count());
             let mut outputs = Vec::new();
-            for item in text.split('\n') {
+            for item in text.split_terminator('\n') {
                 outputs.push(
                     self.run_node(node, Some(item.as_bytes()), prov.clone())
                         .await?,
@@ -7660,6 +7662,30 @@ mod tests {
             output(list_engine().eval("source urn:test:reverse \"a\nb\nc\" .. urn:test:upper"))
                 .unwrap();
         assert_eq!(out, "C\nB\nA");
+    }
+
+    #[test]
+    fn map_ignores_a_terminating_newline() {
+        for spawner in [false, true] {
+            for stage in ["urn:test:upper", "( urn:test:upper | urn:test:upper )"] {
+                for (input, expected, width) in [
+                    ("a\nb\n", "A\nB", 2),
+                    ("a\n\nb\n", "A\n\nB", 3),
+                    ("a\nb\n\n", "A\nB\n", 3),
+                    ("a\nb", "A\nB", 2),
+                    ("\n", "", 1),
+                    ("", "", 0),
+                ] {
+                    let mut engine = list_engine();
+                    if spawner {
+                        engine = engine.with_spawner(Arc::new(InlineSpawner));
+                    }
+                    let line = format!("source urn:test:upper in=\"{input}\" .. {stage}");
+                    assert_eq!(output(engine.eval(&line)).unwrap(), expected, "{line:?}");
+                    assert_eq!(engine.last_fan_out().unwrap().nominal, width, "{line:?}");
+                }
+            }
+        }
     }
 
     #[test]
