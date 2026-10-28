@@ -72,6 +72,12 @@ With the `plan-reader` feature, `plan_space::space()` binds `urn:plan:eval`,
 `urn:plan:validate` and `urn:plan:requires`, and names itself
 `urn:iki:space:engine:plan` (`plan_space::SPACE_ID`).
 
+A stored plan run by `execute` pipes as the text face does: a step whose only reader is one
+`ik:pipeFrom` edge hands that step its body attached, and a value read more than once (a
+fork's branches, a `..` map's items, a step referencing its `ik:binds`) or the plan's result
+is collected once under the run's byte budget. `urn:plan:eval` still hands every step its
+input by value: a sub-request issued from an invocation cannot carry an attached body.
+
 `config` is a small user-settings reader (used by the `config` command and the TUI's
 keybindings); on a target with no config directory it reports defaults.
 

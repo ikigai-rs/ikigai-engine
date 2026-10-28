@@ -56,8 +56,12 @@
 //!   by `urn:plan:requires`, never believed from the plan, because a plan that understated
 //!   its needs would let a pre-flight pass a plan the kernel then denies.
 
+#[cfg(feature = "plan-reader")]
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+#[cfg(feature = "plan-reader")]
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -68,10 +72,10 @@ use oxrdf::{NamedOrBlankNode, Term};
 use oxttl::TurtleParser;
 
 #[cfg(feature = "plan-reader")]
-use ikigai_core::{ArgRef, Description, Provenance, Request};
+use ikigai_core::{ArgRef, Body, Description, Provenance, Request};
 
 #[cfg(feature = "plan-reader")]
-use crate::engine::{combine_outputs, root_provenance, Staged};
+use crate::engine::{combine_outputs, root_provenance, Flow, Piped, Staged};
 use crate::engine::{
     declared_arguments, is_named_argument, join_named, parse_spec, parse_target, route_value_name,
     takes_open_arguments, Connector, Engine, Node, Pipeline,
@@ -1473,6 +1477,21 @@ pub(crate) trait PlanHost {
     /// cacheability itself; a host whose sub-requests are recorded for it may ignore it.
     async fn issue(&self, request: Request, incoming: Provenance) -> Result<Staged, Self::Error>;
 
+    /// [`issue`](Self::issue) for a step on an `ik:pipeFrom` edge (ledger #2490), as the
+    /// text face issues a pipe stage: `attach`, when given, is the upstream step's body as
+    /// the value of the one argument the pipe fills, handed over unread, and `body_out` asks
+    /// for this step's own body as its endpoint produced it ([`Flow::Piped`]), for the one
+    /// step it feeds. A host that cannot carry a body collects `attach` under the run's
+    /// byte budget and answers collected ([`Flow::Staged`]); the runner hands a collected
+    /// answer on by value, as it did before.
+    async fn issue_flow(
+        &self,
+        request: Request,
+        incoming: Provenance,
+        attach: Option<(String, Body)>,
+        body_out: bool,
+    ) -> Result<Flow, Self::Error>;
+
     /// The target's contract, for routing a fed value — `None` when it cannot be read,
     /// which routes to the conventional `in` exactly as the text face does.
     async fn describe(&self, iri: &Iri) -> Option<Description>;
@@ -1552,6 +1571,60 @@ impl Plan {
         }
         Ok(values)
     }
+
+    /// The steps among `order` whose answer only ONE `ik:pipeFrom` edge reads (ledger
+    /// #2490): each answers its body as produced, for the step it feeds to be handed it
+    /// attached. Every other node is COLLECTED ONCE, the rule the text face holds for a fork
+    /// and a map (`hands_on_a_body` in `engine.rs`): an upstream read by several consumers
+    /// (two pipes, a fork's branches, a `..` map's items, a step referencing its `ik:binds`)
+    /// would read a one-shot body once and be refused for the rest, and the result is
+    /// collected for whoever asked for it.
+    pub(crate) fn piped_steps(&self, order: &[NodeRef]) -> Result<BTreeSet<usize>, Refusal> {
+        // Per node: how many consumers read it, and whether every one is a pipe.
+        let mut readers: BTreeMap<NodeRef, (usize, bool)> = BTreeMap::new();
+        let mut read = |node: NodeRef, by_pipe: bool| {
+            let entry = readers.entry(node).or_insert((0, true));
+            entry.0 += 1;
+            entry.1 &= by_pipe;
+        };
+        read(self.result, false);
+        for node in order {
+            match *node {
+                NodeRef::Step(index) => {
+                    let step = &self.steps[index];
+                    match step.feed {
+                        Feed::None => {}
+                        Feed::Pipe(up) => read(up, true),
+                        Feed::Map(up) => read(up, false),
+                        Feed::Branch { fork, .. } => {
+                            if let Some(up) = self.forks[fork].upstream {
+                                read(up, false);
+                            }
+                        }
+                    }
+                    for to in step.refs.values() {
+                        if let RefTo::Name(var) = to {
+                            if let Some(binder) = self.binder(var) {
+                                read(NodeRef::Step(binder), false);
+                            }
+                        }
+                    }
+                }
+                NodeRef::Fork(index) => {
+                    for tail in self.branch_tails(index)? {
+                        read(tail, false);
+                    }
+                }
+            }
+        }
+        Ok(readers
+            .into_iter()
+            .filter_map(|(node, readers)| match (node, readers) {
+                (NodeRef::Step(index), (1, true)) => Some(index),
+                _ => None,
+            })
+            .collect())
+    }
 }
 
 /// Run a plan and return the representation of its `ik:result`.
@@ -1570,10 +1643,19 @@ pub(crate) async fn execute<H: PlanHost>(
     let order = plan
         .run_order()
         .map_err(|refusal| RunError::Plan(refusal.message))?;
+    let piped = plan
+        .piped_steps(&order)
+        .map_err(|refusal| RunError::Plan(refusal.message))?;
     let mut done: BTreeMap<NodeRef, Staged> = BTreeMap::new();
+    // The bodies of the steps `piped` names, each until the one step it feeds takes it.
+    // Apart from `done`: a body is not `Sync`, and `urn:plan:eval`'s future must be `Send`.
+    let mut bodies: BTreeMap<NodeRef, Piped> = BTreeMap::new();
     for node in order {
-        let staged = match node {
-            NodeRef::Step(index) => run_step(host, plan, index, &done, &values).await?,
+        let flow = match node {
+            NodeRef::Step(index) => {
+                let body_out = piped.contains(&index);
+                run_step(host, plan, index, &done, &mut bodies, &values, body_out).await?
+            }
             NodeRef::Fork(index) => {
                 let tails = plan
                     .branch_tails(index)
@@ -1584,31 +1666,95 @@ pub(crate) async fn execute<H: PlanHost>(
                 // (`run_parallel`); a plan does not yet, so moving a wide fork into a plan
                 // costs its concurrency today.
                 host.fan_out(tails.len());
-                combine_outputs(tails.iter().map(|tail| done[tail].clone()).collect())
+                Flow::Staged(combine_outputs(
+                    tails.iter().map(|tail| done[tail].clone()).collect(),
+                ))
             }
         };
-        done.insert(node, staged);
+        match flow {
+            Flow::Staged(staged) => {
+                done.insert(node, staged);
+            }
+            Flow::Piped(body) => {
+                bodies.insert(node, body);
+            }
+        }
     }
     Ok(done
         .remove(&plan.result)
-        .expect("the result is the last node of its own run order"))
+        .expect("the result is the last node of its own run order, and collected"))
+}
+
+/// What flows into a step along its feed.
+#[cfg(feature = "plan-reader")]
+enum Fed<'a> {
+    /// Bytes, handed on by value.
+    Bytes(Cow<'a, [u8]>),
+    /// The upstream step's body, this step's alone, to attach (ledger #2490).
+    Body(Body),
+}
+
+/// Issue `request` collected, or answering its body when `body_out`.
+#[cfg(feature = "plan-reader")]
+async fn issue<H: PlanHost>(
+    host: &H,
+    request: Request,
+    provenance: Provenance,
+    body_out: bool,
+) -> Result<Flow, RunError<H::Error>> {
+    if body_out {
+        host.issue_flow(request, provenance, None, true).await
+    } else {
+        host.issue(request, provenance).await.map(Flow::Staged)
+    }
+    .map_err(RunError::Step)
 }
 
 /// One step: its arguments (by value, and by reference — resolved once, for every item of
 /// a map), then its request — once, or once per item of a mapped upstream.
+///
+/// On an `ik:pipeFrom` edge from a step that answered its body ([`Plan::piped_steps`]),
+/// the body is TAKEN and attached as the argument the pipe fills (ledger #2490), unless it
+/// is already a buffer, which goes by value as before. `body_out` answers this step's own
+/// body for the one step it feeds; a mapped step answers its items' join, collected.
 #[cfg(feature = "plan-reader")]
 async fn run_step<H: PlanHost>(
     host: &H,
     plan: &Plan,
     index: usize,
     done: &BTreeMap<NodeRef, Staged>,
+    bodies: &mut BTreeMap<NodeRef, Piped>,
     values: &BTreeMap<String, Option<String>>,
-) -> Result<Staged, RunError<H::Error>> {
+    body_out: bool,
+) -> Result<Flow, RunError<H::Error>> {
     let step = &plan.steps[index];
-    let upstream: Option<&Staged> = match step.feed {
-        Feed::None => None,
-        Feed::Pipe(up) | Feed::Map(up) => Some(&done[&up]),
-        Feed::Branch { fork, .. } => plan.forks[fork].upstream.map(|up| &done[&up]),
+    let taken: Option<Piped> = match step.feed {
+        Feed::Pipe(up) => bodies.remove(&up),
+        _ => None,
+    };
+    let upstream: Option<(Fed<'_>, Provenance)> = match (taken, step.feed) {
+        (Some(piped), _) => {
+            let provenance = piped.provenance();
+            Some(match piped.body {
+                Body::Bytes(bytes) => (Fed::Bytes(Cow::Owned(bytes.to_vec())), provenance),
+                body => (Fed::Body(body), provenance),
+            })
+        }
+        (None, Feed::None) => None,
+        (None, Feed::Pipe(up) | Feed::Map(up)) => {
+            let staged = &done[&up];
+            Some((
+                Fed::Bytes(Cow::Borrowed(&staged.bytes)),
+                staged.provenance(),
+            ))
+        }
+        (None, Feed::Branch { fork, .. }) => plan.forks[fork].upstream.map(|up| {
+            let staged = &done[&up];
+            (
+                Fed::Bytes(Cow::Borrowed(&staged.bytes)),
+                staged.provenance(),
+            )
+        }),
     };
 
     let mut arguments: Vec<(String, Vec<u8>)> = step
@@ -1618,7 +1764,7 @@ async fn run_step<H: PlanHost>(
         .collect();
     // Everything the request is built from, for its provenance: the feed, every bound
     // name it references, and every resource it sources.
-    let mut inputs: Vec<Provenance> = upstream.iter().map(|up| up.provenance()).collect();
+    let mut inputs: Vec<Provenance> = upstream.iter().map(|(_, up)| up.clone()).collect();
     for (name, to) in &step.refs {
         match to {
             RefTo::Name(var) => match plan.binder(var) {
@@ -1677,21 +1823,28 @@ async fn run_step<H: PlanHost>(
         request
     };
 
-    let Some(upstream) = upstream else {
-        return host
-            .issue(request(None), provenance)
-            .await
-            .map_err(RunError::Step);
+    let upstream = match (upstream, &fed_name) {
+        (None, _) => return issue(host, request(None), provenance, body_out).await,
+        (Some((Fed::Body(body), _)), Some(name)) => {
+            return host
+                .issue_flow(
+                    request(None),
+                    provenance,
+                    Some((name.clone(), body)),
+                    body_out,
+                )
+                .await
+                .map_err(RunError::Step);
+        }
+        (Some((Fed::Body(_), _)), None) => unreachable!("a fed step routes its value"),
+        (Some((Fed::Bytes(bytes), _)), _) => bytes,
     };
     if !matches!(step.feed, Feed::Map(_)) {
-        return host
-            .issue(request(Some(&upstream.bytes)), provenance)
-            .await
-            .map_err(RunError::Step);
+        return issue(host, request(Some(&upstream)), provenance, body_out).await;
     }
 
     // `..` — the same newline-item convention `run_map` uses, item for item.
-    let text = std::str::from_utf8(&upstream.bytes).map_err(|_| {
+    let text = std::str::from_utf8(&upstream).map_err(|_| {
         RunError::Plan(
             "`..` maps over newline-separated text items, but the piped value is not \
              UTF-8 text — use a plain `|` to pass the bytes through whole"
@@ -1707,7 +1860,7 @@ async fn run_step<H: PlanHost>(
                 .map_err(RunError::Step)?,
         );
     }
-    Ok(combine_outputs(outputs))
+    Ok(Flow::Staged(combine_outputs(outputs)))
 }
 
 /// The provenance of a request built from `inputs`: the most restrictive expiry and every
@@ -1728,6 +1881,16 @@ impl PlanHost for Engine {
 
     async fn issue(&self, request: Request, incoming: Provenance) -> Result<Staged, String> {
         self.run_staged(request, Some(incoming)).await
+    }
+
+    async fn issue_flow(
+        &self,
+        request: Request,
+        incoming: Provenance,
+        attach: Option<(String, Body)>,
+        body_out: bool,
+    ) -> Result<Flow, String> {
+        self.issue_stage(request, incoming, attach, body_out).await
     }
 
     async fn describe(&self, iri: &Iri) -> Option<Description> {

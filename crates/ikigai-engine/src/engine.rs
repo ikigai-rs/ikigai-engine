@@ -93,7 +93,7 @@ impl Staged {
 /// ([`hands_on_a_body`]); a stage feeding a fork, a `..` map or the end of the line answers
 /// a collected [`Staged`].
 pub(crate) struct Piped {
-    body: Body,
+    pub(crate) body: Body,
     expiry: Expiry,
     threads: BTreeSet<Thread>,
 }
@@ -110,7 +110,7 @@ impl From<Representation<Body>> for Piped {
 
 impl Piped {
     /// The provenance this stage hands to the next, as [`Staged::provenance`].
-    fn provenance(&self) -> Provenance {
+    pub(crate) fn provenance(&self) -> Provenance {
         Provenance::new(self.expiry, self.threads.clone())
     }
 }
@@ -1334,8 +1334,9 @@ impl Engine {
 
     /// [`run_repr`](Self::run_repr) for a pipe stage: `attach` hands it a body as one named
     /// argument, and `body_out` answers its body unread ([`Flow::Piped`]) instead of
-    /// collected under the run's byte budget ([`Flow::Staged`]).
-    async fn issue_stage(
+    /// collected under the run's byte budget ([`Flow::Staged`]). A stored plan's piped
+    /// steps are issued through it too (the session as a plan host, in `plan.rs`).
+    pub(crate) async fn issue_stage(
         &self,
         request: Request,
         prov: Provenance,
