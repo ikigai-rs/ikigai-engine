@@ -31,7 +31,9 @@ members = ["crates/*"]
 # (`toUpper inn=abc`) is refused, naming the declared arguments, instead of being sent as
 # positional text. The REPL help always promised this. A line that relied on the old fallback
 # now names the argument (`in="a=b"`); no public type changed, so a patch.
-version = "0.2.3"
+# 0.2.4 (ledger #2507): plan-eval declares open arguments so named plan parameters
+# reach the runner, which still refuses undeclared names. A contract fix: a patch.
+version = "0.2.4"
 edition = "2021"
 # Measured 2026-10-26, not assumed: 1.89 is the first toolchain that builds the workspace.
 # `ikigai-intray` takes the lease with `std::fs::File::try_lock` (stable in 1.89; 1.88 refuses
@@ -87,7 +89,7 @@ ikigai-fs = "0.2.2"
 # 0.3.4 is a SECURITY floor (ledger #1326) and 0.3.6 was cli's pin. 0.5.0 is the newest
 # release and the one on core 0.2 (ledger #2349). `"0.5.0"` is `<0.6.0`.
 ikigai-shacl = "0.5.0"
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.2.3" }
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.2.4" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face, reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins
