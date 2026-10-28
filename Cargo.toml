@@ -24,6 +24,9 @@ members = ["crates/*"]
 # 0.2.2 (ledger #2287): a mount forwards `invoke_body`, so a peer's streamed answer passes
 # through it uncollected; `Resolver` gains the defaulted `issue_body_as_in_run`. Additive: a
 # patch, for all three in lockstep.
+# Ledger #2286 part 2 ships within 0.2.2, which was not yet published when it landed
+# (crates.io had 0.2.1 on 2026-10-28): a pipe attaches a stage's body to the next stage, and
+# `Resolver` gains the defaulted `issue_attached_in` / `issue_body_attached_in`. Additive.
 version = "0.2.2"
 edition = "2021"
 # Measured 2026-10-26, not assumed: 1.89 is the first toolchain that builds the workspace.
@@ -60,8 +63,10 @@ homepage = "https://github.com/ikigai-rs/ikigai-engine"
 # - 0.1.64: `Resolved.canonical` (no default in a struct literal, so a hard floor).
 # - 0.1.60: `Spawner::width()`, which the engine's fan-out routing reads; the method is
 #   defaulted, so an older core compiles and silently answers width 1.
-# ⚠ `^0.2.0` is also a ceiling below 0.3.0.
-ikigai-core = "0.2.0"
+# 0.2.3 (ledger #2286, part 2) is the API floor for `BodyIssue` (`Kernel::issue_with` /
+# `issue_body_with`, a body attached to a pipe stage) and `ArgSpec::reads_body`.
+# ⚠ `^0.2.3` is also a ceiling below 0.3.0.
+ikigai-core = "0.2.3"
 # Raised with core, in lockstep. 0.1.70 is the first version carrying the PROCESS vocabulary
 # (`ik:Process`/`ik:Step`/`ik:Argument`/`ik:Fork`, the plan shapes in `SHAPES`, and the
 # `ikigai_vocab::plan` IRI builders) that the engine's `plan.rs` renders and reads; the tests

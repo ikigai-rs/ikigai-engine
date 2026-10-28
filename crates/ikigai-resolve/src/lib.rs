@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::executor::block_on;
 use ikigai_core::{
-    ArgRef, Bindings, Body, Capability, Clock, Description, Endpoint, Error, Expiry, Grammar,
-    Invocation, Iri, IssueContext, Kernel, Limit, Provenance, Representation, Request, Resolution,
-    Resolved, Scope, Space, SpaceEntry, Time, TraceEvent, Tracer, UriTemplate, Verb,
+    ArgRef, Bindings, Body, BodyIssue, Capability, Clock, Description, Endpoint, Error, Expiry,
+    Grammar, Invocation, Iri, IssueContext, Kernel, Limit, Provenance, Representation, Request,
+    Resolution, Resolved, Scope, Space, SpaceEntry, Time, TraceEvent, Tracer, UriTemplate, Verb,
 };
 use serde::{Deserialize, Serialize};
 
@@ -436,6 +436,38 @@ impl ForwardingEndpoint {
         Resolution::Hit(Resolved::new(Arc::new(self), Bindings::new()))
     }
 
+    /// The request to send the peer: the one this endpoint was resolved for, with every
+    /// content id ([`ArgRef::Content`]) replaced by the bytes it names, collected under the
+    /// run's byte budget (ledger #2286).
+    ///
+    /// ★ A content id does not cross a wire. It names a body held in THIS process: one an
+    /// engine attached to the request (`BodyIssue::attach`), or the local content store's,
+    /// and the peer holds neither. The kernel already collects an attached body for an
+    /// argument the endpoint does not declare `reads_body`, but a mounted endpoint describes
+    /// itself by its PEER's contract, so a peer that reads `content` as a body would be
+    /// handed an id it cannot resolve. Until ledger #2467 decides how a live body crosses a
+    /// mount, a mounted stage takes the collected path: what the peer receives is what a
+    /// by-value pipe sent it. Past the budget the forward is refused (`OverBudget`), never
+    /// sent shorter. A request with no content id is forwarded as it was.
+    async fn wire_request(&self, inv: &Invocation<'_>) -> Result<Request, Error> {
+        let mut request = self.request.clone();
+        let ids: Vec<String> = request
+            .args
+            .iter()
+            .filter(|(_, value)| matches!(value, ArgRef::Content(_)))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in ids {
+            // The kernel may already have collected it into the invocation's request.
+            let bytes = match inv.request.args.get(&name) {
+                Some(ArgRef::Inline(bytes)) => bytes.clone(),
+                _ => inv.collect(inv.content_body(&name).await?).await?.to_vec(),
+            };
+            request.args.insert(name, ArgRef::Inline(bytes));
+        }
+        Ok(request)
+    }
+
     /// Stop trusting the memoized contract for this name when the peer REFUSED the forward:
     /// a `Denied` the local floor did not predict, or an `Unresolved` for a name it was
     /// described under, means the peer's contract may no longer be the one held here.
@@ -488,10 +520,9 @@ impl Endpoint for ForwardingEndpoint {
         // The run's context rides along (wire v9): what is left of its retry pool and its
         // deadline, so the peer bounds this sub-request by the run the door minted here.
         let run = RunContext::of(inv);
+        let request = self.wire_request(inv).await?;
         if inv.trace_span().is_none() {
-            let result = self
-                .resolver
-                .issue_as_in_run(self.request.clone(), inv.capability, &run);
+            let result = self.resolver.issue_as_in_run(request, inv.capability, &run);
             self.distrust_on_refusal(&result);
             return result.map(|(representation, _status)| as_held_here(representation));
         }
@@ -502,9 +533,7 @@ impl Endpoint for ForwardingEndpoint {
         // into the tree instead of collapsed to one node.
         let collector = Arc::new(SpanCollector::default());
         self.resolver.set_tracer(collector.clone());
-        let result = self
-            .resolver
-            .issue_as_in_run(self.request.clone(), inv.capability, &run);
+        let result = self.resolver.issue_as_in_run(request, inv.capability, &run);
         self.resolver.clear_tracer();
         self.distrust_on_refusal(&result);
         let (representation, _status) = result?;
@@ -519,10 +548,11 @@ impl Endpoint for ForwardingEndpoint {
     /// and collects under the run's byte pool only when its caller asked for bytes.
     async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>, Error> {
         let run = RunContext::of(inv);
+        let request = self.wire_request(inv).await?;
         if inv.trace_span().is_none() {
             let result = self
                 .resolver
-                .issue_body_as_in_run(self.request.clone(), inv.capability, &run)
+                .issue_body_as_in_run(request, inv.capability, &run)
                 .await;
             self.distrust_on_refusal(&result);
             return result.map(|(representation, _status)| as_held_here(representation));
@@ -534,7 +564,7 @@ impl Endpoint for ForwardingEndpoint {
         self.resolver.set_tracer(collector.clone());
         let result = self
             .resolver
-            .issue_body_as_in_run(self.request.clone(), inv.capability, &run)
+            .issue_body_as_in_run(request, inv.capability, &run)
             .await;
         self.resolver.clear_tracer();
         self.distrust_on_refusal(&result);
@@ -1514,6 +1544,58 @@ pub trait Resolver: Send + Sync {
         }
     }
 
+    /// [`issue_as_async_in`](Resolver::issue_as_async_in) for a pipe stage (ledger #2286):
+    /// `attach`, when given, is the upstream stage's body as the value of one named argument,
+    /// handed over unread. The answer is collected under the run's byte budget, refused with
+    /// `OverBudget` past it, never shortened; [`issue_body_attached_in`] answers the body.
+    ///
+    /// Why the parts and not core's `BodyIssue`: a `BodyIssue` cannot be taken apart outside
+    /// core, so the default below could not read the body back out of one to collect it.
+    /// The in-process kernel builds one from these parts and resolves through
+    /// [`Kernel::issue_with`], so a stage that declares the argument
+    /// [`reads_body`](ikigai_core::ArgSpec::reads_body) reads the body as it comes, and one
+    /// that does not is handed it collected by the kernel (the trace notes `collected=`).
+    ///
+    /// The DEFAULT collects the body here, bounded by core's default byte budget
+    /// ([`DEFAULT_STREAM_MEMORY`](ikigai_core::DEFAULT_STREAM_MEMORY), `OverBudget` past it),
+    /// and issues the request with the bytes inline through
+    /// [`issue_as_async_in`](Resolver::issue_as_async_in): a resolver that cannot carry a body
+    /// answers exactly as a by-value pipe did, and keeps that method's refusals. A body under
+    /// a name the request already carries is refused (`InvalidArgument`), as the kernel
+    /// refuses it. A WRAPPER forwards this, or it silently collects.
+    ///
+    /// [`issue_body_attached_in`]: Resolver::issue_body_attached_in
+    async fn issue_attached_in(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+        attach: Option<(String, Body)>,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        let request = attached_by_value(request, attach).await?;
+        self.issue_as_async_in(request, capability, incoming, scope)
+            .await
+    }
+
+    /// [`issue_attached_in`](Resolver::issue_attached_in), answering with the stage's body
+    /// **as it produced it**, so the stage after it can be handed it in turn. The in-process
+    /// kernel resolves through [`Kernel::issue_body_with`]; a one-shot answer is never cached
+    /// and reports [`CacheStatus::Uncacheable`]. The DEFAULT is
+    /// [`issue_attached_in`](Resolver::issue_attached_in) wrapped as [`Body::Bytes`].
+    async fn issue_body_attached_in(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+        attach: Option<(String, Body)>,
+    ) -> Result<(Representation<Body>, CacheStatus), Error> {
+        self.issue_attached_in(request, capability, incoming, scope, attach)
+            .await
+            .map(|(representation, status)| (representation.into_body(), status))
+    }
+
     /// [`is_cached`](Resolver::is_cached) in a resolution chain — the cache is partitioned by
     /// the chain's fingerprint, so "cached" is a claim about one chain. The default answers
     /// `false` for any non-empty chain (it cannot resolve one, so nothing is cached in it) and
@@ -1671,6 +1753,45 @@ impl Resolver for Kernel {
         Ok((representation, status))
     }
 
+    async fn issue_attached_in(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+        attach: Option<(String, Body)>,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        let was_cached =
+            attach.is_none() && Kernel::is_cached_in(self, &request, capability, &scope);
+        let issue = body_issue(incoming, scope, attach);
+        let representation = Kernel::issue_with(self, request, capability, issue).await?;
+        let status = cache_status(was_cached, &representation);
+        Ok((representation, status))
+    }
+
+    async fn issue_body_attached_in(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+        attach: Option<(String, Body)>,
+    ) -> Result<(Representation<Body>, CacheStatus), Error> {
+        // The probe keys on the request as sent; an attached body's id is minted by the
+        // issue, so a request carrying one is not probed (a one-shot one is never cached).
+        let was_cached =
+            attach.is_none() && Kernel::is_cached_in(self, &request, capability, &scope);
+        let issue = body_issue(incoming, scope, attach);
+        let representation = Kernel::issue_body_with(self, request, capability, issue).await?;
+        let status = if representation.bytes.is_one_shot() {
+            // A one-shot body is never stored, whatever its expiry says.
+            CacheStatus::Uncacheable
+        } else {
+            cache_status(was_cached, &representation)
+        };
+        Ok((representation, status))
+    }
+
     fn is_cached_in(&self, request: &Request, capability: &Capability, scope: &Scope) -> bool {
         Kernel::is_cached_in(self, request, capability, scope)
     }
@@ -1812,6 +1933,45 @@ fn cache_status<B>(was_cached: bool, representation: &Representation<B>) -> Cach
     }
 }
 
+/// Core's [`BodyIssue`] for a pipe stage's parts ([`Resolver::issue_attached_in`]).
+fn body_issue(
+    incoming: Option<Provenance>,
+    scope: Scope,
+    attach: Option<(String, Body)>,
+) -> BodyIssue {
+    let mut issue = BodyIssue::new().in_scope(scope);
+    if let Some(incoming) = incoming {
+        issue = issue.with_incoming(incoming);
+    }
+    if let Some((name, body)) = attach {
+        issue = issue.attach(name, body);
+    }
+    issue
+}
+
+/// `request` with an attached body collected and set inline, for a resolver that cannot
+/// carry a body ([`Resolver::issue_attached_in`]'s default).
+async fn attached_by_value(
+    request: Request,
+    attach: Option<(String, Body)>,
+) -> Result<Request, Error> {
+    let Some((name, body)) = attach else {
+        return Ok(request);
+    };
+    if request.args.contains_key(&name) {
+        return Err(Error::InvalidArgument {
+            name,
+            detail: format!(
+                "{}: the request carries it and a body is attached under it",
+                ikigai_core::GIVEN_TWICE
+            ),
+        });
+    }
+    let bound = usize::try_from(ikigai_core::DEFAULT_STREAM_MEMORY).unwrap_or(usize::MAX);
+    let bytes = body.collect(bound).await?;
+    Ok(request.with_arg(name, ArgRef::Inline(bytes.to_vec())))
+}
+
 /// An `Arc`-shared resolver is itself a resolver, delegating to the inner one. So
 /// a kernel can be held as `Arc<Kernel>` and *shared* — driven by the engine, and
 /// at the same time reached by a file watcher that cuts golden threads on the very
@@ -1889,6 +2049,33 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
     ) -> Result<(Representation, CacheStatus), Error> {
         (**self)
             .issue_as_async_in(request, capability, incoming, scope)
+            .await
+    }
+
+    // Forwarded, or the defaults would collect the body the inner resolver can carry.
+    async fn issue_attached_in(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+        attach: Option<(String, Body)>,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        (**self)
+            .issue_attached_in(request, capability, incoming, scope, attach)
+            .await
+    }
+
+    async fn issue_body_attached_in(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+        attach: Option<(String, Body)>,
+    ) -> Result<(Representation<Body>, CacheStatus), Error> {
+        (**self)
+            .issue_body_attached_in(request, capability, incoming, scope, attach)
             .await
     }
 
@@ -3575,6 +3762,126 @@ mod tests {
             matches!(&refused, Err(Error::Denied(message)) if message.contains("IssueOnly")),
             "the body path's default inherits the refusal: {:?}",
             refused.as_ref().map(|_| "a body")
+        );
+    }
+
+    /// One-shot `content` of `chunks`, counting every chunk polled.
+    fn counted_body(chunks: usize, polled: &Arc<std::sync::atomic::AtomicUsize>) -> Body {
+        let polled = polled.clone();
+        Body::once(futures::stream::iter((0..chunks).map(move |n| {
+            polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ikigai_core::Bytes::from(format!("{n};")))
+        })))
+    }
+
+    /// Ledger #2286: a resolver that cannot carry a body is handed the attached body
+    /// collected, by value, through `issue_as_async_in`; and refuses a second value under
+    /// the attached name, as the kernel does.
+    #[test]
+    fn the_attached_issue_default_collects_the_body_and_issues_by_value() {
+        struct Echo;
+        impl Resolver for Echo {
+            fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
+                let content = match request.args.get("content") {
+                    Some(ArgRef::Inline(bytes)) => bytes.clone(),
+                    other => panic!("the default sends the body inline, got {other:?}"),
+                };
+                Ok((
+                    Representation::new(ikigai_core::ReprType::new("text/plain"), content),
+                    CacheStatus::Uncacheable,
+                ))
+            }
+            fn is_cached(&self, _: &Request, _: &Capability) -> bool {
+                false
+            }
+            fn entries(&self) -> Option<Vec<SpaceEntry>> {
+                None
+            }
+        }
+        let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read = || Request::new(Verb::Source, Iri::parse("urn:echo").unwrap());
+        let attach = Some(("content".to_string(), counted_body(3, &polled)));
+        let (answer, _) = block_on(Echo.issue_attached_in(
+            read(),
+            &Capability::root(),
+            None,
+            Scope::empty(),
+            attach,
+        ))
+        .unwrap();
+        assert_eq!(answer.bytes, b"0;1;2;");
+        let attach = Some(("content".to_string(), Body::from(b"x".to_vec())));
+        let (body, _) = block_on(Arc::new(Echo).issue_body_attached_in(
+            read(),
+            &Capability::root(),
+            None,
+            Scope::empty(),
+            attach,
+        ))
+        .unwrap();
+        assert_eq!(body.bytes.as_bytes().unwrap(), &b"x"[..]);
+        let twice = block_on(Echo.issue_attached_in(
+            read().with_arg("content", ArgRef::Inline(b"y".to_vec())),
+            &Capability::root(),
+            None,
+            Scope::empty(),
+            Some(("content".to_string(), Body::from(b"x".to_vec()))),
+        ));
+        assert!(
+            matches!(&twice, Err(Error::InvalidArgument { name, .. }) if name == "content"),
+            "{twice:?}"
+        );
+    }
+
+    /// The kernel (and an `Arc` of it) hands the attached body to a stage that declares it
+    /// `reads_body`, unread: a stage that stops after one chunk polls one.
+    #[test]
+    fn the_kernel_hands_an_attached_body_to_a_stage_that_reads_it() {
+        let first = ikigai_core::AsyncFnEndpoint::new("first", |inv| {
+            Box::pin(async move {
+                use futures::StreamExt;
+                let mut stream = inv.content_body("content").await?.into_stream();
+                let chunk = stream.next().await.transpose()?.unwrap_or_default();
+                Ok(Representation::new(
+                    ikigai_core::ReprType::new("text/plain"),
+                    chunk.to_vec(),
+                ))
+            })
+        })
+        .with_description(
+            Description::new("first")
+                .verb(Verb::Source)
+                .input(ikigai_core::ArgSpec::new("content").reads_body()),
+        );
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:first"), first),
+        )));
+        let read = || Request::new(Verb::Source, Iri::parse("urn:first").unwrap());
+        let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (answer, _) = block_on(kernel.issue_attached_in(
+            read(),
+            &Capability::root(),
+            None,
+            Scope::empty(),
+            Some(("content".to_string(), counted_body(100, &polled))),
+        ))
+        .unwrap();
+        assert_eq!(answer.bytes, b"0;");
+        assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (body, status) = block_on(kernel.issue_body_attached_in(
+            read(),
+            &Capability::root(),
+            None,
+            Scope::empty(),
+            Some(("content".to_string(), counted_body(100, &polled))),
+        ))
+        .unwrap();
+        assert_eq!(body.bytes.as_bytes().unwrap(), &b"0;"[..]);
+        assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            status,
+            CacheStatus::Uncacheable,
+            "one-shot content is never cached"
         );
     }
 }

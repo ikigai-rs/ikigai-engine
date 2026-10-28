@@ -41,6 +41,16 @@ its own crate for the browser build to reuse unchanged.
   where it likes, so nothing between the two is collected, and the line resolves as one
   request (one entry in the cache summary).
 
+  Otherwise a stage whose next stage is one request (`| <iri>` or `| sink <iri>`) hands it
+  its body as it produced it, ATTACHED as the argument the pipe fills (`content` for a sink,
+  the routed argument for a source). A stage that declares that argument `reads_body` reads
+  the upstream as it comes, so a one-shot producer is polled only as far as it reads; any
+  other stage is handed the same bytes, collected by the kernel under the run's byte budget
+  (the trace notes `collected=<argument>`). A value a fork's branches or a `..` map's items
+  read, and a line's final answer, are collected once under that budget: `OverBudget` past
+  it, never a shorter value. A mounted stage is sent the collected bytes, since a content id
+  does not cross a wire.
+
 - **Execution traces.** `trace <iri> [args]` resolves a resource and shows its
   execution tree, including cache status, timing, authority and endpoint notes.
   Default traces omit the `defaulted=` note so adding an optional input does not
