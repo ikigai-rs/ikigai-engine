@@ -43,14 +43,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ikigai_core::{
-    space_iri, ArgRef, ArgSpec, AsyncFnEndpoint, ContentId, Description, EndpointSpace, Error,
-    Exact, Invocation, Iri, Provenance, ReprType, Representation, Request, Result, Verb,
+    space_iri, ArgRef, ArgSpec, AsyncFnEndpoint, Body, ContentId, Description, EndpointSpace,
+    Error, Exact, Invocation, Iri, Provenance, ReprType, Representation, Request, Result, Verb,
 };
 use oxigraph::io::RdfFormat;
 use oxrdf::{Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 use oxttl::{TurtleParser, TurtleSerializer};
 
-use crate::engine::Staged;
+use crate::engine::{Flow, Staged};
 pub use crate::plan::MAX_PLAN_TRIPLES;
 use crate::plan::{
     execute, literal, too_large, verb_name, NodeRef, Plan, PlanHost, RefTo, Refusal, RunError, IK,
@@ -288,6 +288,27 @@ impl PlanHost for InvocationHost<'_, '_> {
 
     async fn issue(&self, request: Request, _incoming: Provenance) -> Result<Staged> {
         Ok(Staged::from(self.inv.issue(request).await?))
+    }
+
+    /// ⚠ Collected: an [`Invocation`] has no public way to issue a sub-request with a body
+    /// attached (core attaches one only for its own `transrept`), so this host never answers
+    /// a body, and a piped step here is issued by value as before (ledger #2490). An
+    /// `attach` it is handed anyway is collected under the run's byte budget.
+    async fn issue_flow(
+        &self,
+        request: Request,
+        incoming: Provenance,
+        attach: Option<(String, Body)>,
+        _body_out: bool,
+    ) -> Result<Flow> {
+        let request = match attach {
+            Some((name, body)) => {
+                let bytes = self.inv.collect(body).await?.to_vec();
+                request.with_arg(name, ArgRef::Inline(bytes))
+            }
+            None => request,
+        };
+        Ok(Flow::Staged(self.issue(request, incoming).await?))
     }
 
     async fn describe(&self, iri: &Iri) -> Option<Description> {
