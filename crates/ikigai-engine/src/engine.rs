@@ -230,7 +230,9 @@ commands:
 
 arguments:
   `key=value` sets an argument by name (`key` must be a declared argument of the
-  target); any other word is positional and fills the one argument left unnamed.
+  target, so a misspelled name is refused); any other word is positional and fills
+  the one argument left unnamed. to send text that holds `=`, name its argument:
+  `in=\"a=b\"`.
   each name is given once: `graph=A graph=B` is refused, never narrowed to one value.
 
 quoting:
@@ -1919,7 +1921,8 @@ impl Engine {
     /// `source` (which then runs it) and `cache` (which probes it). `args` are
     /// the stage's words after the IRI; a word `key=value` is a named argument
     /// when `key` is a declared argument of the target (discovered from its
-    /// self-description), otherwise it is positional text. The positional text —
+    /// self-description). A `key=value` whose key reads as a name but is not declared is
+    /// refused (ledger #2502); any other word is positional text. The positional text —
     /// or `incoming`, the value flowing in from a connector/fork — is routed to
     /// the one declared argument left unnamed.
     async fn source_request(
@@ -1968,6 +1971,13 @@ impl Engine {
             match arg.split_once('=') {
                 Some((key, value)) if is_named_argument(&declared, open, key) => {
                     words.push((key, value))
+                }
+                // A word that NAMES an argument the contract does not declare is a typo,
+                // refused rather than sent as text (ledger #2502): `toUpper inn=abc` used to
+                // answer `INN=ABC`. Without a contract (`description` is None) routing still
+                // fails open, as `last_contract_notes` reports.
+                Some((key, _)) if description.is_some() && looks_like_argument_name(key) => {
+                    return Err(undeclared_argument(iri.as_str(), &declared, key, arg))
                 }
                 _ => positional.push(arg),
             }
@@ -2962,6 +2972,35 @@ pub(crate) fn takes_open_arguments(description: Option<&Description>, verb: Verb
 /// all on an open argument set ([`takes_open_arguments`]).
 pub(crate) fn is_named_argument(declared: &[String], open: bool, key: &str) -> bool {
     key == "as" || open || declared.iter().any(|name| name == key)
+}
+
+/// Whether the `key` of a `key=value` word reads as an argument NAME: a letter, then
+/// letters, digits, `_` or `-`. Such a word is an attempt to name an argument; anything else
+/// that holds `=` (`2+2=4`, `=x`, a quoted `"x y=z"`) is text.
+fn looks_like_argument_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The refusal for `word`, whose `key` names no argument `target` declares: what it does
+/// declare, and how to send the word as text instead (name the argument it should fill).
+fn undeclared_argument(target: &str, declared: &[String], key: &str, word: &str) -> String {
+    let names = if declared.is_empty() {
+        "it declares no arguments".to_string()
+    } else {
+        let names: Vec<String> = declared.iter().map(|name| format!("`{name}`")).collect();
+        format!("its arguments: {}", names.join(", "))
+    };
+    let fill = match declared {
+        [only] => only.as_str(),
+        _ => "<argument>",
+    };
+    let text = word.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "`{target}` declares no argument `{key}` ({names}). To send `{word}` as text, name \
+         the argument it fills: {fill}=\"{text}\""
+    )
 }
 
 /// One value per name for a stage about to become a [`Request`] (which holds one value per
@@ -7126,15 +7165,15 @@ mod tests {
             .unwrap_err(),
             format!("invalid argument `as`: {GIVEN_TWICE}")
         );
-        // Two DIFFERENT names are still fine, and so is an undeclared key repeated as text.
+        // Two DIFFERENT names are still fine. An undeclared key, repeated or not, is refused
+        // as undeclared (ledger #2502), before the given-twice rule could see it.
         assert_eq!(
             output(engine.eval("source urn:demo:greet greeting=Hi name=World")).unwrap(),
             "Hi, World"
         );
-        assert_eq!(
-            output(engine.eval("source urn:test:upper a=b a=c")).unwrap(),
-            "A=B A=C"
-        );
+        assert!(output(engine.eval("source urn:test:upper a=b a=c"))
+            .unwrap_err()
+            .contains("declares no argument `a`"));
     }
 
     /// ledger #387, the write verbs: the top-level `sink`/`delete` and a piped `sink` stage
@@ -7241,22 +7280,70 @@ mod tests {
         assert_eq!(out, "Hi, b\nHi, a");
     }
 
+    /// ledger #2502: a word that NAMES an argument the contract does not declare is a typo,
+    /// and is refused. It used to be sent as positional text, so `toUpper inn=abc` answered
+    /// `INN=ABC` and `greet greting=Hello name=Joe` answered `greting=Hello, Joe`.
     #[test]
-    fn equals_in_a_value_is_positional_when_the_key_is_not_declared() {
-        // `a` is not a declared argument of toUpper, so `a=b` is positional input.
+    fn an_undeclared_argument_name_is_refused() {
+        let engine = greet_engine();
+        let err = output(engine.eval("source urn:test:upper inn=abc")).unwrap_err();
         assert_eq!(
-            output(greet_engine().eval("source urn:test:upper a=b")).unwrap(),
-            "A=B"
+            err,
+            "`urn:test:upper` declares no argument `inn` (its arguments: `in`). To send \
+             `inn=abc` as text, name the argument it fills: in=\"inn=abc\""
+        );
+        let err = output(engine.eval("source urn:demo:greet greting=Hello name=Joe")).unwrap_err();
+        assert!(
+            err.starts_with("`urn:demo:greet` declares no argument `greting` (its arguments: ")
+                && err.contains("`greeting`")
+                && err.contains("`name`")
+                && err.ends_with("<argument>=\"greting=Hello\""),
+            "{err}"
+        );
+        // The same word in a later pipe stage is refused the same way.
+        assert!(
+            output(engine.eval("source urn:test:upper a | urn:test:upper inn=x"))
+                .unwrap_err()
+                .contains("declares no argument `inn`")
         );
     }
 
+    /// The way out the refusal names: text holding `=` goes to an argument by name. Text whose
+    /// part before `=` is not an argument name (`2+2=4`, a quoted `"x y=z"`) is still text.
     #[test]
-    fn an_undeclared_key_is_treated_as_positional_text() {
-        // `bogus` isn't declared, so `bogus=x` is positional and fills `greeting`.
+    fn text_holding_equals_is_sent_by_naming_its_argument() {
+        let engine = greet_engine();
         assert_eq!(
-            output(greet_engine().eval("source urn:demo:greet bogus=x name=World")).unwrap(),
-            "bogus=x, World"
+            output(engine.eval("source urn:test:upper in=\"a=b\"")).unwrap(),
+            "A=B"
         );
+        assert_eq!(
+            output(engine.eval("source urn:test:upper 2+2=4")).unwrap(),
+            "2+2=4"
+        );
+        assert_eq!(
+            output(engine.eval("source urn:test:upper \"x y=z\"")).unwrap(),
+            "X Y=Z"
+        );
+    }
+
+    /// Without a contract the engine cannot tell a typo from text, so routing still fails
+    /// open (ledger #98): an undeclared `key=value` stays positional, and the line is noted.
+    #[test]
+    fn without_a_contract_an_undeclared_key_stays_text() {
+        let echo_in = FnEndpoint::new("echo-in", |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                inv.inline_str("in").unwrap_or("-").as_bytes().to_vec(),
+            ))
+        });
+        let space = EndpointSpace::new().bind(Exact::new("urn:test:echo-in"), echo_in);
+        let engine = Engine::new(Kernel::new(Arc::new(space)));
+        assert_eq!(
+            output(engine.eval("source urn:test:echo-in inn=abc")).unwrap(),
+            "inn=abc"
+        );
+        assert_eq!(engine.last_contract_notes().len(), 1);
     }
 
     #[test]
@@ -7549,10 +7636,12 @@ mod tests {
             output(engine.eval("source urn:demo:compose src=urn:x title=a title=b")).unwrap_err(),
             format!("invalid argument `title`: {GIVEN_TWICE}")
         );
-        // On a CLOSED action an undeclared `k=v` is still positional text.
-        assert_eq!(
-            output(greet_engine().eval("source urn:demo:greet bogus=x name=World")).unwrap(),
-            "bogus=x, World"
+        // On a CLOSED action an undeclared `k=v` is refused (ledger #2502); it used to be
+        // positional text.
+        assert!(
+            output(greet_engine().eval("source urn:demo:greet bogus=x name=World"))
+                .unwrap_err()
+                .contains("declares no argument `bogus`")
         );
     }
 
