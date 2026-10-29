@@ -1,0 +1,20 @@
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+
+<urn:plan:shout> a ik:Process ;
+    ik:input <urn:plan:shout:input:who> ;
+    ik:output "text/plain" ;
+    ik:step <urn:plan:shout:step:1> ;
+    ik:result <urn:plan:shout:step:1> .
+
+<urn:plan:shout:input:who> ik:inputName "who" ;
+    ik:source "argument" ;
+    ik:required true .
+
+<urn:plan:shout:step:1> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:text:upper> ;
+    ik:argument <urn:plan:shout:step:1:arg:in> .
+
+<urn:plan:shout:step:1:arg:in> a ik:Argument ;
+    ik:inputName "in" ;
+    ik:ref <urn:plan:shout:var:who> .

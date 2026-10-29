@@ -126,6 +126,9 @@ fn eval_endpoint() -> AsyncFnEndpoint {
             )
             .verb(Verb::Source)
             .input(plan_input("piped in, it is the sole required input"))
+            .open_arguments(
+                "parameters declared by the supplied plan; undeclared names are refused",
+            )
             .input(
                 ArgSpec::new("as")
                     .summary(

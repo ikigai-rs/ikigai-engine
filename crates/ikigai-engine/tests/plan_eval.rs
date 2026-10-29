@@ -350,6 +350,64 @@ fn output(action: Action) -> Result<String, String> {
     }
 }
 
+/// A stored plan and a text endpoint, with real metadata routing and plan validation.
+fn shout_engine() -> Engine {
+    let space = EndpointSpace::new()
+        .bind(
+            Exact::new("urn:file:shout.ttl"),
+            FnEndpoint::new("shout-plan", |_: &Invocation<'_>| {
+                Ok(Representation::new(
+                    ReprType::new("text/turtle"),
+                    include_bytes!("fixtures/plan-shout.ttl").to_vec(),
+                ))
+            })
+            .with_description(Description::new("shout-plan").verb(Verb::Source)),
+        )
+        .bind(
+            Exact::new("urn:text:upper"),
+            FnEndpoint::new("upper", |inv: &Invocation<'_>| {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    inv.inline_str("in")?.to_uppercase().into_bytes(),
+                ))
+            })
+            .with_description(
+                Description::new("upper")
+                    .verb(Verb::Source)
+                    .input(input("in"))
+                    .output("text/plain"),
+            ),
+        );
+    Engine::new(Arc::new(Kernel::with_meta_renderer(
+        Arc::new(ikigai_core::Fallback::new(vec![
+            Arc::new(space),
+            Arc::new(ikigai_shacl::space()),
+            Arc::new(ikigai_engine::plan_space::space()),
+        ])),
+        Arc::new(JsonRenderer),
+    )))
+}
+
+#[test]
+fn piped_eval_passes_named_parameters_to_the_plan() {
+    let engine = shout_engine();
+    assert_eq!(
+        output(engine.eval("source urn:file:shout.ttl | urn:plan:eval who=brian")),
+        Ok("BRIAN".to_string()),
+    );
+}
+
+#[test]
+fn piped_eval_refuses_parameters_the_plan_does_not_declare() {
+    let engine = shout_engine();
+    let error = output(engine.eval("source urn:file:shout.ttl | urn:plan:eval nobody=x"))
+        .expect_err("undeclared parameter must be refused");
+    assert!(
+        error.contains("<urn:plan:shout> declares no parameter `nobody` (it declares who)"),
+        "{error}",
+    );
+}
+
 // --- one runner, two hosts -----------------------------------------------------------
 
 #[test]
