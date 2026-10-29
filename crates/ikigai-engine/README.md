@@ -78,6 +78,16 @@ With the `plan-reader` feature, `plan_space::space()` binds `urn:plan:eval`,
 `urn:plan:validate` and `urn:plan:requires`, and names itself
 `urn:iki:space:engine:plan` (`plan_space::SPACE_ID`).
 
+`bind <name> = <verb> <target> [key=value …]` and `unbind <name>` write a named request into
+the host's names atom (`Engine::with_names_atom`); a host that names none refuses them. A
+binding is checked against its target's contract when it is written (`bind urn:x = source
+urn:t:upper nosuch=1` is refused naming `nosuch`), a `{var}` in a template name fills the
+target IRI or a whole argument value, and a `urn:plan:eval` binding copies the plan's
+`ik:input`s onto the name. The atom holds the names text form (`names`, media type
+`text/x-ikigai-names`, one binding per line). With `plan-reader`, `names::space()` binds the
+lossless transreptor pair `urn:names:to-rdf` / `urn:names:from-rdf` between that form and the
+`ik:Alias` Turtle core builds, and names itself `urn:iki:space:engine:names`.
+
 A stored plan run by `execute` pipes as the text face does: a step whose only reader is one
 `ik:pipeFrom` edge hands that step its body attached, and a value read more than once (a
 fork's branches, a `..` map's items, a step referencing its `ik:binds`) or the plan's result

@@ -173,6 +173,7 @@ pub(crate) fn combine_outputs(parts: Vec<Staged>) -> Staged {
 
 use crate::config;
 
+mod bind;
 mod why;
 pub use why::{Viewer, COMMANDS};
 
@@ -195,6 +196,13 @@ commands:
   delete <iri> [k=v …]       DELETE a resource (the delete verb)
   exists <iri> [k=v …]       EXISTS: ask whether a resource is there, without reading it
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
+  bind <name> = <verb> <iri> [k=v …]
+                             bind a NAME to a request in the host's names atom: each k=v is
+                             FIXED, checked against the target's contract; a `{var}` in a
+                             template name fills the target IRI or a WHOLE value (`id={id}`);
+                             binding a plan (`urn:plan:eval in=<plan>`) copies its inputs.
+                             `bind` alone lists the names; verbs: source sink exists delete forward
+  unbind <name>              remove a name from the host's names atom
   (<sexpr>)                  evaluate a Lisp form (leading `(` routes to urn:lisp:eval)
   :lisp                      enter multi-line Lisp mode; a blank line evaluates, `:lisp` cancels
   :load <uri> [cap=<scope>]  read a script resource and evaluate it as Lisp (cap= narrows first)
@@ -467,6 +475,10 @@ pub struct Engine {
     /// — the HOST's to supply ([`with_host_build`](Self::with_host_build)), because only the
     /// binary that IS the kernel knows its own version. `None` ⇒ the message is unchanged.
     host_build: Option<HostBuild>,
+    /// The resource holding this host's names, which `bind` and `unbind` write (ledger
+    /// #2509) — the HOST's to name ([`with_names_atom`](Self::with_names_atom)). `None` ⇒
+    /// both are refused by name.
+    names_atom: Option<Iri>,
 }
 
 /// The running build and the command that replaces it, for [`Engine::with_host_build`].
@@ -602,6 +614,7 @@ impl Engine {
             scope: RefCell::new(Scope::empty()),
             viewer: None,
             host_build: None,
+            names_atom: None,
         }
     }
 
@@ -1035,6 +1048,8 @@ impl Engine {
             // which runs a signed program). It still runs the plan for one release, and says so.
             "run" => output(self, renamed_to_execute(self.run_stored_plan(rest).await)),
             "sink" => output(self, self.run_sink(rest).await),
+            "bind" => output(self, self.run_bind(rest).await),
+            "unbind" => output(self, self.run_unbind(rest).await),
             "delete" | "del" => output(self, self.run_delete(rest).await),
             "exists" => output(self, self.run_exists(rest).await),
             "describe" | "desc" => {
@@ -3007,7 +3022,7 @@ pub(crate) fn is_named_argument(declared: &[String], open: bool, key: &str) -> b
 /// Whether the `key` of a `key=value` word reads as an argument NAME: a letter, then
 /// letters, digits, `_` or `-`. Such a word is an attempt to name an argument; anything else
 /// that holds `=` (`2+2=4`, `=x`, a quoted `"x y=z"`) is text.
-fn looks_like_argument_name(key: &str) -> bool {
+pub(crate) fn looks_like_argument_name(key: &str) -> bool {
     let mut chars = key.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -3190,6 +3205,11 @@ impl From<&str> for Word {
 }
 
 impl Word {
+    /// Whether any of the word was quoted.
+    pub(crate) fn is_quoted(&self) -> bool {
+        self.quoted
+    }
+
     /// The reference an unquoted `key=<iri>` word names: `None` for any other word, and the
     /// refusal for an unquoted `key=<…>` whose inside is not an IRI, which says how to send
     /// it as text instead.
@@ -3224,7 +3244,7 @@ impl std::fmt::Display for Word {
 
 /// A lexical token. `Word` carries already-unquoted text and its quotedness.
 #[derive(Debug, PartialEq, Eq)]
-enum Token {
+pub(crate) enum Token {
     Word(Word),
     Pipe,  // |
     Map,   // ..  (only as a whole, unquoted word)
@@ -3243,7 +3263,7 @@ enum Token {
 /// a literal quote and `\\` a literal backslash, any other `\x` left as-is.
 /// Quote a word to use any operator character, or a bare `..`, as literal data — or to
 /// keep a `key="<iri>"` value text rather than a reference ([`Word::reference`]).
-fn tokenize(spec: &str) -> Result<Vec<Token>, String> {
+pub(crate) fn tokenize(spec: &str) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
     let mut word = String::new();
     let mut in_word = false; // started a word? distinguishes "" (a quoted empty) from no word

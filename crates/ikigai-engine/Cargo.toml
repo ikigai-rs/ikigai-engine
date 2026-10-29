@@ -58,7 +58,10 @@ futures = { workspace = true }
 # wasm32-unknown-unknown` passes on main and failed with these deps unconditional. The
 # `wasm32 lib clippy` job in ci.yml now runs exactly that, so the claim is a gate.
 default = []
-plan-reader = ["dep:oxttl", "dep:oxrdf", "dep:ikigai-store", "dep:oxigraph"]
+# `ikigai-core/declare` is core's Turtle reader (`Topology::from_turtle`), which the names
+# file's Turtle transreptors read their own output back with (ledger #2509); it pulls the same
+# oxttl/getrandom stack, so it belongs to this feature.
+plan-reader = ["dep:oxttl", "dep:oxrdf", "dep:ikigai-store", "dep:oxigraph", "ikigai-core/declare"]
 
 [dev-dependencies]
 # The pipe tests' counting producer overrides `Endpoint::invoke_body`, an `async_trait`
