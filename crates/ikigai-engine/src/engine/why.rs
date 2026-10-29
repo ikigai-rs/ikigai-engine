@@ -37,6 +37,8 @@ pub const COMMANDS: &[&str] = &[
     "delete",
     "exists",
     "describe",
+    "bind",
+    "unbind",
     ":lisp",
     ":load",
     "cache",

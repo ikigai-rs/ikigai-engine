@@ -14,6 +14,9 @@
 pub mod config;
 pub mod engine;
 pub mod fanout;
+/// The names text form (`<name> = <verb> <target> [key=value …]`) a host's names atom is
+/// written in, and its Turtle transreptor pair (`plan-reader`).
+pub mod names;
 mod plan;
 /// `urn:plan:eval`, `urn:plan:validate` and `urn:plan:requires` — plan execution as a
 /// resource. Reading a plan needs the Turtle parser, so this is the `plan-reader` feature's.
