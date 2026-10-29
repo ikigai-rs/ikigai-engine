@@ -233,6 +233,9 @@ arguments:
   target, so a misspelled name is refused); any other word is positional and fills
   the one argument left unnamed. to send text that holds `=`, name its argument:
   `in=\"a=b\"`.
+  `key=<iri>` sends a REFERENCE to the resource, not text: the target's contract decides
+  whether it reads the referent, takes the IRI, or reads the body itself. quote the value,
+  `key=\"<iri>\"`, to send the text `<iri>` instead.
   each name is given once: `graph=A graph=B` is refused, never narrowed to one value.
 
 quoting:
@@ -527,7 +530,7 @@ fn parse_as_of(raw: &str) -> Result<AsOf, String> {
 /// does not change what it means; two words naming DIFFERENT instants are refused (two
 /// spellings of the same instant are one).
 fn take_as_of(pipeline: &mut Pipeline) -> Result<Option<AsOf>, String> {
-    fn words(words: &mut Vec<String>, found: &mut Option<AsOf>) -> Result<(), String> {
+    fn words(words: &mut Vec<Word>, found: &mut Option<AsOf>) -> Result<(), String> {
         let mut error = None;
         words.retain(|word| match word.split_once('=') {
             Some((AS_OF, raw)) => {
@@ -1710,7 +1713,7 @@ impl Engine {
     async fn run_source(
         &self,
         target: &str,
-        args: &[String],
+        args: &[Word],
         incoming: Option<&[u8]>,
         prov: Provenance,
     ) -> Result<Staged, String> {
@@ -1931,7 +1934,7 @@ impl Engine {
     async fn source_request(
         &self,
         target: &str,
-        args: &[String],
+        args: &[Word],
         incoming: Option<&[u8]>,
     ) -> Result<Request, String> {
         Ok(self.source_request_routed(target, args, incoming).await?.0)
@@ -1942,7 +1945,7 @@ impl Engine {
     async fn source_request_routed(
         &self,
         target: &str,
-        args: &[String],
+        args: &[Word],
         incoming: Option<&[u8]>,
     ) -> Result<(Request, Option<String>), String> {
         let iri = parse_target(target)?;
@@ -1969,11 +1972,17 @@ impl Engine {
         // On an OPEN argument set every `key=value` word is named (ledger #1547).
         let open = takes_open_arguments(description.as_ref(), Verb::Source);
         let mut words: Vec<(&str, &str)> = Vec::new();
+        let mut references: Vec<(&str, Iri)> = Vec::new();
         let mut positional: Vec<&str> = Vec::new();
         for arg in args {
             match arg.split_once('=') {
+                // An unquoted `key=<iri>` is a reference (ledger #2508), which the kernel
+                // settles by the target's contract.
                 Some((key, value)) if is_named_argument(&declared, open, key) => {
-                    words.push((key, value))
+                    match arg.reference().filter(|_| key != "as") {
+                        Some(reference) => references.push(reference?),
+                        None => words.push((key, value)),
+                    }
                 }
                 // A word that NAMES an argument the contract does not declare is a typo,
                 // refused rather than sent as text (ledger #2502): `toUpper inn=abc` used to
@@ -1991,12 +2000,18 @@ impl Engine {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        refuse_a_repeated_reference(&words, &references)?;
+        // Every name given, by value or by reference: what routing must leave alone.
+        let names: Vec<&str> = named
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(references.iter().map(|(name, _)| *name))
+            .collect();
         let positional = positional.join(" ");
 
         // A batch's piped stdin, when this stage has no other value and a required
         // argument is left for it (ledger #1166).
         let stdin = if incoming.is_none() && positional.is_empty() && stdin_waiting {
-            let names: Vec<&str> = named.iter().map(|(name, _)| *name).collect();
             self.stdin_for_the_required_argument(&iri, description.as_ref(), &names)
         } else {
             None
@@ -2021,10 +2036,12 @@ impl Engine {
         for (name, value) in &named {
             request = request.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
         }
+        for (name, reference) in references {
+            request = request.with_arg(name, ArgRef::Reference(reference));
+        }
 
         let mut routed = None;
         if let Some(value) = value {
-            let names: Vec<&str> = named.iter().map(|(name, _)| *name).collect();
             let name = route_value_name(&iri, description.as_ref(), &names)?;
             routed = Some(name.to_string());
             request = request.with_arg(name, ArgRef::Inline(value.to_vec()));
@@ -2081,7 +2098,7 @@ impl Engine {
     async fn sink_request(
         &self,
         target: &str,
-        args: &[String],
+        args: &[Word],
         incoming: Option<&[u8]>,
     ) -> Result<Request, String> {
         let iri = parse_target(target)?;
@@ -2100,12 +2117,17 @@ impl Engine {
         let mut request = Request::new(Verb::Sink, iri.clone());
         let mut content_named = false;
         let mut words: Vec<(&str, &str)> = Vec::new();
+        let mut references: Vec<(&str, Iri)> = Vec::new();
         for arg in args {
             match arg.split_once('=') {
                 // `as` is the universal conneg selector (carried as an arg, not
-                // endpoint input), so it is always a named argument.
+                // endpoint input), so it is always a named argument. Any other unquoted
+                // `key=<iri>` is a reference (ledger #2508).
                 Some((key, value)) if is_named_argument(&declared, open, key) => {
-                    words.push((key, value));
+                    match arg.reference().filter(|_| key != "as") {
+                        Some(reference) => references.push(reference?),
+                        None => words.push((key, value)),
+                    }
                 }
                 _ => {
                     return Err(format!(
@@ -2120,6 +2142,11 @@ impl Engine {
         for (key, value) in join_named(description.as_ref(), Verb::Sink, &words)? {
             content_named |= key == "content";
             request = request.with_arg(key, ArgRef::Inline(value.into_bytes()));
+        }
+        refuse_a_repeated_reference(&words, &references)?;
+        for (key, reference) in references {
+            content_named |= key == "content";
+            request = request.with_arg(key, ArgRef::Reference(reference));
         }
 
         // Same last-wins hazard as the top-level `sink`: a named `content=` must survive,
@@ -3094,7 +3121,7 @@ pub(crate) enum Connector {
 /// is multi-stage or itself a fork, in which case the fork runs sequentially (so a
 /// spawned branch is always a single resolve, never something that re-enters the
 /// parallel path).
-fn single_source_branches(branches: &[Pipeline]) -> Option<Vec<&[String]>> {
+fn single_source_branches(branches: &[Pipeline]) -> Option<Vec<&[Word]>> {
     branches
         .iter()
         .map(|branch| match &branch.first {
@@ -3108,13 +3135,13 @@ fn single_source_branches(branches: &[Pipeline]) -> Option<Vec<&[String]>> {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Node {
     /// A `source` leaf: the first word is the IRI, the rest the literal input.
-    Source(Vec<String>),
+    Source(Vec<Word>),
     /// A `sink` leaf: a stage written `sink <iri> [key=value …]`. The first word
     /// is the target IRI, the rest leading named arguments; the piped upstream
     /// value fills the sink's `content`. This is the pipeline write-terminal —
     /// `A | B | sink <iri>` stores `B`'s output — mirroring the top-level `sink`
     /// command, whose content instead comes verbatim from the spec.
-    Sink(Vec<String>),
+    Sink(Vec<Word>),
     /// A `( … ; … )` fork: each branch is run on the same input, outputs joined.
     Fork(Vec<Pipeline>),
 }
@@ -3140,10 +3167,65 @@ pub(crate) struct Pipeline {
     pub(crate) rest: Vec<Step>,
 }
 
-/// A lexical token. `Word` carries already-unquoted text.
+/// A word of a stage: its already-unquoted text, and whether any of it was quoted.
+///
+/// The text is what every reader of a stage sees (it derefs to `str`). Quotedness is kept
+/// for the one reading that depends on it (ledger #2508): an unquoted `key=<iri>` sends a
+/// reference, while a quoted `key="<urn:x>"` (or `"key=<urn:x>"`) is literal text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Word {
+    text: String,
+    quoted: bool,
+}
+
+/// A word as typed without quotes.
+#[cfg(test)]
+impl From<&str> for Word {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            quoted: false,
+        }
+    }
+}
+
+impl Word {
+    /// The reference an unquoted `key=<iri>` word names: `None` for any other word, and the
+    /// refusal for an unquoted `key=<…>` whose inside is not an IRI, which says how to send
+    /// it as text instead.
+    pub(crate) fn reference(&self) -> Option<Result<(&str, Iri), String>> {
+        if self.quoted {
+            return None;
+        }
+        let (key, value) = self.text.split_once('=')?;
+        let inner = value.strip_prefix('<')?.strip_suffix('>')?;
+        Some(Iri::parse(inner).map(|iri| (key, iri)).map_err(|e| {
+            format!(
+                "`{word}` names a reference, and `{inner}` is not an IRI ({e}); quote the \
+                 value to send it as text: `{key}=\"{value}\"`",
+                word = self.text,
+            )
+        }))
+    }
+}
+
+impl std::ops::Deref for Word {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for Word {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// A lexical token. `Word` carries already-unquoted text and its quotedness.
 #[derive(Debug, PartialEq, Eq)]
 enum Token {
-    Word(String),
+    Word(Word),
     Pipe,  // |
     Map,   // ..  (only as a whole, unquoted word)
     Open,  // (
@@ -3159,7 +3241,8 @@ enum Token {
 /// are not. A `"…"` span keeps any of them — and whitespace — literal and is
 /// removed from the resulting word (`"a | b"` is one `Word`); inside it `\"` is
 /// a literal quote and `\\` a literal backslash, any other `\x` left as-is.
-/// Quote a word to use any operator character, or a bare `..`, as literal data.
+/// Quote a word to use any operator character, or a bare `..`, as literal data — or to
+/// keep a `key="<iri>"` value text rather than a reference ([`Word::reference`]).
 fn tokenize(spec: &str) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
     let mut word = String::new();
@@ -3176,7 +3259,10 @@ fn tokenize(spec: &str) -> Result<Vec<Token>, String> {
                     tokens.push(Token::Map);
                     word.clear();
                 } else {
-                    tokens.push(Token::Word(std::mem::take(word)));
+                    tokens.push(Token::Word(Word {
+                        text: std::mem::take(word),
+                        quoted: *quoted,
+                    }));
                 }
                 *in_word = false;
                 *quoted = false;
@@ -3315,7 +3401,7 @@ impl Parser {
                 // `… | sink <iri> [key=value …]` sinks the piped value into `<iri>`.
                 // (A source target is always a scheme'd IRI, never the bare word
                 // `sink`, so this keyword can't shadow a real resource.)
-                if words.first().map(String::as_str) == Some("sink") {
+                if words.first().map(|word| &**word) == Some("sink") {
                     Ok(Node::Sink(words.split_off(1)))
                 } else {
                     Ok(Node::Source(words))
@@ -3650,6 +3736,23 @@ pub(crate) fn given_twice(name: &str) -> String {
         detail: "given twice; an argument takes one value, so name it once".to_string(),
     }
     .to_string()
+}
+
+/// Refuse a reference whose name is also given another time, by value or by reference
+/// (ledger #2508): an argument is given once, one way, and a reference has no joined form, so
+/// even a list argument's repeat is refused when one of its values is a reference.
+pub(crate) fn refuse_a_repeated_reference(
+    words: &[(&str, &str)],
+    references: &[(&str, Iri)],
+) -> Result<(), String> {
+    for (i, (name, _)) in references.iter().enumerate() {
+        if words.iter().any(|(word, _)| word == name)
+            || references[..i].iter().any(|(earlier, _)| earlier == name)
+        {
+            return Err(given_twice(name));
+        }
+    }
+    Ok(())
 }
 
 /// The first name that appears twice in `names`, in order (ledger #387).
@@ -5521,6 +5624,162 @@ mod tests {
 
     /// An engine with both a `toUpper` source and the `urn:test:write` sink, so a
     /// pipeline can *produce* a value and then *store* it into a sink terminal.
+    /// An engine for `key=<iri>` (ledger #2508): `urn:test:probe` declares inputs that read
+    /// their own bodies, so the kernel hands them the argument as given, and answers which
+    /// kind each one was; `urn:test:note` is a referent; `urn:test:upper` takes `in` by value.
+    fn reference_engine() -> Engine {
+        fn seen(inv: &Invocation<'_>) -> String {
+            let mut args: Vec<String> = inv
+                .request
+                .args
+                .iter()
+                .map(|(name, arg)| match arg {
+                    ArgRef::Reference(iri) => format!("{name}=ref {}", iri.as_str()),
+                    ArgRef::Inline(bytes) => {
+                        format!("{name}=inline {}", String::from_utf8_lossy(bytes))
+                    }
+                    ArgRef::Content(_) => format!("{name}=content"),
+                })
+                .collect();
+            args.sort();
+            args.join(" ")
+        }
+        let probe = FnEndpoint::new("probe", |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                seen(inv).into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("probe")
+                .verb(Verb::Source)
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("in").reads_body())
+                .input(ArgSpec::new("meta").optional().reads_body())
+                .input(ArgSpec::new("content").optional().reads_body()),
+        );
+        let note = FnEndpoint::new("note", |_: &Invocation<'_>| {
+            Ok(Representation::new(ReprType::new("text/plain"), b"world".to_vec()).cacheable())
+        });
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:probe"), probe)
+            .bind(Exact::new("urn:test:note"), note)
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper());
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    /// ledger #2508: an unquoted `key=<iri>` sends a reference, and the target's contract
+    /// settles it — a body-reading input gets the reference, a by-value one the referent.
+    #[test]
+    fn an_unquoted_angle_bracketed_value_is_a_reference() {
+        let engine = reference_engine();
+        assert_eq!(
+            output(engine.eval("source urn:test:probe in=<urn:test:note>")).unwrap(),
+            "in=ref urn:test:note"
+        );
+        assert_eq!(
+            output(engine.eval("source urn:test:upper in=<urn:test:note>")).unwrap(),
+            "WORLD"
+        );
+        // A reference is named, so a positional value still routes to what is left.
+        assert_eq!(
+            output(engine.eval("source urn:test:probe meta=<urn:test:note> hi")).unwrap(),
+            "in=inline hi meta=ref urn:test:note"
+        );
+        // A piped stage, and a pipeline `sink` stage.
+        assert_eq!(
+            output(engine.eval("source urn:test:upper hi | urn:test:probe meta=<urn:test:note>"))
+                .unwrap(),
+            "in=inline HI meta=ref urn:test:note"
+        );
+        assert_eq!(
+            output(
+                engine.eval("source urn:test:upper hi | sink urn:test:probe meta=<urn:test:note>")
+            )
+            .unwrap(),
+            "content=inline HI meta=ref urn:test:note"
+        );
+    }
+
+    /// ledger #2508: a quoted value is literal text, however it looks.
+    #[test]
+    fn a_quoted_angle_bracketed_value_stays_literal() {
+        let engine = reference_engine();
+        for line in [
+            "source urn:test:probe in=\"<urn:test:note>\"",
+            "source urn:test:probe \"in=<urn:test:note>\"",
+        ] {
+            assert_eq!(
+                output(engine.eval(line)).unwrap(),
+                "in=inline <urn:test:note>",
+                "{line}"
+            );
+        }
+        assert_eq!(
+            output(
+                engine.eval(
+                    "source urn:test:upper hi | sink urn:test:probe meta=\"<urn:test:note>\""
+                )
+            )
+            .unwrap(),
+            "content=inline HI meta=inline <urn:test:note>"
+        );
+        // Only a whole `<…>` value is a reference.
+        assert_eq!(
+            output(engine.eval("source urn:test:probe in=a<urn:test:note>")).unwrap(),
+            "in=inline a<urn:test:note>"
+        );
+    }
+
+    /// ledger #2508: an unquoted `<…>` that is not an IRI is refused, saying how to send it
+    /// as text, rather than sent as text that looked like a reference.
+    #[test]
+    fn an_unquoted_angle_bracketed_non_iri_is_refused() {
+        let engine = reference_engine();
+        let error = output(engine.eval("source urn:test:upper in=<b>")).unwrap_err();
+        assert!(error.contains("`in=<b>`"), "{error}");
+        assert!(error.contains("in=\"<b>\""), "{error}");
+        assert_eq!(
+            output(engine.eval("source urn:test:upper in=\"<b>\"")).unwrap(),
+            "<B>"
+        );
+    }
+
+    /// ledger #2508: an argument is given once, one way — a reference and a value for the
+    /// same name, or two references, are refused as a repeat.
+    #[test]
+    fn a_reference_given_twice_is_refused() {
+        let engine = reference_engine();
+        let refusal = format!("invalid argument `meta`: {GIVEN_TWICE}");
+        for line in [
+            "source urn:test:probe meta=<urn:test:note> meta=<urn:test:note> hi",
+            "source urn:test:probe meta=<urn:test:note> meta=x hi",
+            "source urn:test:upper hi | sink urn:test:probe meta=x meta=<urn:test:note>",
+            "plan urn:test:probe meta=<urn:test:note> meta=x hi",
+        ] {
+            assert_eq!(output(engine.eval(line)).unwrap_err(), refusal, "{line}");
+        }
+    }
+
+    /// ledger #2508: `plan` renders a reference as `ik:ref`, and a quoted one as a value.
+    #[test]
+    fn plan_renders_a_reference_as_ik_ref() {
+        let engine = reference_engine();
+        let plan = output(engine.eval("plan urn:test:probe in=<urn:test:note>")).unwrap();
+        assert!(plan.contains("ik:ref <urn:test:note>"), "{plan}");
+        let plan = output(
+            engine.eval("plan urn:test:upper hi | sink urn:test:probe meta=<urn:test:note>"),
+        )
+        .unwrap();
+        assert!(plan.contains("ik:ref <urn:test:note>"), "{plan}");
+        let plan = output(engine.eval("plan urn:test:probe in=\"<urn:test:note>\"")).unwrap();
+        assert!(!plan.contains("ik:ref"), "{plan}");
+        assert!(plan.contains("ik:value \"<urn:test:note>\""), "{plan}");
+    }
+
     fn pipe_sink_engine() -> Engine {
         let endpoint = FnEndpoint::new("write", |inv: &Invocation<'_>| {
             let url = inv.inline_str("url").unwrap_or("");
@@ -6882,9 +7141,17 @@ mod tests {
         assert!(err.contains("empty pipeline stage"), "got: {err}");
     }
 
-    /// Shorthand for an expected `Word` token.
+    /// Shorthand for an expected unquoted `Word` token.
     fn w(s: &str) -> Token {
-        Token::Word(s.to_string())
+        Token::Word(s.into())
+    }
+
+    /// Shorthand for an expected `Word` token that was (at least partly) quoted.
+    fn q(s: &str) -> Token {
+        Token::Word(Word {
+            text: s.to_string(),
+            quoted: true,
+        })
     }
 
     #[test]
@@ -6921,7 +7188,7 @@ mod tests {
             let (_, value, _) = take_named_arg(&format!("title={quoted} rest"), &declared)
                 .unwrap_or_else(|| panic!("{quoted} is a terminated quote"));
             assert_eq!(
-                vec![w(&value)],
+                vec![q(&value)],
                 tokenize(quoted).unwrap(),
                 "a sink's named arg and the tokenizer disagree on {quoted}"
             );
@@ -6939,7 +7206,7 @@ mod tests {
             tokenize("urn:test:upper \"a | b\" | urn:demo:wrap").unwrap(),
             vec![
                 w("urn:test:upper"),
-                w("a | b"),
+                q("a | b"),
                 Token::Pipe,
                 w("urn:demo:wrap"),
             ]
@@ -6950,7 +7217,7 @@ mod tests {
     fn tokenize_processes_escapes() {
         assert_eq!(
             tokenize(r#"x "say \"hi\" \\ ok""#).unwrap(),
-            vec![w("x"), w(r#"say "hi" \ ok"#)]
+            vec![w("x"), q(r#"say "hi" \ ok"#)]
         );
     }
 
@@ -6979,8 +7246,39 @@ mod tests {
         // `..` only tokenises as Map when it's a whole, unquoted word.
         assert_eq!(
             tokenize(r#"urn:x/../y ".." z"#).unwrap(),
-            vec![w("urn:x/../y"), w(".."), w("z")]
+            vec![w("urn:x/../y"), q(".."), w("z")]
         );
+    }
+
+    /// ledger #2508: a word remembers whether any of it was quoted, which is what keeps
+    /// `key="<iri>"` text while an unquoted `key=<iri>` is a reference.
+    #[test]
+    fn tokenize_keeps_whether_a_word_was_quoted() {
+        let words: Vec<Option<Result<(String, String), String>>> =
+            tokenize(r#"in=<urn:a> in="<urn:a>" "in=<urn:a>" in=<urn:a>x in=<x> <urn:a>"#)
+                .unwrap()
+                .into_iter()
+                .map(|token| match token {
+                    Token::Word(word) => word.reference().map(|reference| {
+                        reference.map(|(key, iri)| (key.to_string(), iri.as_str().to_string()))
+                    }),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+        assert_eq!(
+            words[..4],
+            [
+                Some(Ok(("in".to_string(), "urn:a".to_string()))),
+                None,
+                None,
+                None,
+            ]
+        );
+        assert!(
+            matches!(&words[4], Some(Err(e)) if e.contains(r#"`in="<x>"`"#)),
+            "{words:?}"
+        );
+        assert_eq!(words[5], None, "a positional `<iri>` is text");
     }
 
     #[test]
@@ -7071,7 +7369,13 @@ mod tests {
         let pipeline = parse_spec(r#"urn:q query="SELECT ?s ; x""#).expect("quoted");
         assert_eq!(
             pipeline.first,
-            Node::Source(vec!["urn:q".into(), "query=SELECT ?s ; x".into()])
+            Node::Source(vec![
+                "urn:q".into(),
+                Word {
+                    text: "query=SELECT ?s ; x".to_string(),
+                    quoted: true,
+                },
+            ])
         );
         // An apostrophe in a positional value is still ordinary text.
         assert_eq!(

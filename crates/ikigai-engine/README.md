@@ -17,7 +17,10 @@ its own crate for the browser build to reuse unchanged.
   a differently-named argument, several arguments, or only a grammar binding. A
   `key=value` word names a declared argument, once: `graph=A graph=B` is refused as an invalid
   argument `graph`, "given twice", never narrowed to the last value. Positional
-  or piped text fills the one argument left unnamed. The contract is fetched through `issue`, so it works the
+  or piped text fills the one argument left unnamed. An unquoted `key=<iri>` sends the
+  argument as a reference (`ArgRef::Reference`), which the kernel settles by the target's
+  contract, and `plan` renders as `ik:ref <iri>`; a quoted `key="<iri>"` is the literal text.
+  The contract is fetched through `issue`, so it works the
   same against a remote kernel. When the fetch FAILS (a kernel with no Meta renderer,
   a refusal, an answer that is not a JSON description), routing falls back to the
   conventional `in`, as it always did, and since 0.1.62 the line says so:

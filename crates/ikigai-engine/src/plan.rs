@@ -77,8 +77,9 @@ use ikigai_core::{ArgRef, Body, Description, Provenance, Request};
 #[cfg(feature = "plan-reader")]
 use crate::engine::{combine_outputs, root_provenance, Flow, Piped, Staged};
 use crate::engine::{
-    declared_arguments, is_named_argument, join_named, parse_spec, parse_target, route_value_name,
-    takes_open_arguments, Connector, Engine, Node, Pipeline,
+    declared_arguments, is_named_argument, join_named, parse_spec, parse_target,
+    refuse_a_repeated_reference, route_value_name, takes_open_arguments, Connector, Engine, Node,
+    Pipeline,
 };
 
 /// The ikigai vocabulary namespace — the terms a plan graph is written in.
@@ -148,7 +149,8 @@ pub(crate) enum Feed {
     not(feature = "plan-reader"),
     allow(
         dead_code,
-        reason = "only the reader constructs a reference; the renderer, always built, writes one"
+        reason = "only the reader constructs a `Name`; the builder constructs a `Resource` \
+                  from a `key=<iri>` word, and the renderer, always built, writes both"
     )
 )]
 pub(crate) enum RefTo {
@@ -1306,11 +1308,17 @@ impl Engine {
                     let open = takes_open_arguments(description.as_ref(), Verb::Source);
 
                     let mut words: Vec<(&str, &str)> = Vec::new();
+                    let mut references: Vec<(&str, Iri)> = Vec::new();
                     let mut positional: Vec<&str> = Vec::new();
                     for arg in args {
                         match arg.split_once('=') {
+                            // An unquoted `key=<iri>` is a reference, rendered `ik:ref`
+                            // (ledger #2508), as `source_request` sends it.
                             Some((key, value)) if is_named_argument(&declared, open, key) => {
-                                words.push((key, value));
+                                match arg.reference().filter(|_| key != "as") {
+                                    Some(reference) => references.push(reference?),
+                                    None => words.push((key, value)),
+                                }
                             }
                             _ => positional.push(arg),
                         }
@@ -1321,6 +1329,11 @@ impl Engine {
                         join_named(description.as_ref(), Verb::Source, &words)?
                             .into_iter()
                             .collect();
+                    refuse_a_repeated_reference(&words, &references)?;
+                    let refs: BTreeMap<String, RefTo> = references
+                        .into_iter()
+                        .map(|(name, iri)| (name.to_string(), RefTo::Resource(iri)))
+                        .collect();
                     let positional = positional.join(" ");
                     if has_input && !positional.is_empty() {
                         return Err(format!(
@@ -1331,7 +1344,11 @@ impl Engine {
                     if !positional.is_empty() {
                         // The text face's one implicit routing decision, made explicit —
                         // which is the whole reason a plan can be checked before it runs.
-                        let named: Vec<&str> = arguments.keys().map(String::as_str).collect();
+                        let named: Vec<&str> = arguments
+                            .keys()
+                            .chain(refs.keys())
+                            .map(String::as_str)
+                            .collect();
                         let name = route_value_name(&iri, description.as_ref(), &named)?;
                         arguments.insert(name, positional);
                     }
@@ -1341,7 +1358,7 @@ impl Engine {
                             verb: Verb::Source,
                             resolves: iri,
                             arguments,
-                            refs: BTreeMap::new(),
+                            refs,
                             binds: None,
                             feed,
                         },
@@ -1358,10 +1375,14 @@ impl Engine {
                     let declared = declared_arguments(description.as_ref());
                     let open = takes_open_arguments(description.as_ref(), Verb::Sink);
                     let mut words: Vec<(&str, &str)> = Vec::new();
+                    let mut references: Vec<(&str, Iri)> = Vec::new();
                     for arg in args {
                         match arg.split_once('=') {
                             Some((key, value)) if is_named_argument(&declared, open, key) => {
-                                words.push((key, value));
+                                match arg.reference().filter(|_| key != "as") {
+                                    Some(reference) => references.push(reference?),
+                                    None => words.push((key, value)),
+                                }
                             }
                             _ => {
                                 return Err(format!(
@@ -1376,15 +1397,20 @@ impl Engine {
                         join_named(description.as_ref(), Verb::Sink, &words)?
                             .into_iter()
                             .collect();
+                    refuse_a_repeated_reference(&words, &references)?;
+                    let refs: BTreeMap<String, RefTo> = references
+                        .into_iter()
+                        .map(|(name, iri)| (name.to_string(), RefTo::Resource(iri)))
+                        .collect();
                     if has_input {
-                        if arguments.contains_key("content") {
+                        if arguments.contains_key("content") || refs.contains_key("content") {
                             return Err(format!(
                                 "`sink {}` was given content twice — named `content=` and the \
                                  piped value; drop one",
                                 iri.as_str()
                             ));
                         }
-                    } else {
+                    } else if !refs.contains_key("content") {
                         // Nothing flows in, so the body is empty — which `sink_request`
                         // sends as an empty `content`. A plan says that rather than
                         // leaving the next reader to know it.
@@ -1396,7 +1422,7 @@ impl Engine {
                             verb: Verb::Sink,
                             resolves: iri,
                             arguments,
-                            refs: BTreeMap::new(),
+                            refs,
                             binds: None,
                             feed,
                         },

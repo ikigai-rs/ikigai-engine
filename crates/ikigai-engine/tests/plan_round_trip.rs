@@ -120,6 +120,20 @@ fn fixture() -> (Engine, Log, Arc<Mutex<String>>) {
                 .input(ArgSpec::new("flavor").optional()),
         ),
     );
+    // The same two inputs on a contract that DECLARES its verb: the kernel settles a
+    // reference by a verb's contract (core 0.2.5, ledger #2508), so a by-value `flavor` is
+    // handed the referent's bytes only where `Source` is declared.
+    space = space.bind(
+        Exact::new("urn:t:spice"),
+        stage(
+            "spice",
+            &log,
+            Description::new("spice")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("in"))
+                .input(ArgSpec::new("flavor").optional()),
+        ),
+    );
     space = space.bind(
         Exact::new("urn:t:store"),
         stage(
@@ -317,6 +331,18 @@ fn a_conneg_selector_round_trips() {
     // endpoint input, so it has to ride in the graph as a plain named argument.
     let turtle = round_trip("urn:t:up hi as=text/plain | urn:t:down");
     assert!(turtle.contains("ik:inputName \"as\""), "{turtle}");
+}
+
+#[test]
+fn a_reference_argument_round_trips() {
+    // ledger #2508: an unquoted `key=<iri>` is a reference, so the plan carries it as an
+    // `ik:ref` edge, not as text. Run directly, the kernel reads the referent for the
+    // by-value `flavor`; replayed, the runner sources it. The world sees the same requests.
+    let turtle = round_trip("urn:t:spice hello flavor=<urn:t:a> | urn:t:up");
+    assert!(turtle.contains("ik:ref <urn:t:a>"), "{turtle}");
+    // Quoted, the same text is the value itself.
+    let turtle = round_trip("urn:t:spice hello flavor=\"<urn:t:a>\" | urn:t:up");
+    assert!(turtle.contains("ik:value \"<urn:t:a>\""), "{turtle}");
 }
 
 // --- what a plan cannot say, said out loud ------------------------------------

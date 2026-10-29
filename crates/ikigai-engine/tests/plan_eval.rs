@@ -408,6 +408,26 @@ fn piped_eval_refuses_parameters_the_plan_does_not_declare() {
     );
 }
 
+/// ledger #2508: `in=<iri>` hands plan-eval the plan by reference, and the plan's parameter
+/// still arrives by name.
+#[test]
+fn eval_reads_a_plan_named_by_reference() {
+    let engine = shout_engine();
+    assert_eq!(
+        output(engine.eval("source urn:plan:eval in=<urn:file:shout.ttl> who=world")),
+        Ok("WORLD".to_string()),
+    );
+}
+
+/// ledger #2508: quoted, the same text is the plan itself, inline — not a reference.
+#[test]
+fn eval_takes_a_quoted_reference_as_inline_text() {
+    let engine = shout_engine();
+    let error = output(engine.eval("source urn:plan:eval in=\"<urn:file:shout.ttl>\" who=world"))
+        .expect_err("`<urn:file:shout.ttl>` is not a plan");
+    assert!(error.contains("the plan is not valid Turtle"), "{error}");
+}
+
 // --- one runner, two hosts -----------------------------------------------------------
 
 #[test]
