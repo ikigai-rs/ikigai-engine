@@ -22,10 +22,15 @@
 //! cacheable as what it read, and over a pure step that is cacheable, so a dependency that
 //! silently made one volatile is a red test here.
 //!
+//! `BODIES` (conformance 0.12.0) compares each door's `invoke` with its `invoke_body`
+//! directly, so the suite is handed the kernel's own root (`Suite::body_space`). No plan door
+//! declares a `reads_body` argument, so `BODY-INPUTS` has nothing to probe and the kernel
+//! needs no content store.
+//!
 //! One space declaration: `plan_space::space()` is configuration-free, so it is self-named
 //! `urn:iki:space:engine:plan`.
 
-use ikigai_conformance::{Fixture, Suite};
+use ikigai_conformance::{Expected, Fixture, Suite};
 use ikigai_core::{
     Description, EndpointSpace, Exact, Fallback, FnEndpoint, Invocation, Kernel, MetaRenderer,
     ReprType, Representation, Space, Verb,
@@ -76,14 +81,14 @@ fn hello() -> FnEndpoint {
 
 #[test]
 fn conforms() {
-    let kernel = Kernel::with_meta_renderer(
-        Arc::new(Fallback::new(vec![
-            Arc::new(ikigai_engine::plan_space::space()) as Arc<dyn Space>,
-            Arc::new(ikigai_shacl::space()),
-            Arc::new(EndpointSpace::new().bind(Exact::new("urn:t:hello"), hello())),
-        ])),
-        Arc::new(JsonRenderer),
-    );
+    // One shared root: the kernel resolves through it, and `BODIES` resolves each door in
+    // the same `Arc` to call `invoke` and `invoke_body` directly.
+    let root = Arc::new(Fallback::new(vec![
+        Arc::new(ikigai_engine::plan_space::space()) as Arc<dyn Space>,
+        Arc::new(ikigai_shacl::space()),
+        Arc::new(EndpointSpace::new().bind(Exact::new("urn:t:hello"), hello())),
+    ]));
+    let kernel = Kernel::with_meta_renderer(root.clone(), Arc::new(JsonRenderer));
     let suite = PLAN_DOORS
         .iter()
         .fold(Suite::new(), |suite, id| {
@@ -95,9 +100,13 @@ fn conforms() {
         .own("hello")
         .pure("hello")
         .cacheable("hello")
-        .self_named_space("engine:plan", ikigai_engine::plan_space::space);
+        .self_named_space("engine:plan", ikigai_engine::plan_space::space)
+        .body_space(root);
     let report = suite.run_blocking(&kernel);
-    report.assert_clean();
+    // Nothing unprobed: without `body_space` every door's `BODIES` comparison is reported
+    // unprobed ("the module space is unavailable") on a report that is otherwise clean, so
+    // this is what keeps the wiring from silently falling off.
+    report.assert_clean_with(&Expected::new().nothing_unprobed());
     // The three plan doors and the stub are walked; a fourth plan door bound without a
     // fixture, a `cacheable` line and an `own` changes one of these.
     assert_eq!(

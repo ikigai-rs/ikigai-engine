@@ -89,4 +89,7 @@ serde_json = { workspace = true }
 # default from 0.11.0; `Suite::fails_under` probes.
 # 0.11.0 (ledger #2349): the release on core 0.2.0, required by the re-pin (0.10 links core 0.1).
 # FAILURES and DATATYPES run by default. ⚠ `^0.11.0` is also a ceiling below 0.12.0.
-ikigai-conformance = "0.11.0"
+# 0.12.0 (ledger #2569, wave #2559): BODIES and BODY-INPUTS run by default. BODIES probes only
+# with `Suite::body_space` (the kernel's shared root); no plan door declares `reads_body`, so
+# BODY-INPUTS needs no content store. ⚠ `^0.12.0` is also a ceiling below 0.13.0.
+ikigai-conformance = "0.12.0"
