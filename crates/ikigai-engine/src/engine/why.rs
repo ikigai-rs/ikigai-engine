@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use ikigai_core::{ArgRef, Request, Verb};
 
-use super::{parse_spec, parse_target, take_as_of, Engine, Node, Pipeline};
+use super::{parse_spec, parse_target, take_as_of, Engine, Node, Pipeline, Word};
 
 /// Every command word the engine dispatches, in the order `help` lists them — the table a
 /// completing face (the TUI, Emacs) reads, and the one a test holds against
@@ -89,7 +89,7 @@ impl Engine {
         &self,
         spec: &str,
         command: &str,
-    ) -> Result<(Vec<String>, ikigai_core::Scope), String> {
+    ) -> Result<(Vec<Word>, ikigai_core::Scope), String> {
         if spec.trim().is_empty() {
             return Err(format!("usage: {}", usage(command)));
         }
@@ -112,7 +112,7 @@ impl Engine {
         self.in_scope(scope, self.explain_line(words)).await
     }
 
-    async fn explain_line(&self, words: Vec<String>) -> Result<String, String> {
+    async fn explain_line(&self, words: Vec<Word>) -> Result<String, String> {
         let (target, rest) = words.split_first().ok_or_else(|| usage("explain"))?;
         let target = parse_target(target)?;
         let mut verb: Option<String> = None;
@@ -125,7 +125,7 @@ impl Engine {
                 Some(("as", _)) if face.is_some() => return Err(super::given_twice("as")),
                 Some(("as", value)) => face = Some(value.to_string()),
                 Some(("verb", value)) => set_verb(&mut verb, value)?,
-                None if VERBS.contains(&word.as_str()) => set_verb(&mut verb, word)?,
+                None if VERBS.contains(&&**word) => set_verb(&mut verb, word)?,
                 _ => {
                     return Err(format!(
                         "`explain` does not take `{word}` — usage: {}",
@@ -176,7 +176,7 @@ impl Engine {
         self.in_scope(scope, self.why_line(words)).await
     }
 
-    async fn why_line(&self, words: Vec<String>) -> Result<String, String> {
+    async fn why_line(&self, words: Vec<Word>) -> Result<String, String> {
         let [target] = words.as_slice() else {
             return Err(format!(
                 "`why` takes one IRI (a read with arguments is its own log row; \
@@ -226,7 +226,7 @@ impl Engine {
         self.in_scope(scope, self.dependents_line(words)).await
     }
 
-    async fn dependents_line(&self, words: Vec<String>) -> Result<String, String> {
+    async fn dependents_line(&self, words: Vec<Word>) -> Result<String, String> {
         let (thread, rest) = words.split_first().ok_or_else(|| usage("dependents"))?;
         let thread = parse_target(thread)?;
         let mut request = Request::new(Verb::Source, parse_target("urn:kernel:dependents")?)
@@ -254,7 +254,7 @@ impl Engine {
         self.in_scope(scope, self.show_line(words)).await
     }
 
-    async fn show_line(&self, words: Vec<String>) -> Result<String, String> {
+    async fn show_line(&self, words: Vec<Word>) -> Result<String, String> {
         let (target, args) = words.split_first().ok_or_else(|| usage("show"))?;
         // Refused BEFORE the read, so a face that cannot show a picture never computes one.
         let viewer = self.viewer.clone().ok_or_else(|| {
