@@ -62,6 +62,7 @@ fn stage(tag: &'static str, log: &Log, description: Description) -> FnEndpoint {
             match tag {
                 // A list, so `..` has items to map over.
                 "list" => format!("{input}/1\n{input}/2"),
+                "echo" => input.to_string(),
                 other => format!("{other}({input})"),
             }
             .into_bytes(),
@@ -92,7 +93,7 @@ fn fixture() -> (Engine, Log, Arc<Mutex<String>>) {
     };
 
     let mut space = EndpointSpace::new().bind(Exact::new("urn:t:plan"), plan_resource);
-    for tag in ["up", "down", "a", "b", "c", "d"] {
+    for tag in ["up", "down", "a", "b", "c", "d", "echo"] {
         space = space.bind(
             Exact::new(format!("urn:t:{tag}")),
             stage(tag, &log, reads(tag)),
@@ -234,6 +235,25 @@ fn a_pipe_round_trips() {
 fn a_map_round_trips() {
     let turtle = round_trip("urn:t:list seed .. urn:t:up");
     assert!(turtle.contains("ik:mapOver"), "{turtle}");
+}
+
+#[test]
+fn a_map_ignores_a_terminating_newline_in_a_stored_plan() {
+    for (input, expected, width) in [
+        ("a\nb\n", "up(a)\nup(b)", 2),
+        ("a\n\nb\n", "up(a)\nup()\nup(b)", 3),
+        ("a\nb\n\n", "up(a)\nup(b)\nup()", 3),
+        ("a\nb", "up(a)\nup(b)", 2),
+        ("\n", "up()", 1),
+        ("", "", 0),
+    ] {
+        let (engine, log, stored) = fixture();
+        *stored.lock().unwrap() =
+            output(engine.eval(&format!("plan urn:t:echo in=\"{input}\" .. urn:t:up"))).unwrap();
+        assert_eq!(output(engine.eval("execute urn:t:plan")).unwrap(), expected);
+        assert_eq!(engine.last_fan_out().unwrap().nominal, width);
+        assert_eq!(drain(&log).len(), width + 1, "one upstream plus each item");
+    }
 }
 
 #[test]

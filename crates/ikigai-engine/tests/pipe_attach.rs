@@ -332,12 +332,14 @@ fn a_fork_over_a_one_shot_body_answers_on_every_branch() {
         answer.as_deref(),
         Ok("line 0\nline 1\n\nline 0\nline 1\n\nline 0\nline 1\n")
     );
-    // And a map: every item is its own value.
+    // And a map: every item is its own value; the final newline terminates
+    // the second item rather than adding an empty third one.
     let answer = output(
         &engine,
         "source urn:test:count from=0 | urn:test:head .. urn:test:head",
     );
-    assert_eq!(answer.as_deref(), Ok("line 0\nline 1\n"));
+    assert_eq!(answer.as_deref(), Ok("line 0\nline 1"));
+    assert_eq!(engine.last_fan_out().unwrap().nominal, 2);
 }
 
 /// A peer reached as a transport reaches one: each call resolved on another thread, the

@@ -308,8 +308,9 @@ fn an_upstream_with_several_consumers_is_collected_once() {
         world
             .execute("urn:test:count from=0 | urn:test:head .. urn:test:head")
             .as_deref(),
-        Ok("line 0\nline 1\n")
+        Ok("line 0\nline 1")
     );
+    assert_eq!(world.engine.last_fan_out().unwrap().nominal, 2);
 }
 
 #[test]
