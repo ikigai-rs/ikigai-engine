@@ -47,7 +47,9 @@ members = ["crates/*"]
 # skipped, `ikigai_engine::script` and `Engine::run_script` run a script of REPL lines with
 # declared `# @param` parameters and stop at the first failing line, and `execute <plan>
 # key=value` passes `key=value` to the plan's parameters. Additive: a patch.
-version = "0.2.8"
+# 0.2.9 (ledger #2656): plan-requires includes fixed named plans recursively, refusing
+# cycles and nesting beyond 16 named plans. A preflight bug fix: a patch.
+version = "0.2.9"
 edition = "2021"
 # Measured 2026-10-26, not assumed: 1.89 is the first toolchain that builds the workspace.
 # `ikigai-intray` takes the lease with `std::fs::File::try_lock` (stable in 1.89; 1.88 refuses
@@ -110,7 +112,7 @@ ikigai-fs = "0.2.2"
 # 0.3.4 is a SECURITY floor (ledger #1326) and 0.3.6 was cli's pin. 0.5.0 is the newest
 # release and the one on core 0.2 (ledger #2349). `"0.5.0"` is `<0.6.0`.
 ikigai-shacl = "0.5.0"
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.2.8" }
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.2.9" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face, reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins
