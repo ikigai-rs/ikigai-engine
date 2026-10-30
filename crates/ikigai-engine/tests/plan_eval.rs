@@ -1020,3 +1020,92 @@ fn a_name_bound_inside_a_mapped_fork_is_not_cited_from_outside() {
     }
     assert!(w.drain().is_empty(), "a refused plan runs nothing");
 }
+
+fn disconnected_step(verb: &str) -> String {
+    format!(
+        r#"@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:plan:dead> a ik:Process ; ik:step <urn:plan:dead:step:1>, <urn:plan:dead:step:2> ;
+    ik:result <urn:plan:dead:step:1> .
+<urn:plan:dead:step:1> a ik:Step ; ik:verb "Source" ; ik:resolves <urn:demo:a> .
+<urn:plan:dead:step:2> a ik:Step ; ik:verb "{verb}" ; ik:resolves <urn:demo:b> .
+"#
+    )
+}
+
+#[test]
+fn unreached_writes_are_refused() {
+    let w = world();
+    for verb in ["Sink", "Delete"] {
+        let plan = disconnected_step(verb);
+        let shapes = ikigai_shacl::validate_outcome(&plan, ikigai_vocab::SHAPES).unwrap();
+        assert!(shapes.conforms, "{shapes:?}");
+        let report = w.text("urn:plan:validate", &plan, &[]);
+        assert!(report.contains("does not conform"), "{verb}: {report}");
+        assert!(report.contains("urn:plan:dead:step:2"), "{report}");
+        let graph = w.text("urn:plan:validate", &plan, &[("as", "text/turtle")]);
+        assert!(graph.contains("sh:Violation"), "{graph}");
+        assert!(graph.contains("urn:plan:dead:step:2"), "{graph}");
+        assert!(w.eval(&plan, &[], &Capability::root()).is_err());
+        assert!(w.drain().is_empty());
+    }
+}
+
+#[test]
+fn unreached_reads_warn_without_refusing() {
+    let w = world();
+    for verb in ["Source", "Exists", "Meta"] {
+        let plan = disconnected_step(verb);
+        let report = w.text("urn:plan:validate", &plan, &[]);
+        assert!(report.contains(" conforms:"), "{verb}: {report}");
+        assert!(report.contains("warning"), "{report}");
+        assert!(report.contains("urn:plan:dead:step:2"), "{report}");
+        let graph = w.text("urn:plan:validate", &plan, &[("as", "text/turtle")]);
+        assert!(graph.contains("sh:Warning"), "{graph}");
+        let triples: Vec<_> = oxttl::TurtleParser::new()
+            .for_slice(graph.as_bytes())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            triples.iter().any(
+                |t| t.predicate.as_str() == "http://www.w3.org/ns/shacl#conforms"
+                    && matches!(&t.object, oxrdf::Term::Literal(value) if value.value() == "true")
+            ),
+            "{graph}"
+        );
+        assert!(triples.iter().any(|t|
+            t.predicate.as_str() == "http://www.w3.org/ns/shacl#focusNode"
+                && matches!(&t.object, oxrdf::Term::NamedNode(node) if node.as_str() == "urn:plan:dead:step:2")
+        ), "{graph}");
+        assert!(graph.contains("urn:plan:dead:step:2"), "{graph}");
+        let answer = w
+            .eval(&plan, &[], &Capability::root())
+            .expect("a warning permits execution");
+        assert_eq!(String::from_utf8(answer.bytes).unwrap(), "one\ntwo\nthree");
+        assert!(!w
+            .drain()
+            .iter()
+            .any(|request| request.contains("urn:demo:b")));
+    }
+}
+
+/// A named reference is an execution dependency even without a pipe edge.
+#[test]
+fn a_step_reached_through_a_bound_name_is_not_dead() {
+    let w = world();
+    for verb in ["Sink", "Delete", "Source", "Exists", "Meta"] {
+        let plan = disconnected_step(verb)
+            .replace(
+                "ik:resolves <urn:demo:b> .",
+                "ik:resolves <urn:demo:b> ; ik:binds \"saved\" .",
+            )
+            .replace(
+                "ik:resolves <urn:demo:a> .",
+                "ik:resolves <urn:demo:a> ; ik:argument <urn:plan:dead:step:1:arg:in> .\n\
+                 <urn:plan:dead:step:1:arg:in> a ik:Argument ; ik:inputName \"in\" ;\n\
+                 ik:ref <urn:plan:dead:var:saved> .",
+            );
+        let report = w.text("urn:plan:validate", &plan, &[]);
+        assert!(report.contains(" conforms:"), "{verb}: {report}");
+        assert!(!report.contains("warning"), "{report}");
+    }
+}

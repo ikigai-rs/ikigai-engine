@@ -989,7 +989,26 @@ impl Plan {
         for node in nodes {
             self.visit(node, &mut marks, &mut Vec::new())?;
         }
-        self.check_scopes()
+        self.check_scopes()?;
+        for index in self.unreached_steps()? {
+            if matches!(self.steps[index].verb, Verb::Sink | Verb::Delete) {
+                return Err(format!(
+                    "<{}> is a {} step the result does not reach, so it would never run",
+                    self.node_iri(NodeRef::Step(index)),
+                    verb_name(self.steps[index].verb)
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Steps absent from the executor's dependency walk, including references and forks.
+    pub(crate) fn unreached_steps(&self) -> Result<Vec<usize>, Refusal> {
+        let reached: BTreeSet<_> = self.run_order()?.into_iter().collect();
+        Ok((0..self.steps.len())
+            .filter(|index| !reached.contains(&NodeRef::Step(*index)))
+            .collect())
     }
 
     /// The nodes a run evaluates, dependencies first: everything the result depends on,
