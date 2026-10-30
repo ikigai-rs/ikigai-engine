@@ -16,6 +16,13 @@
 //!   copied onto the rule as the name's own declared inputs, and a fixed argument the plan does
 //!   not declare is refused, though plan-eval's own argument set is open. Reading a plan needs
 //!   the `plan-reader` feature.
+//! - **A pipeline is bound as its plan** (ledger #2510). `bind urn:q:loud = source urn:file:x
+//!   | urn:iki:fn:toUpper` compiles the pipeline to the plan `plan` renders and binds `source
+//!   urn:plan:eval` with that plan inline (on one line, as the names file is line-oriented),
+//!   so the name is a live composite, recomputed when what it reads is cut, not a `sink`
+//!   snapshot. A shape `plan` cannot spell (`.. ( … )`, a map over a fork) is refused with
+//!   the renderer's own message. The name is plain and the verb `source`: a plan has no
+//!   spelling for a capture, and no verb but its steps'.
 //! - **A templated target is checked when it is called.** Its contract is a function of the
 //!   capture, so there is none to read before the name is resolved; the reply says so.
 //! - **Authority is unchanged.** The atom is read and written under the session's capability,
@@ -25,11 +32,13 @@
 //! The atom is the HOST's to name ([`Engine::with_names_atom`]): which resource holds a
 //! host's names is a fact about the host, and a host that names none refuses `bind` by name.
 
-use ikigai_core::{ArgRef, ArgSpec, FixedValue, InputSource, Iri, Request, TopologyRule, Verb};
+use ikigai_core::{
+    ArgRef, ArgSpec, FixedArgument, FixedValue, InputSource, Iri, Request, TopologyRule, Verb,
+};
 
 use super::{
-    declared_arguments, describe, parse_target, takes_open_arguments, verb_action, verb_inputs,
-    Engine,
+    declared_arguments, describe, parse_target, split_first_word, takes_open_arguments, tokenize,
+    verb_action, verb_inputs, Engine, Token,
 };
 use crate::names::{in_table_order, parse_binding, parse_names, render_binding, render_names};
 
@@ -62,7 +71,11 @@ impl Engine {
             }
             return render_names(&rules);
         }
-        let (rule, note) = self.checked_binding(parse_binding(rest)?).await?;
+        let rule = match self.pipeline_binding(rest).await? {
+            Some(rule) => rule,
+            None => parse_binding(rest)?,
+        };
+        let (rule, note) = self.checked_binding(rule).await?;
         let mut rules = self.read_names(&atom).await?;
         let was = rules
             .iter()
@@ -81,6 +94,61 @@ impl Engine {
             out.push('\n');
         }
         Ok(out.trim_end().to_string())
+    }
+
+    /// `bind <name> = source <pipeline>` (ledger #2510): the pipeline compiled to the plan
+    /// `plan <pipeline>` renders, bound as `source urn:plan:eval` with the plan inline, so the
+    /// name is a live composite that recomputes as what it reads changes. `None` when `rest`
+    /// holds no operator, so it is the one request [`parse_binding`] reads.
+    async fn pipeline_binding(&self, rest: &str) -> Result<Option<TopologyRule>, String> {
+        if tokenize(rest)?
+            .iter()
+            .all(|token| matches!(token, Token::Word(_)))
+        {
+            return Ok(None);
+        }
+        let (name, after) = split_first_word(rest.trim());
+        let (eq, after) = split_first_word(after);
+        if eq != "=" || name.contains('"') {
+            // Not a binding's shape at all: `parse_binding` says what one is.
+            return Ok(None);
+        }
+        let (verb, spec) = split_first_word(after);
+        if !matches!(verb, "source" | "src") {
+            return Err(format!(
+                "a pipeline on the right of `bind` is bound as `source <pipeline>`: the name \
+                 answers what the pipeline outputs, and a plan has no verb but its steps'; \
+                 got `{verb}`"
+            ));
+        }
+        if name.contains('{') {
+            return Err(format!(
+                "`{name}` is a template, and a pipeline is bound as a plan, which has no \
+                 spelling for a capture: bind the pipeline under a plain name"
+            ));
+        }
+        let plan = self.build_plan(spec).await.map_err(|e| {
+            format!(
+                "{e} So `bind` cannot make it a live name either: a pipeline on the right of \
+                 `bind` is bound as its plan (ledger #2510)."
+            )
+        })?;
+        // The names file is line-oriented, so the plan is written on one line. Turtle takes
+        // any whitespace between terms, and a rendered plan holds no line break but between
+        // them (`literal` escapes every one inside a string).
+        let turtle = plan
+            .to_turtle(Some(spec.trim()))
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let rule = TopologyRule::named_request(name, PLAN_EVAL)
+            .verb(Verb::Source)
+            .fixing(FixedArgument::value("in", turtle));
+        // Read back through the text form, so the name is checked as any binding's is and
+        // what is written is exactly what the atom will read.
+        parse_binding(&render_binding(&rule)?).map(Some)
     }
 
     /// `unbind <name>`.
@@ -380,6 +448,21 @@ mod tests {
         String::from_utf8(held.lock().unwrap().clone().unwrap_or_default()).unwrap()
     }
 
+    /// An engine over `host` plus everything bound in `held`, as a host builds its names:
+    /// an alias table from the atom, beside the spaces the names forward to.
+    fn named(held: &Arc<Mutex<Option<Vec<u8>>>>, beside: Vec<Arc<dyn Space>>) -> Engine {
+        let mut table = AliasTable::new();
+        for rule in parse_names(&names(held)).unwrap() {
+            table = table.with_rule(rule).unwrap();
+        }
+        let alias = Alias::new(Arc::new(table), Arc::new(EndpointSpace::new()));
+        let mut spaces = beside;
+        spaces.push(host(held.clone()));
+        spaces.push(Arc::new(alias));
+        let root: Arc<dyn Space> = Arc::new(Fallback::new(spaces));
+        Engine::new(Kernel::with_meta_renderer(root, Arc::new(JsonRenderer)))
+    }
+
     /// The item's refusal: a binding fixes only what its target takes, and says which name
     /// it does not.
     #[test]
@@ -453,14 +536,7 @@ mod tests {
     fn a_bound_template_resolves_through_an_alias_built_from_the_atom() {
         let (engine, held) = engine();
         output(engine.eval("bind urn:shout:{word} = source urn:t:upper in={word}")).unwrap();
-        let mut table = AliasTable::new();
-        for rule in parse_names(&names(&held)).unwrap() {
-            table = table.with_rule(rule).unwrap();
-        }
-        let alias = Alias::new(Arc::new(table), Arc::new(EndpointSpace::new()));
-        let root: Arc<dyn Space> =
-            Arc::new(Fallback::new(vec![host(held.clone()), Arc::new(alias)]));
-        let shout = Engine::new(Kernel::with_meta_renderer(root, Arc::new(JsonRenderer)));
+        let shout = named(&held, Vec::new());
         assert_eq!(
             output(shout.eval("source urn:shout:hello")).unwrap(),
             "HELLO"
@@ -495,5 +571,114 @@ mod tests {
         let rules = parse_names(&names(&held)).unwrap();
         let fixed = rules.iter().find(|r| r.from == "urn:shout3").unwrap();
         assert!(fixed.inputs.is_empty());
+    }
+
+    /// A cacheable cell at `urn:file:x`, holding `hello` until something is sunk into it. The
+    /// kernel cuts the cell's thread on the write, as it does for every write it dispatches.
+    #[cfg(feature = "plan-reader")]
+    fn cell() -> FnEndpoint {
+        let state = Arc::new(Mutex::new(b"hello".to_vec()));
+        FnEndpoint::new("cell", move |inv: &Invocation<'_>| {
+            if inv.request.verb == Verb::Sink {
+                *state.lock().unwrap() = inv.inline_arg("content")?.to_vec();
+                return Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"ok".to_vec(),
+                ));
+            }
+            Ok(
+                Representation::new(ReprType::new("text/plain"), state.lock().unwrap().clone())
+                    .cacheable(),
+            )
+        })
+        .with_description(
+            Description::new("cell")
+                .verb(Verb::Source)
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("content").optional()),
+        )
+    }
+
+    /// The item (ledger #2510): a pipeline on the right of `bind` is compiled to a plan and
+    /// bound as `urn:plan:eval` with the plan inline, so the name is a live composite: it
+    /// answers the pipeline's output, from the cache while nothing it read has changed, and
+    /// cutting `urn:file:x` recomputes it.
+    #[cfg(feature = "plan-reader")]
+    #[test]
+    fn a_bound_pipeline_is_a_live_name_that_a_cut_recomputes() {
+        let beside: Arc<dyn Space> = Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:file:x"), cell())
+                .bind(Exact::new("urn:iki:fn:toUpper"), builtins::to_upper()),
+        );
+        // `urn:plan:eval` validates every plan before it runs it.
+        let shacl: Arc<dyn Space> = Arc::new(ikigai_shacl::space());
+
+        let held = Arc::new(Mutex::new(None));
+        let root: Arc<dyn Space> =
+            Arc::new(Fallback::new(vec![beside.clone(), host(held.clone())]));
+        let engine = Engine::new(Kernel::with_meta_renderer(root, Arc::new(JsonRenderer)))
+            .with_names_atom(Iri::parse(ATOM).unwrap());
+        let bound = output(engine.eval("bind urn:q:loud = source urn:file:x | urn:iki:fn:toUpper"))
+            .unwrap();
+        assert!(
+            bound.contains("urn:q:loud = source urn:plan:eval in="),
+            "{bound}"
+        );
+        // One binding, its plan inline: the line the names atom holds is one line.
+        let rules = parse_names(&names(&held)).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].to, "urn:plan:eval");
+        assert_eq!(names(&held).lines().count(), 1, "{}", names(&held));
+
+        let loud = named(&held, vec![beside, shacl]);
+        let entry = |line: &str| match loud.eval(line) {
+            Action::Output(entry) => entry,
+            _ => panic!("expected output"),
+        };
+        assert_eq!(entry("source urn:q:loud").result.unwrap(), "HELLO");
+        // Asked again, the name is a cached answer: a plan of pure reads is cacheable.
+        let again = entry("source urn:q:loud");
+        assert_eq!(again.result.unwrap(), "HELLO");
+        assert!(
+            again.cache.hits == 1 && again.cache.misses == 0,
+            "{:?}",
+            again.cache
+        );
+        // Cutting `urn:file:x` — writing it — recomputes the name: not the cached answer.
+        output(loud.eval("sink urn:file:x goodbye")).unwrap();
+        let cut = entry("source urn:q:loud");
+        assert_eq!(cut.result.unwrap(), "GOODBYE");
+        assert_eq!(cut.cache.hits, 0, "{:?}", cut.cache);
+    }
+
+    /// A shape `plan` cannot spell stays refused with the plan renderer's own message, which
+    /// now names `bind` and the item, and nothing is written.
+    #[test]
+    fn a_bound_map_over_a_fork_is_refused_with_the_plan_renderers_message() {
+        let (engine, held) = engine();
+        let spec = "urn:t:upper in=a .. ( urn:t:upper ; urn:t:upper )";
+        let rendered = output(engine.eval(&format!("plan {spec}"))).unwrap_err();
+        assert!(rendered.contains("has no plan spelling"), "{rendered}");
+        let refused =
+            output(engine.eval(&format!("bind urn:q:river = source {spec}"))).unwrap_err();
+        assert!(refused.starts_with(&rendered), "{refused}");
+        assert!(refused.contains("`bind`"), "{refused}");
+        assert!(refused.contains("#2510"), "{refused}");
+        assert!(held.lock().unwrap().is_none(), "nothing was written");
+    }
+
+    /// A pipeline binding is `source <pipeline>` under a plain name: a plan has no verb but
+    /// its steps', and no spelling for a capture.
+    #[test]
+    fn a_bound_pipeline_is_a_source_under_a_plain_name() {
+        let (engine, held) = engine();
+        let verb = output(engine.eval("bind urn:x = sink urn:t:upper | urn:t:upper")).unwrap_err();
+        assert!(verb.contains("`source <pipeline>`"), "{verb}");
+        let template =
+            output(engine.eval("bind urn:x:{w} = source urn:t:upper in={w} | urn:t:upper"))
+                .unwrap_err();
+        assert!(template.contains("template"), "{template}");
+        assert!(held.lock().unwrap().is_none(), "nothing was written");
     }
 }
