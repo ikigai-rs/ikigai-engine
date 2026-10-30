@@ -825,3 +825,73 @@ fn a_narrower_capability_is_refused_exactly_where_requires_said() {
         assert_eq!(transcript, repl.drain(), "both stop at the same step");
     }
 }
+
+// Verbatim ikigai-vocab 0.2.8 fixture from ikigai-core commit
+// 7a0cd8fc658eb6988af24bf062b75840163ad1ba, crates/ikigai-vocab/tests/fixtures/.
+const MAPPED_FORK: &str = include_str!("fixtures/plan-fork-mapped.ttl");
+
+const NESTED_FORK: &str = r#"
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:plan:nested> a ik:Process ;
+    ik:step <urn:plan:nested:step:1>, <urn:plan:nested:step:2> ;
+    ik:result <urn:plan:nested:fork:1> .
+<urn:plan:nested:fork:1> a ik:Fork ; ik:join "newline" .
+<urn:plan:nested:fork:2> a ik:Fork ; ik:join "newline" ;
+    ik:forkOf <urn:plan:nested:fork:1> ; ik:order 1 .
+<urn:plan:nested:step:1> a ik:Step ; ik:verb "Source" ;
+    ik:resolves <urn:demo:b> ; ik:forkOf <urn:plan:nested:fork:1> ; ik:order 2 .
+<urn:plan:nested:step:2> a ik:Step ; ik:verb "Source" ;
+    ik:resolves <urn:demo:c> ; ik:forkOf <urn:plan:nested:fork:2> ; ik:order 1 .
+"#;
+
+fn assert_unsupported_fork(plan: &str, property: &str) {
+    let w = world();
+    let report = w.text("urn:plan:validate", plan, &[]);
+    assert!(
+        report.contains("does not conform"),
+        "ik:{property}: {report}"
+    );
+    assert!(report.contains(&format!("ik:{property}")), "{report}");
+    assert!(report.contains("#2653"), "{report}");
+    for door in ["urn:plan:requires", "urn:plan:eval"] {
+        let error = w
+            .issue(door, plan, &[], &Capability::root())
+            .expect_err("unsupported fork");
+        let Error::InvalidArgument { name, detail } = error else {
+            panic!("{door}: {error}");
+        };
+        assert_eq!(name, "in");
+        assert!(
+            detail.contains(&format!("ik:{property}")),
+            "{door}: {detail}"
+        );
+        assert!(detail.contains("#2653"), "{door}: {detail}");
+        // The validator reports the reader's exact refusal, alongside SHACL.
+        if door == "urn:plan:requires" {
+            assert!(
+                report.contains(&detail),
+                "{report} did not include {detail}"
+            );
+        }
+    }
+    assert!(w.drain().is_empty(), "a refused fork runs nothing");
+}
+
+#[test]
+fn unsupported_fork_map_is_refused() {
+    assert_unsupported_fork(MAPPED_FORK, "mapOver");
+}
+
+#[test]
+fn unsupported_fork_nesting_is_refused() {
+    assert_unsupported_fork(NESTED_FORK, "forkOf");
+}
+
+#[test]
+fn unsupported_fork_binding_is_refused() {
+    let bound = MAPPED_FORK.replace(
+        "ik:mapOver <urn:plan:fork-mapped:step:1>",
+        "ik:binds \"mapped\"",
+    );
+    assert_unsupported_fork(&bound, "binds");
+}
