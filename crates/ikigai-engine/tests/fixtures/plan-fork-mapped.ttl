@@ -1,0 +1,33 @@
+# A mapped fork (ledger #32, ikigai-cli #329): the text face `a .. ( b ; c )` had no
+# graph form while ik:mapOver had domain ik:Step. With ik:Stage the fork carries
+# ik:mapOver: it runs, with both its branches, once per item of its upstream.
+#
+#   source urn:demo:a .. ( source urn:demo:b ; source urn:demo:c )
+
+@prefix ik:   <https://ikigai-rs.dev/ns#> .
+
+<urn:plan:fork-mapped> a ik:Process ;
+    ik:output "text/plain" ;
+    ik:step <urn:plan:fork-mapped:step:1> , <urn:plan:fork-mapped:step:2> ,
+            <urn:plan:fork-mapped:step:3> ;
+    ik:result <urn:plan:fork-mapped:fork:1> .
+
+<urn:plan:fork-mapped:step:1> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:demo:a> .
+
+<urn:plan:fork-mapped:fork:1> a ik:Fork ;
+    ik:mapOver <urn:plan:fork-mapped:step:1> ;
+    ik:join "newline" .
+
+<urn:plan:fork-mapped:step:2> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:demo:b> ;
+    ik:forkOf <urn:plan:fork-mapped:fork:1> ;
+    ik:order 1 .
+
+<urn:plan:fork-mapped:step:3> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:demo:c> ;
+    ik:forkOf <urn:plan:fork-mapped:fork:1> ;
+    ik:order 2 .

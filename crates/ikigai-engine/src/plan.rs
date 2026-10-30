@@ -699,6 +699,17 @@ impl Plan {
 
         let mut forks = Vec::with_capacity(fork_iris.len());
         for fork_iri in &fork_iris {
+            // These Stage properties are valid vocabulary, but Fork cannot represent
+            // them yet. Refuse rather than silently execute a different plan (#2653).
+            for property in ["mapOver", "forkOf", "binds"] {
+                if !graph.objects(fork_iri, property).is_empty() {
+                    return Err(format!(
+                        "<{fork_iri}> carries ik:{property} on an ik:Fork; this engine does not \
+                         implement that fork property yet (ledger #2653)"
+                    )
+                    .into());
+                }
+            }
             let upstream = match graph.at_most_one(fork_iri, "upstream")? {
                 Some(object) => Some(node_ref(
                     object.iri(fork_iri, "upstream")?,
@@ -2032,6 +2043,25 @@ impl Engine {
 #[cfg(all(test, feature = "plan-reader"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_refuses_unsupported_fork_properties() {
+        let mapped = include_str!("../tests/fixtures/plan-fork-mapped.ttl");
+        for (property, value) in [
+            ("mapOver", "<urn:plan:fork-mapped:step:1>"),
+            ("forkOf", "<urn:plan:fork-mapped:fork:2>"),
+            ("binds", "\"mapped\""),
+        ] {
+            let turtle = mapped.replace(
+                "ik:mapOver <urn:plan:fork-mapped:step:1>",
+                &format!("ik:{property} {value}"),
+            );
+            let error = Plan::from_turtle(&turtle).expect_err("unsupported fork property");
+            assert!(error.contains("<urn:plan:fork-mapped:fork:1>"), "{error}");
+            assert!(error.contains(&format!("ik:{property}")), "{error}");
+            assert!(error.contains("#2653"), "{error}");
+        }
+    }
 
     fn iri(s: &str) -> Iri {
         Iri::parse(s).expect("valid IRI")
