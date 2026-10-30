@@ -719,7 +719,7 @@ impl Plan {
 
         let mut forks = Vec::with_capacity(fork_iris.len());
         for fork_iri in &fork_iris {
-            let feed = read_feed(&graph, fork_iri, "upstream", &node_ref)?;
+            let feed = read_feed(&graph, fork_iri, true, &node_ref)?;
             let binds = read_binds(&graph, fork_iri)?;
             if let Some(join) = graph.at_most_one(fork_iri, "join")? {
                 let join = join.literal(fork_iri, "join")?;
@@ -1319,7 +1319,7 @@ fn read_step(
     let resolves = Iri::parse(resolves).map_err(|e| format!("<{step_iri}> ik:resolves: {e}"))?;
 
     let binds = read_binds(graph, step_iri)?;
-    let feed = read_feed(graph, step_iri, "pipeFrom", node_ref)?;
+    let feed = read_feed(graph, step_iri, false, node_ref)?;
 
     let mut arguments = BTreeMap::new();
     let mut refs = BTreeMap::new();
@@ -1382,14 +1382,14 @@ fn read_step(
 
 /// A stage's `ik:binds`, an identifier if present.
 #[cfg(feature = "plan-reader")]
-fn read_binds(graph: &Graph, iri: &str) -> Result<Option<String>, String> {
-    match graph.at_most_one(iri, "binds")? {
+fn read_binds(graph: &Graph, stage_iri: &str) -> Result<Option<String>, String> {
+    match graph.at_most_one(stage_iri, "binds")? {
         None => Ok(None),
         Some(object) => {
-            let name = object.literal(iri, "binds")?;
+            let name = object.literal(stage_iri, "binds")?;
             if !is_identifier(name) {
                 return Err(format!(
-                    "<{iri}> binds `{name}`; a bound name is an identifier (letters, digits, _ \
+                    "<{stage_iri}> binds `{name}`; a bound name is an identifier (letters, digits, _ \
                      and -)"
                 ));
             }
@@ -1403,45 +1403,52 @@ fn read_binds(graph: &Graph, iri: &str) -> Result<Option<String>, String> {
 #[cfg(feature = "plan-reader")]
 fn read_feed(
     graph: &Graph,
-    iri: &str,
-    pipe: &str,
+    stage_iri: &str,
+    // A fork's upstream edge is `ik:upstream`; a step's is `ik:pipeFrom`.
+    is_fork: bool,
     node_ref: &impl Fn(&str, &str) -> Result<NodeRef, String>,
 ) -> Result<Feed, String> {
-    let piped = graph.at_most_one(iri, pipe)?;
-    let map = graph.at_most_one(iri, "mapOver")?;
-    let fork = graph.at_most_one(iri, "forkOf")?;
-    let order = graph.at_most_one(iri, "order")?;
+    let (pipe, piped) = if is_fork {
+        let fork_iri = stage_iri;
+        ("upstream", graph.at_most_one(fork_iri, "upstream")?)
+    } else {
+        let step_iri = stage_iri;
+        ("pipeFrom", graph.at_most_one(step_iri, "pipeFrom")?)
+    };
+    let map = graph.at_most_one(stage_iri, "mapOver")?;
+    let fork = graph.at_most_one(stage_iri, "forkOf")?;
+    let order = graph.at_most_one(stage_iri, "order")?;
     Ok(match (piped, map, fork) {
         (None, None, None) => {
             if order.is_some() {
                 return Err(format!(
-                    "<{iri}> carries ik:order but no ik:forkOf — a position without a join"
+                    "<{stage_iri}> carries ik:order but no ik:forkOf — a position without a join"
                 ));
             }
             Feed::None
         }
-        (Some(up), None, None) => Feed::Pipe(node_ref(up.iri(iri, pipe)?, "a pipe")?),
-        (None, Some(up), None) => Feed::Map(node_ref(up.iri(iri, "mapOver")?, "a map")?),
+        (Some(up), None, None) => Feed::Pipe(node_ref(up.iri(stage_iri, pipe)?, "a pipe")?),
+        (None, Some(up), None) => Feed::Map(node_ref(up.iri(stage_iri, "mapOver")?, "a map")?),
         (None, None, Some(of)) => {
-            let order =
-                order.ok_or_else(|| format!("<{iri}> is a fork branch but carries no ik:order"))?;
+            let order = order
+                .ok_or_else(|| format!("<{stage_iri}> is a fork branch but carries no ik:order"))?;
             let order: usize = order
-                .literal(iri, "order")?
+                .literal(stage_iri, "order")?
                 .parse()
-                .map_err(|_| format!("<{iri}> ik:order is not a positive integer"))?;
+                .map_err(|_| format!("<{stage_iri}> ik:order is not a positive integer"))?;
             if order == 0 {
-                return Err(format!("<{iri}> ik:order is not a positive integer"));
+                return Err(format!("<{stage_iri}> ik:order is not a positive integer"));
             }
-            match node_ref(of.iri(iri, "forkOf")?, "a fork")? {
+            match node_ref(of.iri(stage_iri, "forkOf")?, "a fork")? {
                 NodeRef::Fork(fork) => Feed::Branch { fork, order },
                 NodeRef::Step(_) => {
-                    return Err(format!("<{iri}> ik:forkOf names a step, not a fork"))
+                    return Err(format!("<{stage_iri}> ik:forkOf names a step, not a fork"))
                 }
             }
         }
         _ => {
             return Err(format!(
-                "<{iri}> is fed more than one way — a stage takes at most one of ik:{pipe}, \
+                "<{stage_iri}> is fed more than one way — a stage takes at most one of ik:{pipe}, \
                  ik:mapOver, ik:forkOf"
             ))
         }
