@@ -2158,7 +2158,13 @@ async fn run_step<H: PlanHost>(
         .collect();
     // Everything the request is built from, for its provenance: the feed, every bound
     // name it references, and every resource it sources.
-    let mut inputs: Vec<Provenance> = upstream.iter().map(|(_, up)| up.clone()).collect();
+    // A mapped item is inline in its request; only the join depends on the list.
+    // Bound names and sourced arguments still contribute to each item's provenance.
+    let mut inputs: Vec<Provenance> = upstream
+        .iter()
+        .filter(|_| !matches!(step.feed, Feed::Map(_)))
+        .map(|(_, up)| up.clone())
+        .collect();
     for (name, to) in &step.refs {
         match to {
             RefTo::Name(var) => match plan.binder(var) {
@@ -2238,6 +2244,9 @@ async fn run_step<H: PlanHost>(
     }
 
     // `..` — the same newline-item convention `run_map` uses, item for item.
+    let Feed::Map(up) = step.feed else {
+        unreachable!("only mapped steps join item outputs");
+    };
     host.fan_out(map_items(&upstream)?.count());
     let mut outputs = Vec::new();
     for item in map_items(&upstream)? {
@@ -2247,7 +2256,9 @@ async fn run_step<H: PlanHost>(
                 .map_err(RunError::Step)?,
         );
     }
-    Ok(Flow::Staged(combine_outputs(outputs)))
+    Ok(Flow::Staged(
+        combine_outputs(outputs).depending_on(run.get(up).provenance()),
+    ))
 }
 
 /// The provenance of a request built from `inputs`: the most restrictive expiry and every
