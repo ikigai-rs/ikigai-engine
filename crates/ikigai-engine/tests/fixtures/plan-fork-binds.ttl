@@ -1,0 +1,46 @@
+# A fork that binds a name (ledger #32): the text face `report = @stored | ( a ; b )`
+# had no graph form while ik:binds had domain ik:Step. With ik:Stage it is ik:binds on
+# the fork, and a later step cites the bound join by @report.
+#
+#   stored = source urn:demo:store
+#   report = @stored | ( source urn:demo:a ; source urn:demo:b )
+#   source urn:text:wc in=@report
+
+@prefix ik:   <https://ikigai-rs.dev/ns#> .
+
+<urn:plan:fork-binds> a ik:Process ;
+    ik:output "text/plain" ;
+    ik:step <urn:plan:fork-binds:step:1> , <urn:plan:fork-binds:step:2> ,
+            <urn:plan:fork-binds:step:3> , <urn:plan:fork-binds:step:4> ;
+    ik:result <urn:plan:fork-binds:step:4> .
+
+<urn:plan:fork-binds:step:1> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:demo:store> ;
+    ik:binds "stored" .
+
+<urn:plan:fork-binds:fork:1> a ik:Fork ;
+    ik:upstream <urn:plan:fork-binds:step:1> ;
+    ik:binds "report" ;
+    ik:join "newline" .
+
+<urn:plan:fork-binds:step:2> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:demo:a> ;
+    ik:forkOf <urn:plan:fork-binds:fork:1> ;
+    ik:order 1 .
+
+<urn:plan:fork-binds:step:3> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:demo:b> ;
+    ik:forkOf <urn:plan:fork-binds:fork:1> ;
+    ik:order 2 .
+
+<urn:plan:fork-binds:step:4> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:text:wc> ;
+    ik:argument <urn:plan:fork-binds:step:4:arg:in> .
+
+<urn:plan:fork-binds:step:4:arg:in> a ik:Argument ;
+    ik:inputName "in" ;
+    ik:ref <urn:plan:fork-binds:var:report> .

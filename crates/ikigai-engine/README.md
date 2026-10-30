@@ -86,11 +86,20 @@ target IRI or a whole argument value, and a `urn:plan:eval` binding copies the p
 `ik:input`s onto the name. A pipeline on the right (`bind urn:q:loud = source urn:file:x |
 urn:iki:fn:toUpper`) is compiled to the plan `plan` renders and bound as `source urn:plan:eval`
 with that plan inline, so the name is a live composite that recomputes when what it reads is
-cut, not a `sink` snapshot (`plan-reader`); a shape `plan` cannot spell, such as a `.. ( … )`
-map over a fork, is refused with the renderer's message. The atom holds the names text form (`names`, media type
+cut, not a `sink` snapshot (`plan-reader`); every fork the text face makes binds this way,
+`.. ( … )` included, and a pipeline `plan` cannot render is refused with the renderer's
+message. The atom holds the names text form (`names`, media type
 `text/x-ikigai-names`, one binding per line). With `plan-reader`, `names::space()` binds the
 lossless transreptor pair `urn:names:to-rdf` / `urn:names:from-rdf` between that form and the
 `ik:Alias` Turtle core builds, and names itself `urn:iki:space:engine:names`.
+
+A plan spells a fork every way the text face feeds one (vocab 0.2.8, `ik:Stage`): over a
+whole upstream (`ik:upstream`), over each item of one (`a .. ( b ; c )`, `ik:mapOver` on the
+fork), as a fork's branch (`ik:forkOf`), and binding its join to a name (`ik:binds`). In a
+mapped fork each item is its own request for every branch, with its own cache entry and
+thread, so changing one item of the list recomputes only that item's branches; the per-item
+joins are rejoined with newlines in list order, and a failing item aborts the run, as `..`
+does in the text face.
 
 A stored plan run by `execute` pipes as the text face does: a step whose only reader is one
 `ik:pipeFrom` edge hands that step its body attached, and a value read more than once (a

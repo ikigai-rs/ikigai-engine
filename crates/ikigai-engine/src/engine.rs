@@ -74,6 +74,16 @@ impl Staged {
         Provenance::new(self.expiry, self.threads.clone())
     }
 
+    /// This output as also depending on `upstream`: the most restrictive expiry of the two,
+    /// and both sets of threads. A plan's mapped fork folds its list in this way (ledger
+    /// #2654), since each item's requests hang from the item alone.
+    #[cfg(feature = "plan-reader")]
+    pub(crate) fn depending_on(mut self, upstream: Provenance) -> Staged {
+        self.expiry = self.expiry.most_restrictive(upstream.expiry);
+        self.threads.extend(upstream.threads);
+        self
+    }
+
     /// The output as owned text — the terminal display surface. A binary
     /// representation flows *through* a pipe fine; what it can't do is be
     /// printed, so the error points at the `sink` terminal that stores it.

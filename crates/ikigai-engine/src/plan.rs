@@ -130,16 +130,18 @@ pub(crate) enum NodeRef {
     Fork(usize),
 }
 
-/// How a step receives its input — at most one way, which the `ik:Step` shape enforces.
+/// How a stage (a step or a fork) receives its input — at most one way, which the `ik:Step`
+/// and `ik:Fork` shapes enforce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Feed {
     /// Nothing flows in: the plan's first stage, or a branch of an upstream-less fork.
     None,
-    /// `|` — the whole upstream representation (`ik:pipeFrom`).
+    /// `|` — the whole upstream representation (`ik:pipeFrom`; on a fork, `ik:upstream`).
     Pipe(NodeRef),
     /// `..` — once per newline-separated item of the upstream (`ik:mapOver`).
     Map(NodeRef),
-    /// A branch of a fork, at a position in the join (`ik:forkOf` + `ik:order`).
+    /// A branch of a fork, at a position in the join (`ik:forkOf` + `ik:order`): the
+    /// stage takes the fork's input as its own.
     Branch { fork: usize, order: usize },
 }
 
@@ -190,11 +192,17 @@ pub(crate) struct Step {
     pub feed: Feed,
 }
 
-/// A set of branches over one upstream representation, joined in order.
+/// A set of branches over one input, joined in order.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Fork {
-    /// Absent when the fork is the plan's first stage and its branches take no input.
-    pub upstream: Option<NodeRef>,
+    /// How the fork receives its input, which every branch takes as its own (vocab 0.2.8,
+    /// ledger #32): nothing (the plan's first stage), the whole upstream (`ik:upstream`,
+    /// rendered from [`Feed::Pipe`]), each item of the upstream (`ik:mapOver`, `a .. ( b ;
+    /// c )`: the fork and all its branches run once per item), or the input of the fork it
+    /// is a branch of (`ik:forkOf` + `ik:order`, `a | ( ( b ; c ) ; d )`).
+    pub feed: Feed,
+    /// `ik:binds` — the name the fork's join is bound to, if any.
+    pub binds: Option<String>,
 }
 
 /// A plan: the parameters, the steps, the forks, and which node's representation is the
@@ -292,11 +300,23 @@ impl Plan {
                 "\n<{}> a ik:Fork ;\n",
                 self.node_iri(NodeRef::Fork(i))
             ));
-            if let Some(upstream) = fork.upstream {
-                out.push_str(&format!(
-                    "    ik:upstream <{}> ;\n",
-                    self.node_iri(upstream)
-                ));
+            match fork.feed {
+                Feed::None => {}
+                Feed::Pipe(up) => {
+                    out.push_str(&format!("    ik:upstream <{}> ;\n", self.node_iri(up)));
+                }
+                Feed::Map(up) => {
+                    out.push_str(&format!("    ik:mapOver <{}> ;\n", self.node_iri(up)));
+                }
+                Feed::Branch { fork, order } => {
+                    out.push_str(&format!(
+                        "    ik:forkOf <{}> ;\n    ik:order {order} ;\n",
+                        self.node_iri(NodeRef::Fork(fork))
+                    ));
+                }
+            }
+            if let Some(name) = &fork.binds {
+                out.push_str(&format!("    ik:binds {} ;\n", literal(name)));
             }
             // The only join the engine performs. Stated rather than left to the default,
             // so a reader never has to know what the default was when this was written.
@@ -699,24 +719,8 @@ impl Plan {
 
         let mut forks = Vec::with_capacity(fork_iris.len());
         for fork_iri in &fork_iris {
-            // These Stage properties are valid vocabulary, but Fork cannot represent
-            // them yet. Refuse rather than silently execute a different plan (#2653).
-            for property in ["mapOver", "forkOf", "binds"] {
-                if !graph.objects(fork_iri, property).is_empty() {
-                    return Err(format!(
-                        "<{fork_iri}> carries ik:{property} on an ik:Fork; this engine does not \
-                         implement that fork property yet (ledger #2653)"
-                    )
-                    .into());
-                }
-            }
-            let upstream = match graph.at_most_one(fork_iri, "upstream")? {
-                Some(object) => Some(node_ref(
-                    object.iri(fork_iri, "upstream")?,
-                    "a fork's upstream",
-                )?),
-                None => None,
-            };
+            let feed = read_feed(&graph, fork_iri, "upstream", &node_ref)?;
+            let binds = read_binds(&graph, fork_iri)?;
             if let Some(join) = graph.at_most_one(fork_iri, "join")? {
                 let join = join.literal(fork_iri, "join")?;
                 if join != "newline" {
@@ -727,7 +731,7 @@ impl Plan {
                     .into());
                 }
             }
-            forks.push(Fork { upstream });
+            forks.push(Fork { feed, binds });
         }
 
         let result = node_ref(
@@ -746,11 +750,174 @@ impl Plan {
         Ok(plan)
     }
 
-    /// The step that binds `name`, if one does (a parameter is a name too, but not a step).
-    pub(crate) fn binder(&self, name: &str) -> Option<usize> {
+    /// The stage that binds `name`, if one does: a step, or a fork's join (a parameter is
+    /// a name too, but not a stage).
+    pub(crate) fn binder(&self, name: &str) -> Option<NodeRef> {
         self.steps
             .iter()
             .position(|step| step.binds.as_deref() == Some(name))
+            .map(NodeRef::Step)
+            .or_else(|| {
+                self.forks
+                    .iter()
+                    .position(|fork| fork.binds.as_deref() == Some(name))
+                    .map(NodeRef::Fork)
+            })
+    }
+
+    /// How `node` is fed.
+    pub(crate) fn feed_of(&self, node: NodeRef) -> Feed {
+        match node {
+            NodeRef::Step(i) => self.steps[i].feed,
+            NodeRef::Fork(i) => self.forks[i].feed,
+        }
+    }
+
+    /// The node whose representation is `fork`'s input: its upstream, what it maps over,
+    /// or — for a fork that is a branch — the input of the fork it is a branch of. `None`
+    /// when nothing flows in.
+    fn fork_input(&self, fork: usize) -> Result<Option<NodeRef>, Refusal> {
+        let mut current = fork;
+        for _ in 0..=self.forks.len() {
+            match self.forks[current].feed {
+                Feed::None => return Ok(None),
+                Feed::Pipe(up) | Feed::Map(up) => return Ok(Some(up)),
+                Feed::Branch { fork, .. } if fork < self.forks.len() => current = fork,
+                Feed::Branch { .. } => {
+                    return Err(format!(
+                        "<{}> is a branch of a fork this plan does not hold",
+                        self.node_iri(NodeRef::Fork(current))
+                    )
+                    .into())
+                }
+            }
+        }
+        Err(Refusal {
+            kind: RefusalKind::Cycle,
+            message: format!(
+                "<{}> is a branch of itself, through ik:forkOf — a plan is a DAG",
+                self.node_iri(NodeRef::Fork(fork))
+            ),
+        })
+    }
+
+    /// The mapped fork (`ik:mapOver` on an `ik:Fork`) each node runs once per item of, the
+    /// innermost one — `None` for a node that runs once. A branch of a mapped fork is
+    /// inside it, and so is everything fed from inside it, down to its branches' tails; a
+    /// mapped fork itself sits where its upstream does.
+    ///
+    /// Iterative, over the feed edges only, with each node's answer memoized, so a chain of
+    /// any length is walked once (ledger #1733). Call it on a plan [`check`](Self::check)
+    /// has passed, whose feed edges are acyclic.
+    pub(crate) fn owners(&self) -> BTreeMap<NodeRef, Option<usize>> {
+        let mut owners: BTreeMap<NodeRef, Option<usize>> = BTreeMap::new();
+        let nodes = (0..self.steps.len())
+            .map(NodeRef::Step)
+            .chain((0..self.forks.len()).map(NodeRef::Fork));
+        for node in nodes {
+            // Walk up the feed edges to a node whose owner is known, or decided by its own
+            // feed, then hand that answer back down the path.
+            let mut path = Vec::new();
+            let mut current = node;
+            let owner = loop {
+                if let Some(known) = owners.get(&current) {
+                    break *known;
+                }
+                if path.len() > self.steps.len() + self.forks.len() {
+                    // A cycle `check` would have refused; nothing is inside a map.
+                    break None;
+                }
+                match self.feed_of(current) {
+                    Feed::None => {
+                        owners.insert(current, None);
+                        break None;
+                    }
+                    Feed::Branch { fork, .. } if matches!(self.forks.get(fork), Some(f) if matches!(f.feed, Feed::Map(_))) =>
+                    {
+                        owners.insert(current, Some(fork));
+                        break Some(fork);
+                    }
+                    Feed::Branch { fork, .. } if fork < self.forks.len() => {
+                        path.push(current);
+                        current = NodeRef::Fork(fork);
+                    }
+                    Feed::Branch { .. } => break None,
+                    Feed::Pipe(up) | Feed::Map(up) => {
+                        path.push(current);
+                        current = up;
+                    }
+                }
+            };
+            // Every edge the walk passed keeps the scope: a pipe, a map step, a branch of a
+            // fork that is not mapped, and a mapped fork's own answer, which is outside it.
+            for node in path {
+                owners.insert(node, owner);
+            }
+        }
+        owners
+    }
+
+    /// Whether `inner` runs inside `scope` (once per item of it, or of a map inside it):
+    /// `scope` is `inner` or encloses it.
+    fn encloses(
+        &self,
+        owners: &BTreeMap<NodeRef, Option<usize>>,
+        scope: usize,
+        inner: Option<usize>,
+    ) -> bool {
+        let mut current = inner;
+        for _ in 0..=self.forks.len() {
+            match current {
+                None => return false,
+                Some(fork) if fork == scope => return true,
+                Some(fork) => current = owners[&NodeRef::Fork(fork)],
+            }
+        }
+        false
+    }
+
+    /// A node inside a mapped fork has one value per item, so only that fork (for its join)
+    /// and what runs inside it, item by item, may take its value — not a step outside it
+    /// through a bound name, and not the plan's result.
+    fn check_scopes(&self) -> Result<(), Refusal> {
+        let owners = self.owners();
+        let outside = |node: NodeRef, dep: NodeRef| -> Option<Refusal> {
+            let fork = owners[&dep]?;
+            if node == NodeRef::Fork(fork) || self.encloses(&owners, fork, owners[&node]) {
+                return None;
+            }
+            Some(
+                format!(
+                    "<{}> takes the value of <{}>, which is inside the mapped fork <{}> and so \
+                     has one value per item — only what runs inside that fork can take it",
+                    self.node_iri(node),
+                    self.node_iri(dep),
+                    self.node_iri(NodeRef::Fork(fork))
+                )
+                .into(),
+            )
+        };
+        let nodes = (0..self.steps.len())
+            .map(NodeRef::Step)
+            .chain((0..self.forks.len()).map(NodeRef::Fork));
+        for node in nodes {
+            for dep in self.deps(node)? {
+                if let Some(refusal) = outside(node, dep) {
+                    return Err(refusal);
+                }
+            }
+        }
+        if let Some(fork) = owners[&self.result] {
+            return Err(format!(
+                "<{}>'s result <{}> is inside the mapped fork <{}>, which runs it once per \
+                 item — the result is the fork's join, or something after it",
+                self.iri(),
+                self.node_iri(self.result),
+                self.node_iri(NodeRef::Fork(fork))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     /// The structural rules a reader must hold that reading one node at a time cannot
@@ -766,13 +933,14 @@ impl Plan {
             .iter()
             .map(|param| param.name.as_str())
             .chain(self.steps.iter().filter_map(|step| step.binds.as_deref()))
+            .chain(self.forks.iter().filter_map(|fork| fork.binds.as_deref()))
         {
             *bound.entry(name).or_default() += 1;
         }
         if let Some((name, count)) = bound.iter().find(|(_, count)| **count > 1) {
             return Err(format!(
                 "<{}> binds the name `{name}` {count} times — a plan is single-assignment, \
-                 across its steps' ik:binds and its parameters",
+                 across its steps' and forks' ik:binds and its parameters",
                 self.iri()
             )
             .into());
@@ -821,7 +989,7 @@ impl Plan {
         for node in nodes {
             self.visit(node, &mut marks, &mut Vec::new())?;
         }
-        Ok(())
+        self.check_scopes()
     }
 
     /// The nodes a run evaluates, dependencies first: everything the result depends on,
@@ -832,28 +1000,39 @@ impl Plan {
         Ok(order)
     }
 
-    /// What `node` needs before it can run: its feed's upstream, the steps that bind the
-    /// names its arguments reference (the edge the shapes cannot follow), and — for a
-    /// fork — the tail of each branch, in join order.
+    /// What `node` needs before it can run: its feed's upstream (for a branch, its fork's
+    /// input), the stages that bind the names its arguments reference (the edge the shapes
+    /// cannot follow), and — for a fork — the tail of each branch, in join order.
     fn deps(&self, node: NodeRef) -> Result<Vec<NodeRef>, Refusal> {
-        match node {
-            NodeRef::Fork(fork) => self.branch_tails(fork),
-            NodeRef::Step(index) => {
-                let step = &self.steps[index];
-                let mut deps = Vec::new();
-                match step.feed {
-                    Feed::None => {}
-                    Feed::Pipe(up) | Feed::Map(up) => deps.push(up),
-                    Feed::Branch { fork, .. } => deps.extend(self.forks[fork].upstream),
+        let mut deps = Vec::new();
+        match self.feed_of(node) {
+            Feed::None => {}
+            Feed::Pipe(up) | Feed::Map(up) => deps.push(up),
+            Feed::Branch { fork, .. } => {
+                if fork >= self.forks.len() {
+                    return Err(format!(
+                        "<{}> is a branch of a fork this plan does not hold",
+                        self.node_iri(node)
+                    )
+                    .into());
                 }
-                for to in step.refs.values() {
-                    if let RefTo::Name(name) = to {
-                        deps.extend(self.binder(name).map(NodeRef::Step));
-                    }
+                // A fork that is a branch needs nothing its branches do not already.
+                if let NodeRef::Step(_) = node {
+                    deps.extend(self.fork_input(fork)?);
                 }
-                Ok(deps)
             }
         }
+        match node {
+            NodeRef::Fork(fork) => deps.extend(self.branch_tails(fork)?),
+            NodeRef::Step(index) => {
+                for to in self.steps[index].refs.values() {
+                    if let RefTo::Name(name) = to {
+                        deps.extend(self.binder(name));
+                    }
+                }
+            }
+        }
+        Ok(deps)
     }
 
     /// Depth-first, dependencies first. `marks` holds `false` while a node is on the
@@ -925,23 +1104,22 @@ impl Plan {
         }
     }
 
-    /// The tail of each branch of `fork`, in join order: the branches are the steps whose
-    /// `ik:forkOf` names it, and a branch that is itself a pipeline is the chain from
-    /// that head — what the fork joins is the chain's last node.
+    /// The tail of each branch of `fork`, in join order: the branches are the stages (steps
+    /// or forks) whose `ik:forkOf` names it, and a branch that is itself a pipeline is the
+    /// chain from that head — what the fork joins is the chain's last node.
     pub(crate) fn branch_tails(&self, fork: usize) -> Result<Vec<NodeRef>, Refusal> {
-        let mut heads: Vec<(usize, usize)> = self
-            .steps
-            .iter()
-            .enumerate()
-            .filter_map(|(i, step)| match step.feed {
-                Feed::Branch { fork: of, order } if of == fork => Some((order, i)),
+        let mut heads: Vec<(usize, NodeRef)> = (0..self.steps.len())
+            .map(NodeRef::Step)
+            .chain((0..self.forks.len()).map(NodeRef::Fork))
+            .filter_map(|node| match self.feed_of(node) {
+                Feed::Branch { fork: of, order } if of == fork => Some((order, node)),
                 _ => None,
             })
             .collect();
         heads.sort_unstable();
         if heads.is_empty() {
             return Err(format!(
-                "<{}> has no branch (no step names it with ik:forkOf)",
+                "<{}> has no branch (no step or fork names it with ik:forkOf)",
                 self.node_iri(NodeRef::Fork(fork))
             )
             .into());
@@ -955,7 +1133,7 @@ impl Plan {
         }
         heads
             .into_iter()
-            .map(|(_, head)| self.chain_tail(NodeRef::Step(head)))
+            .map(|(_, head)| self.chain_tail(head))
             .collect()
     }
 
@@ -970,7 +1148,7 @@ impl Plan {
                 }
             }
             for (i, fork) in self.forks.iter().enumerate() {
-                if fork.upstream == Some(current) {
+                if matches!(fork.feed, Feed::Pipe(up) | Feed::Map(up) if up == current) {
                     next.push(NodeRef::Fork(i));
                 }
             }
@@ -1121,59 +1299,8 @@ fn read_step(
     let resolves = graph.one(step_iri, "resolves")?.iri(step_iri, "resolves")?;
     let resolves = Iri::parse(resolves).map_err(|e| format!("<{step_iri}> ik:resolves: {e}"))?;
 
-    let binds = match graph.at_most_one(step_iri, "binds")? {
-        None => None,
-        Some(object) => {
-            let name = object.literal(step_iri, "binds")?;
-            if !is_identifier(name) {
-                return Err(format!(
-                    "<{step_iri}> binds `{name}`; a bound name is an identifier (letters, \
-                     digits, _ and -)"
-                ));
-            }
-            Some(name.to_string())
-        }
-    };
-
-    let pipe = graph.at_most_one(step_iri, "pipeFrom")?;
-    let map = graph.at_most_one(step_iri, "mapOver")?;
-    let fork = graph.at_most_one(step_iri, "forkOf")?;
-    let order = graph.at_most_one(step_iri, "order")?;
-    let feed = match (pipe, map, fork) {
-        (None, None, None) => {
-            if order.is_some() {
-                return Err(format!(
-                    "<{step_iri}> carries ik:order but no ik:forkOf — a position without a join"
-                ));
-            }
-            Feed::None
-        }
-        (Some(up), None, None) => Feed::Pipe(node_ref(up.iri(step_iri, "pipeFrom")?, "a pipe")?),
-        (None, Some(up), None) => Feed::Map(node_ref(up.iri(step_iri, "mapOver")?, "a map")?),
-        (None, None, Some(of)) => {
-            let order = order
-                .ok_or_else(|| format!("<{step_iri}> is a fork branch but carries no ik:order"))?;
-            let order: usize = order
-                .literal(step_iri, "order")?
-                .parse()
-                .map_err(|_| format!("<{step_iri}> ik:order is not a positive integer"))?;
-            if order == 0 {
-                return Err(format!("<{step_iri}> ik:order is not a positive integer"));
-            }
-            match node_ref(of.iri(step_iri, "forkOf")?, "a fork")? {
-                NodeRef::Fork(fork) => Feed::Branch { fork, order },
-                NodeRef::Step(_) => {
-                    return Err(format!("<{step_iri}> ik:forkOf names a step, not a fork"))
-                }
-            }
-        }
-        _ => {
-            return Err(format!(
-                "<{step_iri}> is fed more than one way — a step takes at most one of \
-                 ik:pipeFrom, ik:mapOver, ik:forkOf"
-            ))
-        }
-    };
+    let binds = read_binds(graph, step_iri)?;
+    let feed = read_feed(graph, step_iri, "pipeFrom", node_ref)?;
 
     let mut arguments = BTreeMap::new();
     let mut refs = BTreeMap::new();
@@ -1231,6 +1358,74 @@ fn read_step(
         refs,
         binds,
         feed,
+    })
+}
+
+/// A stage's `ik:binds`, an identifier if present.
+#[cfg(feature = "plan-reader")]
+fn read_binds(graph: &Graph, iri: &str) -> Result<Option<String>, String> {
+    match graph.at_most_one(iri, "binds")? {
+        None => Ok(None),
+        Some(object) => {
+            let name = object.literal(iri, "binds")?;
+            if !is_identifier(name) {
+                return Err(format!(
+                    "<{iri}> binds `{name}`; a bound name is an identifier (letters, digits, _ \
+                     and -)"
+                ));
+            }
+            Ok(Some(name.to_string()))
+        }
+    }
+}
+
+/// How a stage is fed: by `pipe` (`ik:pipeFrom` on a step, `ik:upstream` on a fork),
+/// `ik:mapOver`, or `ik:forkOf` + `ik:order` — at most one of them.
+#[cfg(feature = "plan-reader")]
+fn read_feed(
+    graph: &Graph,
+    iri: &str,
+    pipe: &str,
+    node_ref: &impl Fn(&str, &str) -> Result<NodeRef, String>,
+) -> Result<Feed, String> {
+    let piped = graph.at_most_one(iri, pipe)?;
+    let map = graph.at_most_one(iri, "mapOver")?;
+    let fork = graph.at_most_one(iri, "forkOf")?;
+    let order = graph.at_most_one(iri, "order")?;
+    Ok(match (piped, map, fork) {
+        (None, None, None) => {
+            if order.is_some() {
+                return Err(format!(
+                    "<{iri}> carries ik:order but no ik:forkOf — a position without a join"
+                ));
+            }
+            Feed::None
+        }
+        (Some(up), None, None) => Feed::Pipe(node_ref(up.iri(iri, pipe)?, "a pipe")?),
+        (None, Some(up), None) => Feed::Map(node_ref(up.iri(iri, "mapOver")?, "a map")?),
+        (None, None, Some(of)) => {
+            let order =
+                order.ok_or_else(|| format!("<{iri}> is a fork branch but carries no ik:order"))?;
+            let order: usize = order
+                .literal(iri, "order")?
+                .parse()
+                .map_err(|_| format!("<{iri}> ik:order is not a positive integer"))?;
+            if order == 0 {
+                return Err(format!("<{iri}> ik:order is not a positive integer"));
+            }
+            match node_ref(of.iri(iri, "forkOf")?, "a fork")? {
+                NodeRef::Fork(fork) => Feed::Branch { fork, order },
+                NodeRef::Step(_) => {
+                    return Err(format!("<{iri}> ik:forkOf names a step, not a fork"))
+                }
+            }
+        }
+        _ => {
+            return Err(format!(
+                "<{iri}> is fed more than one way — a stage takes at most one of ik:{pipe}, \
+                 ik:mapOver, ik:forkOf"
+            ))
+        }
     })
 }
 
@@ -1440,30 +1635,12 @@ impl Engine {
                     ))
                 }
                 Node::Fork(branches) => {
-                    let upstream = match feed {
-                        Feed::None => None,
-                        Feed::Pipe(up) => Some(up),
-                        // ⚠ Both of these are grammar the process vocabulary cannot spell,
-                        // because ik:mapOver, ik:forkOf and ik:order are properties of an
-                        // ik:Step and a fork is not one. Refusing beats rendering
-                        // something that would come back meaning something else.
-                        Feed::Map(_) => {
-                            return Err("`.. ( … )` — mapping over a fork — has no plan spelling: \
-                                 ik:mapOver is a property of an ik:Step, and a fork is not a \
-                                 step. Map over a stage, or make the fork's work one resource."
-                                .to_string())
-                        }
-                        Feed::Branch { .. } => {
-                            return Err("a `( … )` fork directly inside a fork branch has no plan \
-                                 spelling: ik:forkOf and ik:order are properties of an \
-                                 ik:Step. Put a stage at the head of the branch, or make the \
-                                 inner fork one resource."
-                                .to_string())
-                        }
-                    };
+                    // A fork is fed every way a step is (vocab 0.2.8, ledger #32): `( … )`
+                    // first, `| ( … )`, `.. ( … )` (the fork and its branches once per item),
+                    // and as a branch of a fork. Each branch takes the fork's input.
                     let fork = {
                         let mut builder = builder.borrow_mut();
-                        builder.forks.push(Fork { upstream });
+                        builder.forks.push(Fork { feed, binds: None });
                         builder.forks.len() - 1
                     };
                     for (index, branch) in branches.iter().enumerate() {
@@ -1473,7 +1650,7 @@ impl Engine {
                                 fork,
                                 order: index + 1,
                             },
-                            upstream.is_some(),
+                            has_input,
                             builder,
                         )
                         .await?;
@@ -1626,23 +1803,23 @@ impl Plan {
         };
         read(self.result, false);
         for node in order {
+            match self.feed_of(*node) {
+                Feed::None => {}
+                // Only a step takes a body attached; a fork hands its input to every branch.
+                Feed::Pipe(up) => read(up, matches!(node, NodeRef::Step(_))),
+                Feed::Map(up) => read(up, false),
+                Feed::Branch { fork, .. } => {
+                    if let (NodeRef::Step(_), Some(up)) = (node, self.fork_input(fork)?) {
+                        read(up, false);
+                    }
+                }
+            }
             match *node {
                 NodeRef::Step(index) => {
-                    let step = &self.steps[index];
-                    match step.feed {
-                        Feed::None => {}
-                        Feed::Pipe(up) => read(up, true),
-                        Feed::Map(up) => read(up, false),
-                        Feed::Branch { fork, .. } => {
-                            if let Some(up) = self.forks[fork].upstream {
-                                read(up, false);
-                            }
-                        }
-                    }
-                    for to in step.refs.values() {
+                    for to in self.steps[index].refs.values() {
                         if let RefTo::Name(var) = to {
                             if let Some(binder) = self.binder(var) {
-                                read(NodeRef::Step(binder), false);
+                                read(binder, false);
                             }
                         }
                     }
@@ -1654,10 +1831,13 @@ impl Plan {
                 }
             }
         }
+        // A step inside a mapped fork runs once per item and is collected each time: its
+        // consumer, and the fork's join, read it per item.
+        let owners = self.owners();
         Ok(readers
             .into_iter()
             .filter_map(|(node, readers)| match (node, readers) {
-                (NodeRef::Step(index), (1, true)) => Some(index),
+                (NodeRef::Step(index), (1, true)) if owners[&node].is_none() => Some(index),
                 _ => None,
             })
             .collect())
@@ -1670,6 +1850,15 @@ impl Plan {
 /// from the result are not run: the plan is a dependency graph, not a script, so what runs
 /// is what the answer depends on, dependencies first ([`Plan::run_order`]). Sequential:
 /// a fork's branches and a map's items run one after another.
+///
+/// A mapped fork (`a .. ( b ; c )`, ledger #2654) runs the nodes inside it ([`Plan::owners`])
+/// once per newline-separated item of its upstream, each item its own scope, so every
+/// branch's request for an item is its own request with its own cache entry and thread,
+/// and a change to one item recomputes that item's branches alone. Its answer
+/// is the per-item joins rejoined with newlines, in list order, as `run_map` joins a
+/// mapped fork in the text face; a failing item aborts the run, as it does there. The
+/// scopes are a stack rather than a recursion, so a map inside a map needs no boxed
+/// future, and the runner's future stays `Send` exactly when its host's is.
 #[cfg(feature = "plan-reader")]
 pub(crate) async fn execute<H: PlanHost>(
     host: &H,
@@ -1683,43 +1872,215 @@ pub(crate) async fn execute<H: PlanHost>(
     let piped = plan
         .piped_steps(&order)
         .map_err(|refusal| RunError::Plan(refusal.message))?;
-    let mut done: BTreeMap<NodeRef, Staged> = BTreeMap::new();
+    let owners = plan.owners();
+    let scope = |fork: Option<usize>| -> Vec<NodeRef> {
+        order
+            .iter()
+            .copied()
+            .filter(|node| owners[node] == fork)
+            .collect()
+    };
+    let mut run = Run {
+        frames: vec![Frame {
+            items: None,
+            nodes: scope(None),
+            at: 0,
+            done: BTreeMap::new(),
+        }],
+    };
     // The bodies of the steps `piped` names, each until the one step it feeds takes it.
     // Apart from `done`: a body is not `Sync`, and `urn:plan:eval`'s future must be `Send`.
+    // Top-level steps only: nothing inside a mapped fork answers its body.
     let mut bodies: BTreeMap<NodeRef, Piped> = BTreeMap::new();
-    for node in order {
+    loop {
+        let frame = run
+            .frames
+            .last()
+            .expect("the top-level frame is never popped");
+        let Some(&node) = frame.nodes.get(frame.at) else {
+            // This scope is done: the run, or one item of a mapped fork.
+            if run.frames.len() == 1 {
+                break;
+            }
+            let mut frame = run.frames.pop().expect("an item's frame");
+            let mut items = frame.items.take().expect("an item's frame maps a fork");
+            let tails = plan
+                .branch_tails(items.fork)
+                .map_err(|refusal| RunError::Plan(refusal.message))?;
+            host.fan_out(tails.len());
+            items.outputs.push(combine_outputs(
+                tails.iter().map(|tail| frame.done[tail].clone()).collect(),
+            ));
+            items.index += 1;
+            if items.index < items.items.len() {
+                // The next item, in a fresh scope: nothing one item computed is another's.
+                frame.done.clear();
+                frame.at = 0;
+                frame.items = Some(items);
+                run.frames.push(frame);
+            } else {
+                let parent = run.frames.last_mut().expect("the frame the map ran from");
+                // The join depends on the list, though no item's requests did: cutting the
+                // list's thread cuts the join, and the next run recomputes only the items
+                // that changed.
+                let join = combine_outputs(items.outputs).depending_on(items.provenance);
+                parent.done.insert(NodeRef::Fork(items.fork), join);
+                parent.at += 1;
+            }
+            continue;
+        };
         let flow = match node {
             NodeRef::Step(index) => {
                 let body_out = piped.contains(&index);
-                run_step(host, plan, index, &done, &mut bodies, &values, body_out).await?
+                run_step(host, plan, index, &run, &mut bodies, &values, body_out).await?
             }
-            NodeRef::Fork(index) => {
-                let tails = plan
-                    .branch_tails(index)
-                    .map_err(|refusal| RunError::Plan(refusal.message))?;
-                // Sequential, so the achieved width is 1 however many branches there are —
-                // the same honest number `run_node`'s no-spawner fork path records. ⚠ The
-                // text face has a concurrent path for single-`source` branches
-                // (`run_parallel`); a plan does not yet, so moving a wide fork into a plan
-                // costs its concurrency today.
-                host.fan_out(tails.len());
-                Flow::Staged(combine_outputs(
-                    tails.iter().map(|tail| done[tail].clone()).collect(),
-                ))
-            }
+            NodeRef::Fork(index) => match plan.forks[index].feed {
+                Feed::Map(up) => {
+                    let upstream = run.get(up);
+                    let provenance = upstream.provenance();
+                    let items: Vec<Vec<u8>> = map_items(&upstream.bytes)?
+                        .map(|item| item.as_bytes().to_vec())
+                        .collect();
+                    host.fan_out(items.len());
+                    if items.is_empty() {
+                        // No items: the empty join, as `run_map` answers an empty list.
+                        Flow::Staged(combine_outputs(Vec::new()).depending_on(provenance))
+                    } else {
+                        run.frames.push(Frame {
+                            items: Some(Items {
+                                fork: index,
+                                items,
+                                provenance,
+                                index: 0,
+                                outputs: Vec::new(),
+                            }),
+                            nodes: scope(Some(index)),
+                            at: 0,
+                            done: BTreeMap::new(),
+                        });
+                        continue;
+                    }
+                }
+                _ => {
+                    let tails = plan
+                        .branch_tails(index)
+                        .map_err(|refusal| RunError::Plan(refusal.message))?;
+                    // Sequential, so the achieved width is 1 however many branches there
+                    // are — the same honest number `run_node`'s no-spawner fork path
+                    // records. ⚠ The text face has a concurrent path for single-`source`
+                    // branches (`run_parallel`); a plan does not yet, so moving a wide fork
+                    // into a plan costs its concurrency today.
+                    host.fan_out(tails.len());
+                    Flow::Staged(combine_outputs(
+                        tails.iter().map(|tail| run.get(*tail).clone()).collect(),
+                    ))
+                }
+            },
         };
+        let frame = run.frames.last_mut().expect("the frame the node ran in");
         match flow {
             Flow::Staged(staged) => {
-                done.insert(node, staged);
+                frame.done.insert(node, staged);
             }
             Flow::Piped(body) => {
                 bodies.insert(node, body);
             }
         }
+        frame.at += 1;
     }
-    Ok(done
+    Ok(run.frames[0]
+        .done
         .remove(&plan.result)
         .expect("the result is the last node of its own run order, and collected"))
+}
+
+/// The scopes a run is inside, outermost first.
+#[cfg(feature = "plan-reader")]
+struct Run {
+    frames: Vec<Frame>,
+}
+
+/// One scope of a run: the top level, or the current item of a mapped fork.
+#[cfg(feature = "plan-reader")]
+struct Frame {
+    /// The mapped fork this scope runs item by item; `None` at the top level.
+    items: Option<Items>,
+    /// The nodes this scope runs, dependencies first.
+    nodes: Vec<NodeRef>,
+    /// The next of `nodes` to run.
+    at: usize,
+    /// What this scope's nodes answered, for the current item.
+    done: BTreeMap<NodeRef, Staged>,
+}
+
+/// A mapped fork's items, and how far through them the run is.
+#[cfg(feature = "plan-reader")]
+struct Items {
+    fork: usize,
+    items: Vec<Vec<u8>>,
+    /// The upstream's provenance, which the join takes and no item does.
+    provenance: Provenance,
+    /// The item being run.
+    index: usize,
+    /// Each finished item's join, in list order.
+    outputs: Vec<Staged>,
+}
+
+#[cfg(feature = "plan-reader")]
+impl Run {
+    /// What `node` answered, in the innermost scope that ran it.
+    fn get(&self, node: NodeRef) -> &Staged {
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|frame| frame.done.get(&node))
+            .expect("a node runs after everything it depends on, in a scope that encloses it")
+    }
+
+    /// The input every branch of `fork` takes: its upstream, its current item when it is
+    /// mapped, or — for a fork that is a branch — the input of the fork it is a branch of.
+    ///
+    /// An item comes with no provenance of its own (ledger #2654): it travels inline in
+    /// each request it feeds, so the request names it, and hanging those requests from the
+    /// whole list's thread would recompute every item whenever any one changed. The list's
+    /// provenance is the join's instead ([`Staged::depending_on`]).
+    fn fork_input(&self, plan: &Plan, fork: usize) -> Option<(&[u8], Provenance)> {
+        let mut current = fork;
+        loop {
+            match plan.forks[current].feed {
+                Feed::None => return None,
+                Feed::Pipe(up) => {
+                    let staged = self.get(up);
+                    return Some((&staged.bytes, staged.provenance()));
+                }
+                Feed::Map(_) => {
+                    let items = self
+                        .frames
+                        .iter()
+                        .rev()
+                        .find_map(|frame| frame.items.as_ref().filter(|i| i.fork == current))
+                        .expect("a mapped fork's branch runs in one of its items");
+                    return Some((&items.items[items.index], root_provenance()));
+                }
+                // Acyclic: the reader refused a fork that is a branch of itself.
+                Feed::Branch { fork, .. } => current = fork,
+            }
+        }
+    }
+}
+
+/// The items `..` maps over: newline-separated text, a final newline ending the last item
+/// rather than adding an empty one — the convention `run_map` uses, item for item.
+#[cfg(feature = "plan-reader")]
+fn map_items<E>(bytes: &[u8]) -> Result<std::str::SplitTerminator<'_, char>, RunError<E>> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        RunError::Plan(
+            "`..` maps over newline-separated text items, but the piped value is not \
+             UTF-8 text — use a plain `|` to pass the bytes through whole"
+                .to_string(),
+        )
+    })?;
+    Ok(text.split_terminator('\n'))
 }
 
 /// What flows into a step along its feed.
@@ -1759,7 +2120,7 @@ async fn run_step<H: PlanHost>(
     host: &H,
     plan: &Plan,
     index: usize,
-    done: &BTreeMap<NodeRef, Staged>,
+    run: &Run,
     bodies: &mut BTreeMap<NodeRef, Piped>,
     values: &BTreeMap<String, Option<String>>,
     body_out: bool,
@@ -1779,19 +2140,15 @@ async fn run_step<H: PlanHost>(
         }
         (None, Feed::None) => None,
         (None, Feed::Pipe(up) | Feed::Map(up)) => {
-            let staged = &done[&up];
+            let staged = run.get(up);
             Some((
                 Fed::Bytes(Cow::Borrowed(&staged.bytes)),
                 staged.provenance(),
             ))
         }
-        (None, Feed::Branch { fork, .. }) => plan.forks[fork].upstream.map(|up| {
-            let staged = &done[&up];
-            (
-                Fed::Bytes(Cow::Borrowed(&staged.bytes)),
-                staged.provenance(),
-            )
-        }),
+        (None, Feed::Branch { fork, .. }) => run
+            .fork_input(plan, fork)
+            .map(|(bytes, provenance)| (Fed::Bytes(Cow::Borrowed(bytes)), provenance)),
     };
 
     let mut arguments: Vec<(String, Vec<u8>)> = step
@@ -1806,7 +2163,7 @@ async fn run_step<H: PlanHost>(
         match to {
             RefTo::Name(var) => match plan.binder(var) {
                 Some(binder) => {
-                    let bound = &done[&NodeRef::Step(binder)];
+                    let bound = run.get(binder);
                     arguments.push((name.clone(), bound.bytes.clone()));
                     inputs.push(bound.provenance());
                 }
@@ -1881,17 +2238,9 @@ async fn run_step<H: PlanHost>(
     }
 
     // `..` — the same newline-item convention `run_map` uses, item for item.
-    // A final newline terminates the last item rather than adding an empty one.
-    let text = std::str::from_utf8(&upstream).map_err(|_| {
-        RunError::Plan(
-            "`..` maps over newline-separated text items, but the piped value is not \
-             UTF-8 text — use a plain `|` to pass the bytes through whole"
-                .to_string(),
-        )
-    })?;
-    host.fan_out(text.split_terminator('\n').count());
+    host.fan_out(map_items(&upstream)?.count());
     let mut outputs = Vec::new();
-    for item in text.split_terminator('\n') {
+    for item in map_items(&upstream)? {
         outputs.push(
             host.issue(request(Some(item.as_bytes())), provenance.clone())
                 .await
@@ -2044,23 +2393,101 @@ impl Engine {
 mod tests {
     use super::*;
 
+    /// The three fork shapes of vocab 0.2.8 (ledger #32), which ledger #2653 refused and
+    /// #2654 implements: each fixture reads to the fork it spells, and render → read →
+    /// render is byte-identical.
     #[test]
-    fn reader_refuses_unsupported_fork_properties() {
-        let mapped = include_str!("../tests/fixtures/plan-fork-mapped.ttl");
-        for (property, value) in [
-            ("mapOver", "<urn:plan:fork-mapped:step:1>"),
-            ("forkOf", "<urn:plan:fork-mapped:fork:2>"),
-            ("binds", "\"mapped\""),
-        ] {
-            let turtle = mapped.replace(
-                "ik:mapOver <urn:plan:fork-mapped:step:1>",
-                &format!("ik:{property} {value}"),
-            );
-            let error = Plan::from_turtle(&turtle).expect_err("unsupported fork property");
-            assert!(error.contains("<urn:plan:fork-mapped:fork:1>"), "{error}");
-            assert!(error.contains(&format!("ik:{property}")), "{error}");
-            assert!(error.contains("#2653"), "{error}");
+    fn the_vocabularys_fork_fixtures_read_and_render_as_themselves() {
+        let mapped = Plan::from_turtle(include_str!("../tests/fixtures/plan-fork-mapped.ttl"))
+            .expect("mapped");
+        assert_eq!(mapped.forks[0].feed, Feed::Map(NodeRef::Step(0)));
+        let branch = Plan::from_turtle(include_str!("../tests/fixtures/plan-fork-branch.ttl"))
+            .expect("branch");
+        assert_eq!(branch.forks[1].feed, Feed::Branch { fork: 0, order: 1 });
+        assert_eq!(
+            branch.branch_tails(0).expect("tails"),
+            vec![NodeRef::Fork(1), NodeRef::Step(3)]
+        );
+        let binds = Plan::from_turtle(include_str!("../tests/fixtures/plan-fork-binds.ttl"))
+            .expect("binds");
+        assert_eq!(binds.forks[0].binds.as_deref(), Some("report"));
+        assert_eq!(binds.binder("report"), Some(NodeRef::Fork(0)));
+        for plan in [mapped, branch, binds] {
+            let turtle = plan.to_turtle(None);
+            let read = Plan::from_turtle(&turtle).expect("read back");
+            assert_eq!(read, plan);
+            assert_eq!(read.to_turtle(None), turtle);
         }
+    }
+
+    #[test]
+    fn a_fork_that_is_a_branch_of_itself_is_a_cycle() {
+        let turtle = include_str!("../tests/fixtures/plan-fork-branch.ttl").replace(
+            "ik:forkOf <urn:plan:fork-branch:fork:1> ;\n    ik:order 1",
+            "ik:forkOf <urn:plan:fork-branch:fork:2> ;\n    ik:order 1",
+        );
+        assert_eq!(
+            Plan::read(&turtle).expect_err("a cycle").kind,
+            RefusalKind::Cycle
+        );
+    }
+
+    #[test]
+    fn a_mapped_forks_result_must_be_outside_it() {
+        // The result is a branch of the mapped fork: one value per item, so no answer.
+        let turtle = include_str!("../tests/fixtures/plan-fork-mapped.ttl").replace(
+            "ik:result <urn:plan:fork-mapped:fork:1>",
+            "ik:result <urn:plan:fork-mapped:step:2>",
+        );
+        let error = Plan::from_turtle(&turtle).expect_err("inside the map");
+        assert!(error.contains("once per"), "{error}");
+    }
+
+    #[test]
+    fn owners_put_what_is_inside_a_mapped_fork_inside_it() {
+        // step 0 .. ( step 1 | step 2 ; fork 1 = ( step 3 ; step 4 ) ), then step 5 after.
+        let plan = Plan {
+            id: "own".to_string(),
+            params: Vec::new(),
+            steps: vec![
+                step("urn:t:list", Feed::None, &[]),
+                step("urn:t:a", Feed::Branch { fork: 0, order: 1 }, &[]),
+                step("urn:t:b", Feed::Pipe(NodeRef::Step(1)), &[]),
+                step("urn:t:c", Feed::Branch { fork: 1, order: 1 }, &[]),
+                step("urn:t:d", Feed::Branch { fork: 1, order: 2 }, &[]),
+                step("urn:t:e", Feed::Pipe(NodeRef::Fork(0)), &[]),
+            ],
+            forks: vec![
+                Fork {
+                    feed: Feed::Map(NodeRef::Step(0)),
+                    binds: None,
+                },
+                Fork {
+                    feed: Feed::Branch { fork: 0, order: 2 },
+                    binds: None,
+                },
+            ],
+            result: NodeRef::Step(5),
+        };
+        plan.check().expect("a plan");
+        let owners = plan.owners();
+        let inside: Vec<NodeRef> = owners
+            .iter()
+            .filter(|(_, owner)| **owner == Some(0))
+            .map(|(node, _)| *node)
+            .collect();
+        assert_eq!(
+            inside,
+            [1, 2, 3, 4]
+                .map(NodeRef::Step)
+                .into_iter()
+                .chain([NodeRef::Fork(1)])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(owners[&NodeRef::Fork(0)], None);
+        assert_eq!(owners[&NodeRef::Step(5)], None);
+        let read = Plan::from_turtle(&plan.to_turtle(None)).expect("read back");
+        assert_eq!(read, plan);
     }
 
     fn iri(s: &str) -> Iri {
@@ -2211,7 +2638,8 @@ mod tests {
                 step("urn:t:five", Feed::Branch { fork: 0, order: 2 }, &[]),
             ],
             forks: vec![Fork {
-                upstream: Some(NodeRef::Step(2)),
+                feed: Feed::Pipe(NodeRef::Step(2)),
+                binds: None,
             }],
             result: NodeRef::Fork(0),
         }

@@ -1,0 +1,45 @@
+# A fork as a fork's branch head (ledger #32, ikigai-cli #329): the text face
+# `a | ( ( b ; c ) ; d )` had no graph form while ik:forkOf had domain ik:Step. With
+# ik:Stage the inner fork carries ik:forkOf and ik:order, and takes the outer fork's
+# input as its own (so it has no ik:upstream of its own).
+#
+#   source urn:demo:a | ( ( source urn:demo:b ; source urn:demo:c ) ; source urn:demo:d )
+
+@prefix ik:   <https://ikigai-rs.dev/ns#> .
+
+<urn:plan:fork-branch> a ik:Process ;
+    ik:output "text/plain" ;
+    ik:step <urn:plan:fork-branch:step:1> , <urn:plan:fork-branch:step:2> ,
+            <urn:plan:fork-branch:step:3> , <urn:plan:fork-branch:step:4> ;
+    ik:result <urn:plan:fork-branch:fork:1> .
+
+<urn:plan:fork-branch:step:1> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:demo:a> .
+
+<urn:plan:fork-branch:fork:1> a ik:Fork ;
+    ik:upstream <urn:plan:fork-branch:step:1> ;
+    ik:join "newline" .
+
+<urn:plan:fork-branch:fork:2> a ik:Fork ;
+    ik:forkOf <urn:plan:fork-branch:fork:1> ;
+    ik:order 1 ;
+    ik:join "newline" .
+
+<urn:plan:fork-branch:step:2> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:demo:b> ;
+    ik:forkOf <urn:plan:fork-branch:fork:2> ;
+    ik:order 1 .
+
+<urn:plan:fork-branch:step:3> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:demo:c> ;
+    ik:forkOf <urn:plan:fork-branch:fork:2> ;
+    ik:order 2 .
+
+<urn:plan:fork-branch:step:4> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:demo:d> ;
+    ik:forkOf <urn:plan:fork-branch:fork:1> ;
+    ik:order 2 .
