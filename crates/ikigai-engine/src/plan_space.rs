@@ -156,7 +156,8 @@ fn validate_endpoint() -> AsyncFnEndpoint {
                  closed through an ik:ref, and anything else the executor cannot run as \
                  written. The report is the SHACL report graph (text/turtle) with those \
                  checks added as results, or a summary (text/plain). urn:plan:eval refuses \
-                 exactly the plans this does not pass.",
+                 exactly the plans this does not pass. An unreached Sink or Delete is refused; \
+                 unreached reads are warnings and do not prevent execution.",
             )
             .verb(Verb::Source)
             .input(plan_input("piped in, it is the sole required input"))
@@ -353,6 +354,7 @@ struct Validation {
     report_node: NamedOrBlankNode,
     shapes_conform: bool,
     problems: Vec<Problem>,
+    warnings: Vec<Problem>,
     /// The reader's verdict — the plan, or why it will not run.
     plan: std::result::Result<Plan, Refusal>,
     /// The `ik:Process` node, when the graph has exactly one.
@@ -369,28 +371,35 @@ impl Validation {
             .process
             .as_deref()
             .map_or_else(|| "the plan".to_string(), |iri| format!("<{iri}>"));
-        if self.conforms() {
-            return format!(
+        let mut out = if self.conforms() {
+            format!(
                 "{subject} conforms: it satisfies ikigai_vocab::SHAPES and the executor's \
                  checks\n"
-            );
-        }
-        let mut out = format!(
-            "{subject} does not conform — {} problem{}\n",
-            self.problems.len(),
-            if self.problems.len() == 1 { "" } else { "s" }
-        );
+            )
+        } else {
+            format!(
+                "{subject} does not conform — {} problem{}\n",
+                self.problems.len(),
+                if self.problems.len() == 1 { "" } else { "s" }
+            )
+        };
         for problem in &self.problems {
             out.push_str(&format!(
                 "  {} at <{}>: {}\n",
                 problem.rule, problem.focus, problem.message
             ));
         }
+        for warning in &self.warnings {
+            out.push_str(&format!(
+                "  warning at <{}>: {}\n",
+                warning.focus, warning.message
+            ));
+        }
         out
     }
 
     /// The report graph with the reader's checks folded in: `sh:conforms` corrected, and
-    /// a refusal added as one more `sh:result`.
+    /// refusals and warnings added as `sh:result` entries.
     fn to_turtle(&self) -> Result<String> {
         let sh = |term: &str| NamedNode::new_unchecked(format!("{SH}{term}"));
         let mut triples: Vec<Triple> = self
@@ -432,6 +441,38 @@ impl Validation {
                 (
                     sh("resultMessage"),
                     Term::from(Literal::new_simple_literal(&refusal.message)),
+                ),
+            ] {
+                triples.push(Triple::new(node.clone(), predicate, object));
+            }
+        }
+        for warning in &self.warnings {
+            let node = NamedNode::new_unchecked(format!(
+                "urn:ikigai:plan:check:{}",
+                ContentId::of(warning.message.as_bytes())
+            ));
+            triples.push(Triple::new(
+                self.report_node.clone(),
+                sh("result"),
+                node.clone(),
+            ));
+            for (predicate, object) in [
+                (
+                    NamedNode::new_unchecked(RDF_TYPE),
+                    Term::from(sh("ValidationResult")),
+                ),
+                (
+                    sh("focusNode"),
+                    Term::from(NamedNode::new_unchecked(&warning.focus)),
+                ),
+                (sh("resultSeverity"), Term::from(sh("Warning"))),
+                (
+                    sh("sourceConstraint"),
+                    Term::from(NamedNode::new_unchecked(&warning.rule)),
+                ),
+                (
+                    sh("resultMessage"),
+                    Term::from(Literal::new_simple_literal(&warning.message)),
                 ),
             ] {
                 triples.push(Triple::new(node.clone(), predicate, object));
@@ -573,11 +614,29 @@ async fn validate(inv: &Invocation<'_>, plan: &str) -> Result<Validation> {
             message: refusal.message.clone(),
         });
     }
+    let mut warnings = Vec::new();
+    if let Ok(plan) = &read {
+        for index in plan
+            .unreached_steps()
+            .map_err(|r| Error::Endpoint(r.message))?
+        {
+            let focus = plan.node_iri(NodeRef::Step(index));
+            warnings.push(Problem {
+                rule: "urn:ikigai:plan:check:reachable".to_string(),
+                message: format!(
+                    "<{focus}> is a {} step the result does not reach, so it will not run",
+                    verb_name(plan.steps[index].verb)
+                ),
+                focus,
+            });
+        }
+    }
     Ok(Validation {
         report,
         report_node,
         shapes_conform,
         problems,
+        warnings,
         plan: read,
         process,
     })
