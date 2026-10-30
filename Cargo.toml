@@ -48,7 +48,9 @@ members = ["crates/*"]
 # declared `# @param` parameters and stop at the first failing line, and `execute <plan>
 # key=value` passes `key=value` to the plan's parameters. Additive: a patch.
 # 0.2.9 (ledger #2653): refuse unsupported mapOver, forkOf and binds on stored forks
-# rather than silently dropping them. No public type changed: a patch.
+# rather than silently dropping them; and (ledger #2656) plan-requires includes fixed named
+# plans recursively, refusing cycles and nesting beyond 16 named plans. No public type
+# changed: a patch.
 version = "0.2.9"
 edition = "2021"
 # Measured 2026-10-26, not assumed: 1.89 is the first toolchain that builds the workspace.

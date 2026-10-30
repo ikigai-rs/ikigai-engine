@@ -183,7 +183,8 @@ fn requires_endpoint() -> AsyncFnEndpoint {
                  request that invokes nothing — never read from the plan's own ik:requires. \
                  Reports what each step requires, what the asking capability lacks (where a \
                  run under it would be refused), and every step whose target resolves \
-                 nowhere, in which case the union is a floor and says so.",
+                 nowhere, in which case the union is a floor and says so. Fixed named plans \
+                 are expanded through at most 16 levels; cycles and deeper nesting are refused.",
             )
             .verb(Verb::Source)
             .input(plan_input("piped in, it is the sole required input"))
@@ -674,6 +675,9 @@ async fn eval(inv: &Invocation<'_>) -> Result<Representation> {
 
 // --- derived authority -------------------------------------------------------------
 
+/// Maximum number of fixed named plans expanded on one preflight path.
+const MAX_NAMED_PLAN_DEPTH: usize = 16;
+
 /// What one step needs, read from its contracts.
 struct Needs {
     node: String,
@@ -718,17 +722,7 @@ async fn requires_face(inv: &Invocation<'_>) -> Result<Representation> {
             RefTo::Name(_) => None,
         }));
         for (target, verb) in targets {
-            match contract(inv, &target).await {
-                Ok(description) => {
-                    needs.requires.extend(description.required_scopes(verb));
-                    needs
-                        .lacks
-                        .extend(description.unsatisfied_scopes(verb, inv.capability));
-                }
-                Err(reason) => needs
-                    .unresolved
-                    .push(format!("<{}>: {reason}", target.as_str())),
-            }
+            target_needs(inv, target, verb, &mut needs).await?;
         }
         steps.push(needs);
     }
@@ -743,6 +737,97 @@ async fn requires_face(inv: &Invocation<'_>) -> Result<Representation> {
     } else {
         text(requires_text(&plan, &steps, &unreached))
     })
+}
+
+/// Expand without async recursion: each pending target carries only its active path,
+/// so a shared subplan in separate branches is not mistaken for a cycle.
+async fn target_needs(
+    inv: &Invocation<'_>,
+    target: Iri,
+    verb: Verb,
+    needs: &mut Needs,
+) -> Result<()> {
+    let mut pending = vec![(target, verb, Vec::<String>::new())];
+    while let Some((target, verb, mut path)) = pending.pop() {
+        let description = match contract(inv, &target).await {
+            Ok(description) => description,
+            Err(reason) => {
+                needs.unresolved.push(format!("<{target}>: {reason}"));
+                continue;
+            }
+        };
+        needs.requires.extend(description.required_scopes(verb));
+        needs
+            .lacks
+            .extend(description.unsatisfied_scopes(verb, inv.capability));
+        let Some(source) = fixed_plan(&description, verb) else {
+            continue;
+        };
+        if path.iter().any(|name| name == target.as_str()) {
+            return Err(Error::InvalidArgument {
+                name: "in".to_string(),
+                detail: format!("named plan cycle through <{target}>"),
+            });
+        }
+        if path.len() == MAX_NAMED_PLAN_DEPTH {
+            return Err(Error::InvalidArgument {
+                name: "in".to_string(),
+                detail: format!(
+                    "named plan nesting exceeds the maximum depth of {MAX_NAMED_PLAN_DEPTH} at <{target}>"
+                ),
+            });
+        }
+        path.push(target.as_str().to_string());
+        let plan = Plan::read(&source).map_err(|refusal| Error::InvalidArgument {
+            name: "in".to_string(),
+            detail: format!("named plan <{target}>: {}", refusal.message),
+        })?;
+        let order = plan.run_order().map_err(|refusal| Error::InvalidArgument {
+            name: "in".to_string(),
+            detail: format!("named plan <{target}>: {}", refusal.message),
+        })?;
+        for node in order {
+            let NodeRef::Step(index) = node else { continue };
+            let step = &plan.steps[index];
+            pending.push((step.resolves.clone(), step.verb, path.clone()));
+            pending.extend(step.refs.values().filter_map(|to| match to {
+                RefTo::Resource(iri) => Some((iri.clone(), Verb::Source, path.clone())),
+                RefTo::Name(_) => None,
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Core projects a named request's fixed inputs into its per-verb contract. Its
+/// forwarding destination is currently exposed only in the generated summary header
+/// (`name = [Verb] target ...`), not a structured Description field. Match that header
+/// exactly; a fixed `in` on an unrelated endpoint is ordinary data, not an executable plan.
+fn fixed_plan(description: &Description, verb: Verb) -> Option<String> {
+    if verb != Verb::Source {
+        return None;
+    }
+    let header = description
+        .summary
+        .strip_prefix(&format!("{} = ", description.id))?;
+    let mut words = header.split_whitespace();
+    let first = words.next()?;
+    let target = if first == "Source" {
+        words.next()?
+    } else {
+        first
+    };
+    if target != EVAL {
+        return None;
+    }
+    description
+        .action_specs()
+        .into_iter()
+        .find(|action| action.verb == verb)?
+        .inputs
+        .into_iter()
+        .find(|input| input.name == "in")?
+        .fixed
 }
 
 fn union<'a>(sets: impl Iterator<Item = &'a BTreeSet<String>>) -> BTreeSet<String> {
