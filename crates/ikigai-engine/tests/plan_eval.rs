@@ -931,11 +931,12 @@ fn a_fork_as_a_branch_takes_the_outer_forks_input() {
 fn a_fork_binds_its_join_and_a_later_step_cites_it() {
     // `report = @stored | ( source urn:demo:a ; source urn:demo:b )`, then
     // `source urn:text:wc in=@report`: the join is the three lines of `a` and one of `b`.
-    let w = world();
-    let answer = w.run(FORK_BINDS, Capability::root()).expect("execute");
+    // Vocab 0.2.9 fixes process:local-refs for fork bindings, so this now validates
+    // and executes through both paths, like the other supported forks.
+    let (answer, transcript) = assert_fork_runs(FORK_BINDS);
     assert_eq!(answer, "4");
     assert_eq!(
-        w.drain(),
+        transcript,
         [
             "Source urn:demo:store []",
             "Source urn:demo:a [in=stored]",
@@ -943,23 +944,6 @@ fn a_fork_binds_its_join_and_a_later_step_cites_it() {
             "Source urn:text:wc [in=one\ntwo\nthree\nb(stored)]",
         ]
     );
-    // ⚠ The reader takes this plan, but the published shapes refuse it, so `urn:plan:eval`
-    // (which validates first) does too: vocab 0.2.8's `process:local-refs` reuses the
-    // citing step's `?s` inside its FILTER NOT EXISTS, so its `?s ik:forkOf+ ?f . ?f
-    // ik:binds ?name` arm asks whether the CITING step is a branch of the binding fork,
-    // and a fork's binding never counts. That is an ikigai-vocab defect, pinned here
-    // exactly: when the shape is fixed this fails, and this plan joins
-    // `assert_fork_runs`.
-    let report = w.text("urn:plan:validate", FORK_BINDS, &[]);
-    assert!(
-        report.contains("does not conform — 1 problem")
-            && report.contains(
-                "urn:ikigai:shape:process at <urn:plan:fork-binds>: \
-                 urn:plan:fork-binds:var:report references a name this plan never binds"
-            ),
-        "{report}"
-    );
-    assert!(w.drain().is_empty(), "validating runs nothing");
 }
 
 #[test]

@@ -116,7 +116,9 @@ ikigai-core = "0.2.9"
 # 0.2.8 (ledger #2654) is the first whose shapes take ik:mapOver, ik:forkOf and ik:binds on
 # an ik:Fork (ik:Stage, ledger #32), which the engine now renders and `urn:plan:validate`
 # checks against these shapes.
-ikigai-vocab = "0.2.8"
+# 0.2.9 fixes process:local-refs for a fork's binding, so the supported fork-bind
+# fixture validates and runs through `urn:plan:eval` as well as `execute`.
+ikigai-vocab = "0.2.9"
 # Dev-dependency of the engine (its end-to-end tests mount the real file module). 0.1.8 is a
 # SECURITY floor (audit round 3, ledger #856): the jail authorizes the file it actually opens.
 # 0.2.2 is the newest release and the one on core 0.2 (ledger #2349); it carries that floor.
