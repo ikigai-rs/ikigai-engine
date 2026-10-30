@@ -98,6 +98,19 @@ fork's branches, a `..` map's items, a step referencing its `ik:binds`) or the p
 is collected once under the run's byte budget. `urn:plan:eval` still hands every step its
 input by value: a sub-request issued from an invocation cannot carry an attached body.
 
+`execute <plan> key=value` passes `key=value` to the plan's declared parameter, as
+`urn:plan:eval` does: a `key=value` word on the spec's last stage that its target does not take
+as an argument is a parameter, and one the plan does not declare is refused by name.
+
+A line whose first non-blank character is `#` is a comment (so a `#!` shebang is one too); a
+`#` anywhere else keeps its meaning. `ikigai_engine::script` and `Engine::run_script` run a
+script of REPL lines (a `.iki` file) in file order: `# @param <name>` or `# @param <name> =
+<default>` declares a parameter a line uses as `{name}`, an undeclared `{x}` or parameter is
+refused before any line runs, and the run stops at the first failing line, reporting its
+number and error. A script does not compile to a plan yet: the process vocabulary has no term
+for ordered, independent steps (`ik:step` is unordered, and the runner runs only what the one
+`ik:result` depends on).
+
 `config` is a small user-settings reader (used by the `config` command and the TUI's
 keybindings); on a target with no config directory it reports defaults.
 

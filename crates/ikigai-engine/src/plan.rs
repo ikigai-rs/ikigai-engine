@@ -1939,24 +1939,78 @@ impl Engine {
         Ok(plan.to_turtle(Some(spec.trim())))
     }
 
-    /// `execute <spec>` — resolve `<spec>` (the full `source` grammar) and execute the
-    /// `ik:Process` graph it returns. `sink` stores a plan; this runs a stored one, through
-    /// the same runner `urn:plan:eval` uses. Parameters take their defaults: the text face
-    /// has no spelling for supplying one yet.
+    /// `execute <spec> [key=value …]` — resolve `<spec>` (the full `source` grammar) and
+    /// execute the `ik:Process` graph it returns. `sink` stores a plan; this runs a stored
+    /// one, through the same runner `urn:plan:eval` uses.
+    ///
+    /// A `key=value` word on the spec's last stage is a PARAMETER of the plan (ledger #2485,
+    /// closing #2483), unless the stage's target takes `key` itself (a declared argument,
+    /// `as`, or any name on an open argument set): the words a resource would refuse are the
+    /// ones it cannot have meant. The plan refuses a parameter it does not declare by name,
+    /// as `urn:plan:eval` does; one it declares and is not given takes its `ik:default`.
     #[cfg(feature = "plan-reader")]
     pub(crate) async fn run_stored_plan(&self, spec: &str) -> Result<String, String> {
         if spec.trim().is_empty() {
             return Err(
-                "usage: execute <spec> — resolve a resource and execute the plan it holds"
+                "usage: execute <spec> [key=value …] — resolve a resource and execute the plan \
+                 it holds, with its parameters"
                     .to_string(),
             );
         }
-        let turtle = self.run_pipeline(spec).await?;
+        let mut pipeline = parse_spec(spec)?;
+        let parameters = self.take_plan_parameters(&mut pipeline).await;
+        let turtle = self.run_parsed_pipeline(pipeline).await?.into_text()?;
         let plan = Plan::from_turtle(&turtle)?;
-        execute(self, &plan, &BTreeMap::new())
+        execute(self, &plan, &parameters)
             .await
             .map_err(RunError::into_message)?
             .into_text()
+    }
+
+    /// Peel the plan's parameters off the last stage of an `execute` spec: each unquoted
+    /// `key=value` word after the target whose key is an identifier the target does not
+    /// take as a named argument. `as-of=` stays: it belongs to the whole line.
+    #[cfg(feature = "plan-reader")]
+    async fn take_plan_parameters(&self, pipeline: &mut Pipeline) -> BTreeMap<String, String> {
+        let last = match pipeline.rest.last_mut() {
+            Some(step) => &mut step.node,
+            None => &mut pipeline.first,
+        };
+        let Node::Source(words) = last else {
+            return BTreeMap::new();
+        };
+        let Some(target) = words.first().and_then(|word| parse_target(word).ok()) else {
+            return BTreeMap::new();
+        };
+        fn candidate(word: &str) -> Option<(&str, &str)> {
+            word.split_once('=')
+                .filter(|(key, _)| *key != crate::engine::AS_OF && is_identifier(key))
+        }
+        if !words
+            .iter()
+            .skip(1)
+            .any(|w| !w.is_quoted() && candidate(w).is_some())
+        {
+            return BTreeMap::new();
+        }
+        let description = self.describe_struct(&target).await;
+        let declared = declared_arguments(description.as_ref());
+        let open = takes_open_arguments(description.as_ref(), Verb::Source);
+        let mut parameters = BTreeMap::new();
+        let mut index = 1;
+        while index < words.len() {
+            let word = &words[index];
+            match candidate(word)
+                .filter(|(key, _)| !word.is_quoted() && !is_named_argument(&declared, open, key))
+            {
+                Some((key, value)) => {
+                    parameters.insert(key.to_string(), value.to_string());
+                    words.remove(index);
+                }
+                None => index += 1,
+            }
+        }
+        parameters
     }
 
     /// Without the reader there is no Turtle parser in this build, so say which feature is
