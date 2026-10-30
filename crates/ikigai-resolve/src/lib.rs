@@ -20,7 +20,8 @@ use futures::executor::block_on;
 use ikigai_core::{
     ArgRef, Bindings, Body, BodyIssue, Capability, Clock, Description, Endpoint, Error, Expiry,
     Grammar, Invocation, Iri, IssueContext, Kernel, Limit, Provenance, Representation, Request,
-    Resolution, Resolved, Scope, Space, SpaceEntry, Time, TraceEvent, Tracer, UriTemplate, Verb,
+    Resolution, Resolved, Scope, Space, SpaceEntry, Time, TraceEvent, Tracer, UncachedReason,
+    UriTemplate, Verb,
 };
 use serde::{Deserialize, Serialize};
 
@@ -649,8 +650,9 @@ impl Endpoint for ForwardingEndpoint {
 /// before it). What a mounted read costs is then one round trip, to the PEER's cache, which
 /// still holds the answer with its threads and is cut by the peer's own writes and watchers;
 /// a composite over it is uncacheable here too, and `urn:kernel:uncached` lists the mounted
-/// read as `declared` and the composite as `dependency <the mounted name>`. Only the expiry
-/// changes: the bytes, the type and the peer's own cache status are untouched.
+/// read as `mounted` and the composite as `dependency <the mounted name>`. The expiry and
+/// local uncached reason change: the bytes, the type and the peer's own cache status are
+/// untouched.
 ///
 /// ⚠ What this does NOT give is a mounted read that is cached here AND fresh. That needs the
 /// peer's cuts to cross the wire: core's cut listeners (`Kernel::listen`) already report them
@@ -658,7 +660,7 @@ impl Endpoint for ForwardingEndpoint {
 /// threads it hung its copies on, is the shape. It is a protocol addition, not a fix, and it is
 /// not built.
 fn as_held_here<B>(representation: Representation<B>) -> Representation<B> {
-    representation.with_expiry(Expiry::Always)
+    representation.with_uncached_reason(UncachedReason::Mounted)
 }
 
 /// The description a mounted endpoint gets when its peer's contract could not be read —
@@ -2941,7 +2943,7 @@ mod tests {
     /// ★ Ledger #1570: what ledger #92's fix ([`as_held_here`]) costs, and that the kernel
     /// says so. A mounted answer is `Always` on the mounting side whatever the peer said, so a
     /// cacheable LOCAL composite over it is recomputed on every read, and `urn:kernel:uncached`
-    /// names why: the mounted read as `declared`, the composite as `dependency <the mounted
+    /// names why: the mounted read as `mounted`, the composite as `dependency <the mounted
     /// name>`. Before the fix the peer's `Never` crossed, the composite cached, and the second
     /// read below computed nothing, so neither row existed.
     ///
@@ -2965,8 +2967,19 @@ mod tests {
             })
         });
         let local = Kernel::new(Arc::new(Fallback::new(vec![
-            Arc::new(EndpointSpace::new().bind(Exact::new("urn:local:over"), over))
-                as Arc<dyn Space>,
+            Arc::new(
+                EndpointSpace::new()
+                    .bind(Exact::new("urn:local:over"), over)
+                    .bind(
+                        Exact::new("urn:local:plain"),
+                        FnEndpoint::new("plain", |_inv| {
+                            Ok(Representation::new(
+                                ReprType::new("text/plain"),
+                                b"plain".to_vec(),
+                            ))
+                        }),
+                    ),
+            ) as Arc<dyn Space>,
             Arc::new(MountedRemote::overriding(
                 Arc::new(Forwarding(Arc::clone(&peer))),
                 "urn:peer:",
@@ -2992,6 +3005,7 @@ mod tests {
         );
         read(&local, "urn:local:over");
 
+        read(&local, "urn:local:plain");
         let readout = String::from_utf8(read(&local, "urn:kernel:uncached").bytes).unwrap();
         let row = |name: &str| {
             readout
@@ -3000,10 +3014,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("no `{name}` row in urn:kernel:uncached:\n{readout}"))
                 .to_string()
         };
+        assert!(
+            row("urn:local:plain").contains("declared"),
+            "a plain local uncacheable answer still reports declared: {readout}"
+        );
         let mounted = row("urn:peer:pure");
         assert!(
-            mounted.contains("declared"),
-            "the mounted read is uncacheable by its own (forwarded) answer: {mounted}"
+            mounted.contains("mounted"),
+            "the mounted read names the peer boundary as its reason: {mounted}"
         );
         let composite = row("urn:local:over");
         assert!(
@@ -3668,34 +3686,40 @@ mod tests {
     /// body below arrived as ONE chunk with every chunk already produced before anyone read.
     #[test]
     fn a_mount_passes_a_peers_streamed_body_through_uncollected() {
-        let (peer, made) = chunked_peer();
-        let local = mounting(Arc::new(StreamingPeer(Forwarding(peer))));
-        let answer = block_on(local.issue_body(stream_read(), &Capability::root()))
-            .expect("a streamed read through the mount");
-        assert!(
-            answer.bytes.is_one_shot(),
-            "the peer's stream, not a buffer"
-        );
-        assert_eq!(answer.expiry, Expiry::Always, "held here as uncacheable");
-        assert_eq!(
-            made.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "nothing was read on the way: the mount handed the body over unread"
-        );
-        let chunks = chunks_of(answer.bytes);
-        assert_eq!(
-            chunks.len(),
-            CHUNKS,
-            "every chunk crossed the mount as a chunk"
-        );
-        for (n, chunk) in chunks.iter().enumerate() {
-            assert_eq!(chunk.len(), CHUNK_BYTES);
+        for traced in [false, true] {
+            let (peer, made) = chunked_peer();
+            let local = mounting(Arc::new(StreamingPeer(Forwarding(peer))));
+            if traced {
+                local.set_tracer(Arc::new(SpanCollector::default()));
+            }
+            let answer = block_on(local.issue_body(stream_read(), &Capability::root()))
+                .expect("a streamed read through the mount");
             assert!(
-                chunk.iter().all(|byte| *byte == b'a' + n as u8),
-                "chunk {n} in order"
+                answer.bytes.is_one_shot(),
+                "the peer's stream, not a buffer"
             );
+            assert_eq!(answer.expiry, Expiry::Always, "held here as uncacheable");
+            assert_eq!(answer.uncached_reason(), Some(UncachedReason::Mounted));
+            assert_eq!(
+                made.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "nothing was read on the way: the mount handed the body over unread"
+            );
+            let chunks = chunks_of(answer.bytes);
+            assert_eq!(
+                chunks.len(),
+                CHUNKS,
+                "every chunk crossed the mount as a chunk"
+            );
+            for (n, chunk) in chunks.iter().enumerate() {
+                assert_eq!(chunk.len(), CHUNK_BYTES);
+                assert!(
+                    chunk.iter().all(|byte| *byte == b'a' + n as u8),
+                    "chunk {n} in order"
+                );
+            }
+            assert_eq!(made.load(std::sync::atomic::Ordering::SeqCst), CHUNKS);
         }
-        assert_eq!(made.load(std::sync::atomic::Ordering::SeqCst), CHUNKS);
     }
 
     /// The bytes path through the mount is unchanged: the kernel collects the body for a
@@ -3716,6 +3740,7 @@ mod tests {
             "the kernel's bytes API collects the stream"
         );
         assert_eq!(collected.expiry, Expiry::Always);
+        assert_eq!(collected.uncached_reason(), Some(UncachedReason::Mounted));
 
         // The endpoint's `invoke` itself, off the kernel: the mount resolves the name to its
         // forwarding endpoint, and invoking that collects nothing new and loses nothing.
@@ -3730,6 +3755,7 @@ mod tests {
         let invoked = block_on(resolved.endpoint.invoke(&inv)).expect("invoke forwards");
         assert_eq!(invoked.bytes, whole);
         assert_eq!(invoked.expiry, Expiry::Always);
+        assert_eq!(invoked.uncached_reason(), Some(UncachedReason::Mounted));
     }
 
     /// The body path carries the caller's capability exactly as `invoke` does: a capability

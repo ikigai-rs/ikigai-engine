@@ -102,8 +102,11 @@ homepage = "https://github.com/ikigai-rs/ikigai-engine"
 # 0.2.6 (K2, ledger #2512/#2513) is the API floor for named requests: `TopologyRule::named_request`
 # / `named_template`, `FixedArgument`, `AliasTable::with_rule`, which `bind` and the names text
 # form build rules with (ledger #2509).
-# ⚠ `^0.2.6` is also a ceiling below 0.3.0.
-ikigai-core = "0.2.6"
+# 0.2.9 (core PR 277, ledger #2660) is the API floor for
+# `Representation::with_uncached_reason(UncachedReason::Mounted)`: peer cuts do not
+# reach this kernel, so forwarded answers report `mounted` rather than `declared`.
+# ⚠ `^0.2.9` is also a ceiling below 0.3.0.
+ikigai-core = "0.2.9"
 # Raised with core, in lockstep. 0.1.70 is the first version carrying the PROCESS vocabulary
 # (`ik:Process`/`ik:Step`/`ik:Argument`/`ik:Fork`, the plan shapes in `SHAPES`, and the
 # `ikigai_vocab::plan` IRI builders) that the engine's `plan.rs` renders and reads; the tests
