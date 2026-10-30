@@ -189,7 +189,8 @@ commands:
                              corridor `urn:ctx:time:<instant>` pins every clock it reaches
                              (also on `trace` and `cache`; in-process kernel only)
   plan <spec>                render a pipeline as an ik:Process graph (Turtle) instead of running it
-  execute <spec>             resolve <spec> and EXECUTE the ik:Process graph it returns
+  execute <spec> [k=v …]     resolve <spec> and EXECUTE the ik:Process graph it returns;
+                             each k=v the resource does not take is a plan parameter
                              (`run`, its old name, still works this release and says so)
   sink <iri> [k=v …] <content>  SINK into a resource: leading k=v name declared args, the rest is content
   source a | sink <iri> [k=v …]  pipeline write-terminal: store the piped value as the sink's content
@@ -497,7 +498,7 @@ pub const AS_OF_CORRIDOR_PREFIX: &str = "urn:ctx:time:";
 /// The reserved argument that pins a whole line to one instant. Reserved the way `as` is: it
 /// is peeled off every stage before argument routing, so it never reaches an endpoint and can
 /// never be mistaken for positional input.
-const AS_OF: &str = "as-of";
+pub(crate) const AS_OF: &str = "as-of";
 
 /// An `as-of=` instant, parsed: its canonical spelling (the corridor's name) and the epoch
 /// milliseconds its derived clock reads.
@@ -1000,7 +1001,10 @@ impl Engine {
             return self.eval_lisp_mode(line).await;
         }
 
-        if line.is_empty() {
+        // A comment (ledger #2485): a line whose first non-blank character is `#`, so a
+        // script's shebang and `# @param` lines are comments too. A `#` anywhere else keeps
+        // its meaning (`in=#243`).
+        if line.is_empty() || crate::script::is_comment(line) {
             return Action::Noop;
         }
         // Each `run` during this line accumulates into `self.cache`; reset it
@@ -1070,21 +1074,15 @@ impl Engine {
     /// literal operator can appear inside an IRI or input. Every leaf is just a
     /// `source`, so routing, the binding-only error, and caching all come from
     /// [`run_source`](Self::run_source).
-    #[cfg_attr(
-        not(feature = "plan-reader"),
-        allow(
-            dead_code,
-            reason = "read only by `execute <spec>` in plan.rs, which is the plan-reader feature's; \
-                      the `source` command reads `run_pipeline_staged`"
-        )
-    )]
-    pub(crate) async fn run_pipeline(&self, spec: &str) -> Result<String, String> {
-        self.run_pipeline_staged(spec).await?.into_text()
+    async fn run_pipeline_staged(&self, spec: &str) -> Result<Staged, String> {
+        self.run_parsed_pipeline(parse_spec(spec)?).await
     }
 
-    /// [`run_pipeline`](Self::run_pipeline) before the answer is turned into text.
-    async fn run_pipeline_staged(&self, spec: &str) -> Result<Staged, String> {
-        let mut pipeline = parse_spec(spec)?;
+    /// [`run_pipeline_staged`](Self::run_pipeline_staged) over a spec already parsed.
+    pub(crate) async fn run_parsed_pipeline(
+        &self,
+        mut pipeline: Pipeline,
+    ) -> Result<Staged, String> {
         let scope = self.as_of_scope(take_as_of(&mut pipeline)?.as_ref())?;
         self.in_scope(
             scope,
@@ -1093,7 +1091,7 @@ impl Engine {
         .await
     }
 
-    /// The `source` command: [`run_pipeline`](Self::run_pipeline), except that with the
+    /// The `source` command: [`run_pipeline_staged`](Self::run_pipeline_staged) as text, except that with the
     /// [picture hint](Self::set_picture_hint) on, an `image/*` answer is NAMED rather than
     /// printed (ledger #983: `source urn:diagram:arrangement …` filled the REPL with SVG).
     async fn run_source_command(&self, spec: &str) -> Result<String, String> {

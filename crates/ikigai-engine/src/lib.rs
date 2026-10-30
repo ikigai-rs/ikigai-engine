@@ -22,7 +22,10 @@ mod plan;
 /// resource. Reading a plan needs the Turtle parser, so this is the `plan-reader` feature's.
 #[cfg(feature = "plan-reader")]
 pub mod plan_space;
+/// A script of REPL lines (`.iki`): comments, declared parameters and stop-on-error.
+pub mod script;
 pub mod suggest;
 
 pub use engine::{Action, CacheStats, ContractNote, Engine, Entry, Viewer, COMMANDS, HELP};
 pub use fanout::FanOut;
+pub use script::{Script, ScriptError, ScriptRun};

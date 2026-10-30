@@ -408,6 +408,31 @@ fn piped_eval_refuses_parameters_the_plan_does_not_declare() {
     );
 }
 
+/// ledger #2485 (closing #2483): `execute <plan> key=value` passes `key=value` to the plan's
+/// declared parameter, as `urn:plan:eval` does, instead of sending it to the resource that
+/// holds the plan.
+#[test]
+fn execute_passes_named_parameters_to_a_stored_plan() {
+    let engine = shout_engine();
+    assert_eq!(
+        output(engine.eval("execute urn:file:shout.ttl who=brian")),
+        Ok("BRIAN".to_string()),
+    );
+}
+
+/// ledger #2485: a parameter the plan does not declare is refused by name, as
+/// `urn:plan:eval` refuses it.
+#[test]
+fn execute_refuses_parameters_the_plan_does_not_declare() {
+    let engine = shout_engine();
+    let error = output(engine.eval("execute urn:file:shout.ttl nobody=x"))
+        .expect_err("undeclared parameter must be refused");
+    assert!(
+        error.contains("<urn:plan:shout> declares no parameter `nobody` (it declares who)"),
+        "{error}",
+    );
+}
+
 /// ledger #2508: `in=<iri>` hands plan-eval the plan by reference, and the plan's parameter
 /// still arrives by name.
 #[test]
