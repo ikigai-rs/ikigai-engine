@@ -200,6 +200,35 @@ fn world() -> World {
                 },
             ),
         );
+    // The vocabulary's fork fixtures (ledger #32): `urn:demo:a` is a list of three items
+    // and the store one line, whatever they are fed; the rest say what they were fed.
+    space = space
+        .bind(
+            Exact::new("urn:demo:a"),
+            stub(
+                "demo",
+                &log,
+                reads("demo").input(input("in").optional()),
+                true,
+                |_| "one\ntwo\nthree".to_string(),
+            ),
+        )
+        .bind(
+            Exact::new("urn:demo:store"),
+            stub("demo", &log, reads("demo"), true, |_| "stored".to_string()),
+        );
+    for name in ["b", "c", "d"] {
+        space = space.bind(
+            Exact::new(format!("urn:demo:{name}")),
+            stub(
+                "demo",
+                &log,
+                reads("demo").input(input("in").optional()),
+                true,
+                move |inv| format!("{name}({})", arg(inv, "in")),
+            ),
+        );
+    }
     // The three decision tables: a verdict per checked line, and a filter.
     for (name, verdict) in [("strict", "gone"), ("lenient", "review")] {
         space = space.bind(
@@ -826,9 +855,11 @@ fn a_narrower_capability_is_refused_exactly_where_requires_said() {
     }
 }
 
-// Verbatim ikigai-vocab 0.2.8 fixture from ikigai-core commit
+// Verbatim ikigai-vocab 0.2.8 fixtures from ikigai-core commit
 // 7a0cd8fc658eb6988af24bf062b75840163ad1ba, crates/ikigai-vocab/tests/fixtures/.
 const MAPPED_FORK: &str = include_str!("fixtures/plan-fork-mapped.ttl");
+const FORK_BRANCH: &str = include_str!("fixtures/plan-fork-branch.ttl");
+const FORK_BINDS: &str = include_str!("fixtures/plan-fork-binds.ttl");
 
 const NESTED_FORK: &str = r#"
 @prefix ik: <https://ikigai-rs.dev/ns#> .
@@ -844,54 +875,148 @@ const NESTED_FORK: &str = r#"
     ik:resolves <urn:demo:c> ; ik:forkOf <urn:plan:nested:fork:2> ; ik:order 1 .
 "#;
 
-fn assert_unsupported_fork(plan: &str, property: &str) {
+/// The fork properties ledger #2653 refused until the engine implemented them (#2654): each
+/// plan validates (the shapes and the reader), and runs to the same answer, by the same
+/// requests, through `execute` and through `urn:plan:eval`. Returns that answer and the
+/// transcript.
+fn assert_fork_runs(plan: &str) -> (String, Vec<String>) {
     let w = world();
     let report = w.text("urn:plan:validate", plan, &[]);
-    assert!(
-        report.contains("does not conform"),
-        "ik:{property}: {report}"
+    assert!(report.contains(" conforms:"), "{report}");
+    let by_run = w.run(plan, Capability::root()).expect("execute");
+    let transcript = w.drain();
+    let by_eval = w
+        .eval(plan, &[], &Capability::root())
+        .expect("urn:plan:eval");
+    assert_eq!(
+        transcript,
+        w.drain(),
+        "urn:plan:eval issued different requests"
     );
-    assert!(report.contains(&format!("ik:{property}")), "{report}");
-    assert!(report.contains("#2653"), "{report}");
-    for door in ["urn:plan:requires", "urn:plan:eval"] {
-        let error = w
-            .issue(door, plan, &[], &Capability::root())
-            .expect_err("unsupported fork");
-        let Error::InvalidArgument { name, detail } = error else {
-            panic!("{door}: {error}");
-        };
-        assert_eq!(name, "in");
-        assert!(
-            detail.contains(&format!("ik:{property}")),
-            "{door}: {detail}"
-        );
-        assert!(detail.contains("#2653"), "{door}: {detail}");
-        // The validator reports the reader's exact refusal, alongside SHACL.
-        if door == "urn:plan:requires" {
-            assert!(
-                report.contains(&detail),
-                "{report} did not include {detail}"
-            );
-        }
-    }
-    assert!(w.drain().is_empty(), "a refused fork runs nothing");
+    assert_eq!(by_run, String::from_utf8(by_eval.bytes).expect("text"));
+    (by_run, transcript)
 }
 
 #[test]
-fn unsupported_fork_map_is_refused() {
-    assert_unsupported_fork(MAPPED_FORK, "mapOver");
+fn a_mapped_fork_runs_its_branches_once_per_item() {
+    // `source urn:demo:a .. ( source urn:demo:b ; source urn:demo:c )`: `urn:demo:a` is
+    // three items, and each item is fed to both branches, its own request each.
+    let (answer, transcript) = assert_fork_runs(MAPPED_FORK);
+    assert_eq!(answer, "b(one)\nc(one)\nb(two)\nc(two)\nb(three)\nc(three)");
+    assert_eq!(
+        transcript,
+        [
+            "Source urn:demo:a []",
+            "Source urn:demo:b [in=one]",
+            "Source urn:demo:c [in=one]",
+            "Source urn:demo:b [in=two]",
+            "Source urn:demo:c [in=two]",
+            "Source urn:demo:b [in=three]",
+            "Source urn:demo:c [in=three]",
+        ]
+    );
 }
 
 #[test]
-fn unsupported_fork_nesting_is_refused() {
-    assert_unsupported_fork(NESTED_FORK, "forkOf");
+fn a_fork_as_a_branch_takes_the_outer_forks_input() {
+    // `source urn:demo:a | ( ( source urn:demo:b ; source urn:demo:c ) ; source urn:demo:d )`.
+    let whole = "one\ntwo\nthree";
+    let (answer, transcript) = assert_fork_runs(FORK_BRANCH);
+    assert_eq!(answer, format!("b({whole})\nc({whole})\nd({whole})"));
+    assert_eq!(transcript.len(), 4, "{transcript:?}");
+    assert_eq!(transcript[0], "Source urn:demo:a []");
 }
 
 #[test]
-fn unsupported_fork_binding_is_refused() {
+fn a_fork_binds_its_join_and_a_later_step_cites_it() {
+    // `report = @stored | ( source urn:demo:a ; source urn:demo:b )`, then
+    // `source urn:text:wc in=@report`: the join is the three lines of `a` and one of `b`.
+    let w = world();
+    let answer = w.run(FORK_BINDS, Capability::root()).expect("execute");
+    assert_eq!(answer, "4");
+    assert_eq!(
+        w.drain(),
+        [
+            "Source urn:demo:store []",
+            "Source urn:demo:a [in=stored]",
+            "Source urn:demo:b [in=stored]",
+            "Source urn:text:wc [in=one\ntwo\nthree\nb(stored)]",
+        ]
+    );
+    // ⚠ The reader takes this plan, but the published shapes refuse it, so `urn:plan:eval`
+    // (which validates first) does too: vocab 0.2.8's `process:local-refs` reuses the
+    // citing step's `?s` inside its FILTER NOT EXISTS, so its `?s ik:forkOf+ ?f . ?f
+    // ik:binds ?name` arm asks whether the CITING step is a branch of the binding fork,
+    // and a fork's binding never counts. That is an ikigai-vocab defect, pinned here
+    // exactly: when the shape is fixed this fails, and this plan joins
+    // `assert_fork_runs`.
+    let report = w.text("urn:plan:validate", FORK_BINDS, &[]);
+    assert!(
+        report.contains("does not conform — 1 problem")
+            && report.contains(
+                "urn:ikigai:shape:process at <urn:plan:fork-binds>: \
+                 urn:plan:fork-binds:var:report references a name this plan never binds"
+            ),
+        "{report}"
+    );
+    assert!(w.drain().is_empty(), "validating runs nothing");
+}
+
+#[test]
+fn a_fork_nested_in_a_fork_without_input_runs() {
+    let (answer, _) = assert_fork_runs(NESTED_FORK);
+    assert_eq!(answer, "c()\nb()");
+}
+
+#[test]
+fn a_fork_binding_a_name_nothing_cites_runs() {
+    // #2653's third refusal, now a plan: the fork binds `mapped`, and with no input of its
+    // own its branches take none.
     let bound = MAPPED_FORK.replace(
         "ik:mapOver <urn:plan:fork-mapped:step:1>",
         "ik:binds \"mapped\"",
     );
-    assert_unsupported_fork(&bound, "binds");
+    let (answer, transcript) = assert_fork_runs(&bound);
+    assert_eq!(answer, "b()\nc()");
+    assert!(
+        !transcript
+            .iter()
+            .any(|request| request.contains("urn:demo:a")),
+        "nothing reaches step 1 now: {transcript:?}"
+    );
+}
+
+/// A name bound inside a mapped fork has one value per item, so a step outside the fork
+/// citing it is refused before anything runs, by the reader, whom the validator reports.
+#[test]
+fn a_name_bound_inside_a_mapped_fork_is_not_cited_from_outside() {
+    let plan = MAPPED_FORK
+        .replace(
+            "ik:resolves <urn:demo:b> ;",
+            "ik:resolves <urn:demo:b> ; ik:binds \"inner\" ;",
+        )
+        .replace(
+            "ik:result <urn:plan:fork-mapped:fork:1> .",
+            "ik:result <urn:plan:fork-mapped:step:4> .\n\
+             <urn:plan:fork-mapped:step:4> a ik:Step ; ik:verb \"Source\" ;\n\
+             ik:resolves <urn:text:wc> ; ik:argument <urn:plan:fork-mapped:step:4:arg:in> .\n\
+             <urn:plan:fork-mapped:step:4:arg:in> a ik:Argument ; ik:inputName \"in\" ;\n\
+             ik:ref <urn:plan:fork-mapped:var:inner> .",
+        )
+        .replace(
+            "<urn:plan:fork-mapped:step:3> ;",
+            "<urn:plan:fork-mapped:step:3> , <urn:plan:fork-mapped:step:4> ;",
+        );
+    let w = world();
+    let report = w.text("urn:plan:validate", &plan, &[]);
+    assert!(report.contains("does not conform"), "{report}");
+    assert!(report.contains("one value per item"), "{report}");
+    match w.eval(&plan, &[], &Capability::root()) {
+        Err(Error::InvalidArgument { name, detail }) => {
+            assert_eq!(name, "in");
+            assert!(detail.contains("one value per item"), "{detail}");
+        }
+        other => panic!("expected InvalidArgument(in), got {other:?}"),
+    }
+    assert!(w.drain().is_empty(), "a refused plan runs nothing");
 }

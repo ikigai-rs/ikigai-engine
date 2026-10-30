@@ -51,7 +51,11 @@ members = ["crates/*"]
 # rather than silently dropping them; and (ledger #2656) plan-requires includes fixed named
 # plans recursively, refusing cycles and nesting beyond 16 named plans. No public type
 # changed: a patch.
-version = "0.2.9"
+# 0.2.10 (ledger #2654): the plan face renders, reads, runs and binds a mapped fork
+# (`a .. ( b ; c )`), a fork as a fork's branch, and a fork that binds its join, which 0.2.9
+# refused; each item of a mapped fork is its own request. Raises ikigai-vocab to 0.2.8, whose
+# shapes take them. No public type changed: a patch.
+version = "0.2.10"
 edition = "2021"
 # Measured 2026-10-26, not assumed: 1.89 is the first toolchain that builds the workspace.
 # `ikigai-intray` takes the lease with `std::fs::File::try_lock` (stable in 1.89; 1.88 refuses
@@ -104,7 +108,10 @@ ikigai-core = "0.2.6"
 # validate against the vocabulary the resolve picks.
 # 0.2.0 is the streams release (ledger #2261), in lockstep with core; the old "0.1.108" pin
 # meant <0.2.0 under 0.x rules. ⚠ `^0.2.0` is also a ceiling below 0.3.0.
-ikigai-vocab = "0.2.0"
+# 0.2.8 (ledger #2654) is the first whose shapes take ik:mapOver, ik:forkOf and ik:binds on
+# an ik:Fork (ik:Stage, ledger #32), which the engine now renders and `urn:plan:validate`
+# checks against these shapes.
+ikigai-vocab = "0.2.8"
 # Dev-dependency of the engine (its end-to-end tests mount the real file module). 0.1.8 is a
 # SECURITY floor (audit round 3, ledger #856): the jail authorizes the file it actually opens.
 # 0.2.2 is the newest release and the one on core 0.2 (ledger #2349); it carries that floor.
@@ -114,7 +121,7 @@ ikigai-fs = "0.2.2"
 # 0.3.4 is a SECURITY floor (ledger #1326) and 0.3.6 was cli's pin. 0.5.0 is the newest
 # release and the one on core 0.2 (ledger #2349). `"0.5.0"` is `<0.6.0`.
 ikigai-shacl = "0.5.0"
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.2.9" }
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.2.10" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face, reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins

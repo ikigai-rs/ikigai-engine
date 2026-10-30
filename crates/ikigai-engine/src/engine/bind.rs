@@ -20,9 +20,11 @@
 //!   | urn:iki:fn:toUpper` compiles the pipeline to the plan `plan` renders and binds `source
 //!   urn:plan:eval` with that plan inline (on one line, as the names file is line-oriented),
 //!   so the name is a live composite, recomputed when what it reads is cut, not a `sink`
-//!   snapshot. A shape `plan` cannot spell (`.. ( … )`, a map over a fork) is refused with
-//!   the renderer's own message. The name is plain and the verb `source`: a plan has no
-//!   spelling for a capture, and no verb but its steps'.
+//!   snapshot. Every fork the text face can make binds this way (ledger #2654): `.. ( … )`,
+//!   a map over a fork, runs the fork once per item, and a fork may be a fork's branch. A
+//!   pipeline `plan` cannot render is refused with the renderer's own message. The name is
+//!   plain and the verb `source`: a plan has no spelling for a capture, and no verb but its
+//!   steps'.
 //! - **A templated target is checked when it is called.** Its contract is a function of the
 //!   capture, so there is none to read before the name is resolved; the reply says so.
 //! - **Authority is unchanged.** The atom is read and written under the session's capability,
@@ -652,14 +654,103 @@ mod tests {
         assert_eq!(cut.cache.hits, 0, "{:?}", cut.cache);
     }
 
-    /// A shape `plan` cannot spell stays refused with the plan renderer's own message, which
-    /// now names `bind` and the item, and nothing is written.
+    /// `[in]`, so a branch's answer says which branch it was.
+    #[cfg(feature = "plan-reader")]
+    fn brackets() -> FnEndpoint {
+        FnEndpoint::new("brackets", |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("[{}]", inv.inline_str("in")?).into_bytes(),
+            )
+            .cacheable())
+        })
+        .with_description(
+            Description::new("brackets")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("in")),
+        )
+    }
+
+    /// The item (ledger #2654): the fork shapes `plan` once refused with "has no plan
+    /// spelling" bind as live names — a map over a fork (`.. ( … )`), a fork that is a fork's
+    /// branch, and a stored plan whose fork binds its join to a name — and a cut recomputes
+    /// each. A pipeline `plan` cannot render is still refused with the renderer's message.
+    #[cfg(feature = "plan-reader")]
     #[test]
-    fn a_bound_map_over_a_fork_is_refused_with_the_plan_renderers_message() {
+    fn every_fork_shape_binds_as_a_live_name() {
+        let beside: Arc<dyn Space> = Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:file:x"), cell())
+                .bind(Exact::new("urn:iki:fn:toUpper"), builtins::to_upper())
+                .bind(Exact::new("urn:t:brackets"), brackets())
+                .bind(
+                    Exact::new("urn:t:fork-binds"),
+                    FnEndpoint::new("fork-binds", |_: &Invocation<'_>| {
+                        Ok(Representation::new(
+                            ReprType::new("text/turtle"),
+                            FORK_BINDS.as_bytes().to_vec(),
+                        ))
+                    }),
+                ),
+        );
+        let shacl: Arc<dyn Space> = Arc::new(ikigai_shacl::space());
+        let held = Arc::new(Mutex::new(None));
+        let root: Arc<dyn Space> =
+            Arc::new(Fallback::new(vec![beside.clone(), host(held.clone())]));
+        let engine = Engine::new(Kernel::with_meta_renderer(root, Arc::new(JsonRenderer)))
+            .with_names_atom(Iri::parse(ATOM).unwrap());
+        for binding in [
+            "urn:q:river = source urn:file:x .. ( urn:iki:fn:toUpper ; urn:t:brackets )",
+            "urn:q:tree = source urn:file:x | ( ( urn:iki:fn:toUpper ; urn:t:brackets ) ; \
+             urn:t:brackets )",
+            "urn:q:report = source urn:plan:eval in=<urn:t:fork-binds>",
+        ] {
+            output(engine.eval(&format!("bind {binding}"))).unwrap();
+        }
+        assert_eq!(parse_names(&names(&held)).unwrap().len(), 3);
+
+        let live = named(&held, vec![beside, shacl]);
+        let read = |name: &str| output(live.eval(&format!("source {name}"))).unwrap();
+        assert_eq!(read("urn:q:river"), "HELLO\n[hello]");
+        assert_eq!(read("urn:q:tree"), "HELLO\n[hello]\n[hello]");
+        assert_eq!(read("urn:q:report"), "HELLO\n[hello]");
+        output(live.eval("sink urn:file:x goodbye")).unwrap();
+        assert_eq!(read("urn:q:river"), "GOODBYE\n[goodbye]");
+        assert_eq!(read("urn:q:tree"), "GOODBYE\n[goodbye]\n[goodbye]");
+        assert_eq!(read("urn:q:report"), "GOODBYE\n[goodbye]");
+    }
+
+    /// A stored plan whose fork binds its join (`report = source urn:file:x | ( … )`).
+    /// Nothing cites `@report` here: vocab 0.2.8's `process:local-refs` shape does not see a
+    /// fork's binding (see `plan_eval.rs`), and `urn:plan:eval` validates before it runs.
+    #[cfg(feature = "plan-reader")]
+    const FORK_BINDS: &str = r#"
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:plan:report> a ik:Process ;
+    ik:step <urn:plan:report:step:1> , <urn:plan:report:step:2> , <urn:plan:report:step:3> ;
+    ik:result <urn:plan:report:fork:1> .
+<urn:plan:report:step:1> a ik:Step ; ik:verb "Source" ; ik:resolves <urn:file:x> .
+<urn:plan:report:fork:1> a ik:Fork ; ik:upstream <urn:plan:report:step:1> ;
+    ik:binds "report" ; ik:join "newline" .
+<urn:plan:report:step:2> a ik:Step ; ik:verb "Source" ; ik:resolves <urn:iki:fn:toUpper> ;
+    ik:forkOf <urn:plan:report:fork:1> ; ik:order 1 .
+<urn:plan:report:step:3> a ik:Step ; ik:verb "Source" ; ik:resolves <urn:t:brackets> ;
+    ik:forkOf <urn:plan:report:fork:1> ; ik:order 2 .
+"#;
+
+    /// A pipeline `plan` cannot render is refused with the plan renderer's own message,
+    /// which names `bind` and the item, and nothing is written.
+    #[test]
+    fn a_pipeline_plan_cannot_render_is_refused_with_the_renderers_message() {
         let (engine, held) = engine();
-        let spec = "urn:t:upper in=a .. ( urn:t:upper ; urn:t:upper )";
+        // `urn:t:upper` takes its input from the pipe, so a literal beside it has nowhere
+        // to go.
+        let spec = "urn:t:upper in=a .. ( urn:t:upper extra ; urn:t:upper )";
         let rendered = output(engine.eval(&format!("plan {spec}"))).unwrap_err();
-        assert!(rendered.contains("has no plan spelling"), "{rendered}");
+        assert!(
+            rendered.contains("takes its input from the pipe"),
+            "{rendered}"
+        );
         let refused =
             output(engine.eval(&format!("bind urn:q:river = source {spec}"))).unwrap_err();
         assert!(refused.starts_with(&rendered), "{refused}");

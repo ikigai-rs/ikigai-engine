@@ -281,8 +281,7 @@ fn a_fork_round_trips() {
 
 #[test]
 fn a_fork_nested_inside_a_branch_round_trips() {
-    // The inner fork is the TAIL of the first branch, reached through that branch's head —
-    // which is the only nesting the vocabulary can spell (see the refusals below).
+    // The inner fork is the TAIL of the first branch, reached through that branch's head.
     let turtle = round_trip("urn:t:up hi | ( urn:t:a | ( urn:t:b ; urn:t:c ) ; urn:t:d )");
     assert_eq!(turtle.matches("a ik:Fork").count(), 2, "{turtle}");
 }
@@ -345,30 +344,51 @@ fn a_reference_argument_round_trips() {
     assert!(turtle.contains("ik:value \"<urn:t:a>\""), "{turtle}");
 }
 
-// --- what a plan cannot say, said out loud ------------------------------------
+// --- a fork fed every way a step is (vocab 0.2.8, ledger #32 and #2654) ---------
 
-/// Two grammar shapes have no spelling in the process vocabulary, both for the same
-/// reason: `ik:mapOver`, `ik:forkOf` and `ik:order` are properties of an `ik:Step`, and a
-/// fork is not a step. A plan that came back meaning something subtly different would be
-/// worse than one that will not come back at all, so both are refused by name.
+/// `.. ( … )`: the fork carries `ik:mapOver`, and it and both its branches run once per
+/// item — which the transcript shows request by request, the same from the text as from
+/// the graph.
 #[test]
-fn a_fork_that_is_a_forks_branch_is_refused_not_degraded() {
-    let (engine, _, _) = fixture();
-    // It RUNS as text — this is a gap in the graph, not in the grammar.
-    assert!(
-        output(engine.eval("source urn:t:up hi | ( ( urn:t:a ; urn:t:b ) ; urn:t:c )")).is_ok()
-    );
-    let err =
-        output(engine.eval("plan urn:t:up hi | ( ( urn:t:a ; urn:t:b ) ; urn:t:c )")).unwrap_err();
-    assert!(err.contains("ik:forkOf"), "{err}");
+fn a_map_over_a_fork_round_trips() {
+    let turtle = round_trip("urn:t:list seed .. ( urn:t:a ; urn:t:b )");
+    let fork = turtle
+        .split("\n\n")
+        .find(|block| block.contains("a ik:Fork"))
+        .expect("a fork");
+    assert!(fork.contains("ik:mapOver"), "{turtle}");
+    assert!(!fork.contains("ik:upstream"), "{turtle}");
 }
 
+/// Inside a mapped fork, a branch may itself pipe, map, or map over another fork: each
+/// runs inside the item it belongs to.
 #[test]
-fn a_map_over_a_fork_is_refused_not_degraded() {
-    let (engine, _, _) = fixture();
-    assert!(output(engine.eval("source urn:t:list seed .. ( urn:t:a ; urn:t:b )")).is_ok());
-    let err = output(engine.eval("plan urn:t:list seed .. ( urn:t:a ; urn:t:b )")).unwrap_err();
-    assert!(err.contains("ik:mapOver"), "{err}");
+fn what_runs_inside_a_mapped_fork_round_trips() {
+    round_trip("urn:t:list seed .. ( urn:t:a | urn:t:up ; urn:t:b )");
+    round_trip("urn:t:list seed .. ( urn:t:list .. urn:t:up ; urn:t:b )");
+    let turtle = round_trip("urn:t:list seed .. ( urn:t:list .. ( urn:t:a ; urn:t:b ) ; urn:t:c )");
+    assert_eq!(turtle.matches("ik:mapOver").count(), 2, "{turtle}");
+    // And what follows a mapped fork runs once, over its join.
+    round_trip("urn:t:list seed .. ( urn:t:a ; urn:t:b ) | urn:t:up");
+}
+
+/// `( ( … ) ; … )`: the inner fork is a branch (`ik:forkOf` + `ik:order`) and takes the
+/// outer fork's input, with no `ik:upstream` of its own.
+#[test]
+fn a_fork_that_is_a_forks_branch_round_trips() {
+    let turtle = round_trip("urn:t:up hi | ( ( urn:t:a ; urn:t:b ) ; urn:t:c )");
+    let inner = turtle
+        .split("\n\n")
+        .find(|block| block.contains(":fork:2> a ik:Fork"))
+        .expect("the inner fork");
+    assert!(
+        inner.contains("ik:forkOf") && inner.contains("ik:order 1"),
+        "{turtle}"
+    );
+    assert!(!inner.contains("ik:upstream"), "{turtle}");
+    // Mapped, and first: a branch fork takes the item, or nothing.
+    round_trip("urn:t:list seed .. ( ( urn:t:a ; urn:t:b ) ; urn:t:c )");
+    round_trip("( ( urn:t:a one ; urn:t:b two ) ; urn:t:c three )");
 }
 
 #[test]
