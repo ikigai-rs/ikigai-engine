@@ -83,6 +83,7 @@ impl MetaRenderer for JsonRenderer {
 /// One world: a kernel, the transcript its stubs keep, and the plan `urn:t:plan` holds.
 struct World {
     kernel: Arc<Kernel>,
+    space: Arc<dyn ikigai_core::Space>,
     log: Log,
     plan: Arc<Mutex<String>>,
 }
@@ -312,16 +313,15 @@ fn world() -> World {
         ),
     );
 
-    let kernel = Kernel::with_meta_renderer(
-        Arc::new(ikigai_core::Fallback::new(vec![
-            Arc::new(space) as Arc<dyn ikigai_core::Space>,
-            Arc::new(ikigai_shacl::space()),
-            Arc::new(ikigai_engine::plan_space::space()),
-        ])),
-        Arc::new(JsonRenderer),
-    );
+    let space: Arc<dyn ikigai_core::Space> = Arc::new(ikigai_core::Fallback::new(vec![
+        Arc::new(space) as Arc<dyn ikigai_core::Space>,
+        Arc::new(ikigai_shacl::space()),
+        Arc::new(ikigai_engine::plan_space::space()),
+    ]));
+    let kernel = Kernel::with_meta_renderer(Arc::clone(&space), Arc::new(JsonRenderer));
     World {
         kernel: Arc::new(kernel),
+        space,
         log,
         plan,
     }
@@ -877,12 +877,13 @@ const NESTED_FORK: &str = r#"
 
 /// The fork properties ledger #2653 refused until the engine implemented them (#2654): each
 /// plan validates (the shapes and the reader), and runs to the same answer, by the same
-/// requests, through `execute` and through `urn:plan:eval`. Returns that answer and the
+/// requests, through `execute`, `urn:plan:eval`, and a `bind` name. Returns that answer and the
 /// transcript.
 fn assert_fork_runs(plan: &str) -> (String, Vec<String>) {
     let w = world();
     let report = w.text("urn:plan:validate", plan, &[]);
     assert!(report.contains(" conforms:"), "{report}");
+    assert!(w.drain().is_empty(), "validating runs nothing");
     let by_run = w.run(plan, Capability::root()).expect("execute");
     let transcript = w.drain();
     let by_eval = w
@@ -894,6 +895,56 @@ fn assert_fork_runs(plan: &str) -> (String, Vec<String>) {
         "urn:plan:eval issued different requests"
     );
     assert_eq!(by_run, String::from_utf8(by_eval.bytes).expect("text"));
+
+    // A host persists `bind` in its names atom, then loads those rules into an alias.
+    let names: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let held = Arc::clone(&names);
+    let atom = FnEndpoint::new("names", move |inv: &Invocation<'_>| {
+        if inv.request.verb == Verb::Sink {
+            *held.lock().expect("names") = inv.inline_arg("content")?.to_vec();
+        }
+        Ok(Representation::new(
+            ReprType::new("text/plain"),
+            held.lock().expect("names").clone(),
+        ))
+    })
+    .with_description(
+        Description::new("names")
+            .verb(Verb::Source)
+            .verb(Verb::Sink)
+            .input(input("content").optional()),
+    );
+    let space: Arc<dyn ikigai_core::Space> = Arc::new(ikigai_core::Fallback::new(vec![
+        Arc::new(EndpointSpace::new().bind(Exact::new("urn:t:names"), atom)),
+        Arc::clone(&w.space),
+    ]));
+    let engine = Engine::new(Kernel::with_meta_renderer(space, Arc::new(JsonRenderer)))
+        .with_names_atom(Iri::parse("urn:t:names").expect("IRI"));
+    output(engine.eval("bind urn:t:bound = source urn:plan:eval in=<urn:t:plan>"))
+        .expect("bind plan");
+    assert!(w.drain().is_empty(), "binding runs nothing");
+    let text = String::from_utf8(names.lock().expect("names").clone()).expect("names text");
+    let mut table = ikigai_core::AliasTable::new();
+    for rule in ikigai_engine::names::parse_names(&text).expect("names rules") {
+        table = table.with_rule(rule).expect("alias rule");
+    }
+    let alias = ikigai_core::Alias::new(Arc::new(table), Arc::new(EndpointSpace::new()));
+    let live = Engine::new(Kernel::with_meta_renderer(
+        Arc::new(ikigai_core::Fallback::new(vec![
+            Arc::clone(&w.space),
+            Arc::new(alias),
+        ])),
+        Arc::new(JsonRenderer),
+    ));
+    assert_eq!(
+        output(live.eval("source urn:t:bound")).expect("bound plan"),
+        by_run
+    );
+    assert_eq!(
+        transcript,
+        w.drain(),
+        "bound name issued different requests"
+    );
     (by_run, transcript)
 }
 
@@ -931,11 +982,10 @@ fn a_fork_as_a_branch_takes_the_outer_forks_input() {
 fn a_fork_binds_its_join_and_a_later_step_cites_it() {
     // `report = @stored | ( source urn:demo:a ; source urn:demo:b )`, then
     // `source urn:text:wc in=@report`: the join is the three lines of `a` and one of `b`.
-    let w = world();
-    let answer = w.run(FORK_BINDS, Capability::root()).expect("execute");
+    let (answer, transcript) = assert_fork_runs(FORK_BINDS);
     assert_eq!(answer, "4");
     assert_eq!(
-        w.drain(),
+        transcript,
         [
             "Source urn:demo:store []",
             "Source urn:demo:a [in=stored]",
@@ -943,23 +993,6 @@ fn a_fork_binds_its_join_and_a_later_step_cites_it() {
             "Source urn:text:wc [in=one\ntwo\nthree\nb(stored)]",
         ]
     );
-    // ⚠ The reader takes this plan, but the published shapes refuse it, so `urn:plan:eval`
-    // (which validates first) does too: vocab 0.2.8's `process:local-refs` reuses the
-    // citing step's `?s` inside its FILTER NOT EXISTS, so its `?s ik:forkOf+ ?f . ?f
-    // ik:binds ?name` arm asks whether the CITING step is a branch of the binding fork,
-    // and a fork's binding never counts. That is an ikigai-vocab defect, pinned here
-    // exactly: when the shape is fixed this fails, and this plan joins
-    // `assert_fork_runs`.
-    let report = w.text("urn:plan:validate", FORK_BINDS, &[]);
-    assert!(
-        report.contains("does not conform — 1 problem")
-            && report.contains(
-                "urn:ikigai:shape:process at <urn:plan:fork-binds>: \
-                 urn:plan:fork-binds:var:report references a name this plan never binds"
-            ),
-        "{report}"
-    );
-    assert!(w.drain().is_empty(), "validating runs nothing");
 }
 
 #[test]
