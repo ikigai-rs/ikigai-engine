@@ -1,5 +1,5 @@
-//! A mapped fork in a plan (`a .. ( b ; c )`, `ik:mapOver` on an `ik:Fork`, ledger #2654):
-//! each item is its own request, with its own cache entry and thread.
+//! Mapped forks and steps in plans, and the REPL map (ledger #2654, #2665):
+//! each inline item is its own request and cache entry; the join depends on the list.
 //!
 //! The evidence is the text face's own tally, `[n cached · m computed]`: of four items,
 //! change one, and the next run of the stored plan recomputes exactly that item's branches.
@@ -171,4 +171,109 @@ fn a_failing_item_aborts_the_mapped_fork() {
         ["b(a)"],
         "the first item's failure stops the run"
     );
+}
+
+// Both faces must isolate each inline item's cache entry from the list's thread.
+fn assert_mapped_step_cache(engine: Engine, command: &str, log: &Log, plan: bool) {
+    let cold = entry(engine.eval(command));
+    assert_eq!(cold.result.as_deref(), Ok("b(a)\nb(b)\nb(c)\nb(d)"));
+    assert_eq!(
+        cold.cache.label().as_deref(),
+        Some(if plan { "6 computed" } else { "5 computed" })
+    );
+    assert_eq!(drain(log), ["b(a)", "b(b)", "b(c)", "b(d)"]);
+    let warm = entry(engine.eval(command));
+    assert_eq!(warm.result, cold.result);
+    assert_eq!(
+        warm.cache.label().as_deref(),
+        Some(if plan { "6 cached" } else { "5 cached" })
+    );
+    assert!(drain(log).is_empty());
+
+    entry(engine.eval("sink urn:t:list C"));
+    let cut = entry(engine.eval(command));
+    assert_eq!(cut.result.as_deref(), Ok("b(a)\nb(b)\nb(C)\nb(d)"));
+    assert_eq!(
+        cut.cache.label().as_deref(),
+        Some(if plan {
+            "4 cached · 2 computed"
+        } else {
+            "3 cached · 2 computed"
+        })
+    );
+    assert_eq!(drain(log), ["b(C)"]);
+}
+
+#[test]
+fn mapped_step_recomputes_only_the_changed_item() {
+    let (engine, stored, log) = world();
+    *stored.lock().expect("plan") = entry(engine.eval("plan urn:t:list .. urn:t:b"))
+        .result
+        .expect("plan");
+    assert_mapped_step_cache(engine, "execute urn:t:plan", &log, true);
+}
+
+#[test]
+fn repl_map_recomputes_only_the_changed_item() {
+    let (engine, _, log) = world();
+    assert_mapped_step_cache(engine, "source urn:t:list .. urn:t:b", &log, false);
+}
+
+struct InlineSpawner;
+impl ikigai_core::Spawner for InlineSpawner {
+    fn spawn(&self, task: ikigai_core::BoxFuture<()>) -> ikigai_core::BoxFuture<()> {
+        task
+    }
+    fn width(&self) -> Option<usize> {
+        Some(1)
+    }
+}
+
+#[test]
+fn repl_parallel_map_recomputes_only_the_changed_item() {
+    let (engine, _, log) = world();
+    assert_mapped_step_cache(
+        engine.with_spawner(Arc::new(InlineSpawner)),
+        "source urn:t:list .. urn:t:b",
+        &log,
+        false,
+    );
+}
+
+#[test]
+fn mapped_step_join_keeps_the_list_dependency() {
+    for plan in [false, true] {
+        for parallel in [false, true] {
+            let (mut engine, stored, log) = world();
+            if parallel {
+                engine = engine.with_spawner(Arc::new(InlineSpawner));
+            }
+            let command = if plan {
+                *stored.lock().expect("plan") =
+                    entry(engine.eval("plan urn:t:list .. urn:t:b | urn:t:c"))
+                        .result
+                        .expect("plan");
+                "execute urn:t:plan"
+            } else {
+                "source urn:t:list .. urn:t:b | urn:t:c"
+            };
+            let cold = entry(engine.eval(command));
+            assert_eq!(cold.result.as_deref(), Ok("c(b(a)\nb(b)\nb(c)\nb(d))"));
+            drain(&log);
+            // Cut the list without changing its bytes. Item requests stay cached,
+            // but the downstream request must recompute because it consumes the join.
+            entry(engine.eval("sink urn:t:list c"));
+            let cut = entry(engine.eval(command));
+            assert_eq!(cut.result, cold.result);
+            assert_eq!(
+                cut.cache.label().as_deref(),
+                Some(if plan {
+                    "5 cached · 2 computed"
+                } else {
+                    "4 cached · 2 computed"
+                })
+            );
+            assert_eq!(drain(&log), ["c(b(a)\nb(b)\nb(c)\nb(d))"]);
+        }
+    }
 }

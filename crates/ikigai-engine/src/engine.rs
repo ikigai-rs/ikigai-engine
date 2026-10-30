@@ -75,9 +75,8 @@ impl Staged {
     }
 
     /// This output as also depending on `upstream`: the most restrictive expiry of the two,
-    /// and both sets of threads. A plan's mapped fork folds its list in this way (ledger
-    /// #2654), since each item's requests hang from the item alone.
-    #[cfg(feature = "plan-reader")]
+    /// and both sets of threads. Maps fold their list in this way (ledger #2654, #2665),
+    /// since each item's requests hang from the item alone.
     pub(crate) fn depending_on(mut self, upstream: Provenance) -> Staged {
         self.expiry = self.expiry.most_restrictive(upstream.expiry);
         self.threads.extend(upstream.threads);
@@ -1537,8 +1536,8 @@ impl Engine {
                  UTF-8 text — use a plain `|` to pass the bytes through whole"
                     .to_string()
             })?;
-            // Every mapped item descends from the same upstream, so each inherits its
-            // provenance; the joined result combines them (cacheable iff all are).
+            // Each item travels inline in its request, so its bytes identify its cache
+            // entry. Only the join depends on the whole list (ledger #2665).
             let prov = value.provenance();
             // Concurrent path: mapping a single `source` over each item — resolve the
             // items on the injected scheduler in parallel.
@@ -1551,8 +1550,10 @@ impl Engine {
                             .await?,
                     );
                 }
-                let outputs = self.run_parallel(spawner, requests, prov).await?;
-                return Ok(combine_outputs(outputs));
+                let outputs = self
+                    .run_parallel(spawner, requests, root_provenance())
+                    .await?;
+                return Ok(combine_outputs(outputs).depending_on(prov));
             }
             // Sequential per-item mapping (no spawner, or a stage that isn't a lone
             // `source`): one item at a time, so the achieved width is 1.
@@ -1560,11 +1561,11 @@ impl Engine {
             let mut outputs = Vec::new();
             for item in text.split_terminator('\n') {
                 outputs.push(
-                    self.run_node(node, Some(item.as_bytes()), prov.clone())
+                    self.run_node(node, Some(item.as_bytes()), root_provenance())
                         .await?,
                 );
             }
-            Ok(combine_outputs(outputs))
+            Ok(combine_outputs(outputs).depending_on(prov))
         })
     }
 
