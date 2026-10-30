@@ -83,7 +83,11 @@ the host's names atom (`Engine::with_names_atom`); a host that names none refuse
 binding is checked against its target's contract when it is written (`bind urn:x = source
 urn:t:upper nosuch=1` is refused naming `nosuch`), a `{var}` in a template name fills the
 target IRI or a whole argument value, and a `urn:plan:eval` binding copies the plan's
-`ik:input`s onto the name. The atom holds the names text form (`names`, media type
+`ik:input`s onto the name. A pipeline on the right (`bind urn:q:loud = source urn:file:x |
+urn:iki:fn:toUpper`) is compiled to the plan `plan` renders and bound as `source urn:plan:eval`
+with that plan inline, so the name is a live composite that recomputes when what it reads is
+cut, not a `sink` snapshot (`plan-reader`); a shape `plan` cannot spell, such as a `.. ( … )`
+map over a fork, is refused with the renderer's message. The atom holds the names text form (`names`, media type
 `text/x-ikigai-names`, one binding per line). With `plan-reader`, `names::space()` binds the
 lossless transreptor pair `urn:names:to-rdf` / `urn:names:from-rdf` between that form and the
 `ik:Alias` Turtle core builds, and names itself `urn:iki:space:engine:names`.
