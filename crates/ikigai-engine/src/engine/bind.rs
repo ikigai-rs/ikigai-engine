@@ -721,8 +721,7 @@ mod tests {
     }
 
     /// A stored plan whose fork binds its join (`report = source urn:file:x | ( … )`).
-    /// Nothing cites `@report` here: vocab 0.2.8's `process:local-refs` shape does not see a
-    /// fork's binding (see `plan_eval.rs`), and `urn:plan:eval` validates before it runs.
+    /// The fixture in `plan_eval.rs` also covers a later step citing the bound join.
     #[cfg(feature = "plan-reader")]
     const FORK_BINDS: &str = r#"
 @prefix ik: <https://ikigai-rs.dev/ns#> .
