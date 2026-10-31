@@ -23,7 +23,9 @@
 //!   REFERENCE, as the REPL sends one (ledger #2508); `"…"` quotes a value (and keeps `<iri>`
 //!   text). In a template name (`{var}` in it, RFC 6570 simple), `key={var}` fixes the WHOLE
 //!   value to what the variable captured, and a `{var}` in the target fills the target IRI.
-//!   A capture is never spliced into a longer value: an unquoted `key=a{id}` is refused.
+//!   An unquoted `key=<urn:file:searches/{var}>` fills a reference template, percent-encoding
+//!   each capture before parsing the IRI. A capture is never spliced into longer text:
+//!   an unquoted `key=a{id}` is refused.
 //! - **An indented `input` line declares an input of the name itself**, under the binding
 //!   above it: `input <name> [summary="…"] [class=<iri>] [default="…"] [one-of="…"]…
 //!   [required=true|false]`, required unless it has a default. `bind` writes these for a
@@ -47,7 +49,7 @@ use std::sync::Arc;
 
 use ikigai_core::{
     Alias, AliasTable, ArgSpec, EndpointSpace, FixedArgument, FixedValue, ResolveAt, RuleKind,
-    Space, SpaceKind, TopologyRule, Verb,
+    Space, SpaceKind, TopologyRule, UriTemplate, Verb,
 };
 
 use crate::engine::{looks_like_argument_name, tokenize, Token, Word};
@@ -170,6 +172,15 @@ fn words(line: &str) -> Result<Vec<Word>, String> {
 
 /// One `key=value` word as the argument it fixes.
 fn fixed_argument(word: &Word, key: &str, value: &str) -> Result<FixedArgument, String> {
+    if !word.is_quoted() {
+        if let Some(inner) = value.strip_prefix('<').and_then(|v| v.strip_suffix('>')) {
+            if inner.contains('{') || inner.contains('}') {
+                let template = UriTemplate::parse(inner)
+                    .map_err(|e| format!("`{key}={value}` is not a reference template: {e}"))?;
+                return Ok(FixedArgument::reference_template(key, template));
+            }
+        }
+    }
     if let Some(reference) = word.reference() {
         let (_, iri) = reference?;
         return Ok(FixedArgument::reference(key, iri));
@@ -402,6 +413,7 @@ pub fn render_binding(rule: &TopologyRule) -> Result<String, String> {
             FixedValue::Value(value) => quote_value(value)?,
             FixedValue::Reference(iri) => format!("<{}>", iri.as_str()),
             FixedValue::Capture(var) => format!("{{{var}}}"),
+            FixedValue::ReferenceTemplate(template) => format!("<{}>", template.source()),
             other => {
                 return Err(format!(
                     "`{}` is fixed in a way a names line cannot say: {other}",
@@ -738,6 +750,112 @@ urn:quakes:page:{n} = forward urn:quakes:pages:{n} title=\"a | b\"
             .unwrap();
         assert_eq!(page.verb, None);
         assert_eq!(page.fixes[0], FixedArgument::value("title", "a | b"));
+    }
+
+    #[test]
+    fn a_reference_can_contain_a_template_capture() {
+        let line = "urn:river:search:{file} = source urn:sparql:select graph=urn:file:river.nt query=<urn:file:searches/{file}>";
+        let rule = parse_binding(line).expect("a reference template is a valid fixed argument");
+        assert!(rule.fixes.iter().any(|fixed| {
+            fixed.name == "query"
+                && matches!(&fixed.value, FixedValue::ReferenceTemplate(template)
+                    if template.source() == "urn:file:searches/{file}")
+        }));
+        let rendered = render_binding(&rule).unwrap();
+        assert!(rendered.contains("query=<urn:file:searches/{file}>"));
+        assert_eq!(parse_binding(rendered.trim()).unwrap(), rule);
+    }
+
+    #[test]
+    fn reference_templates_read_saved_searches_without_splicing_paths() {
+        use futures::executor::block_on;
+        use ikigai_core::{
+            ArgRef, AsyncFnEndpoint, Capability, Description, Exact, FnEndpoint, Iri, Kernel,
+            ReprType, Representation, Request,
+        };
+
+        let rule = parse_binding("urn:river:search:{file} = source urn:sparql:select graph=urn:file:river.nt query=<urn:file:searches/{file}>").unwrap();
+        let table = AliasTable::new().with_rule(rule).unwrap();
+        let select = AsyncFnEndpoint::new("select", |inv| {
+            Box::pin(async move {
+                let Some(ArgRef::Reference(query)) = inv.request.args.get("query") else {
+                    panic!("the expanded query must be a reference");
+                };
+                inv.source(query).await
+            })
+        })
+        .with_description(
+            Description::new("select")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("graph"))
+                .input(ArgSpec::new("query").reads_body()),
+        );
+        let mut space = EndpointSpace::new().bind(Exact::new("urn:sparql:select"), select);
+        for encoded in ["since.rq", "a%2Fb.rq", "a%3Ab.rq"] {
+            let iri = format!("urn:file:searches/{encoded}");
+            let body = iri.clone();
+            space = space.bind(
+                Exact::new(iri),
+                FnEndpoint::new(encoded, move |_| {
+                    Ok(Representation::new(
+                        ReprType::new("text/plain"),
+                        body.as_bytes().to_vec(),
+                    ))
+                }),
+            );
+        }
+        let kernel = Kernel::new(Arc::new(space)).with_aliases(Arc::new(table));
+        for (file, encoded) in [
+            ("since.rq", "since.rq"),
+            ("a/b.rq", "a%2Fb.rq"),
+            ("a:b.rq", "a%3Ab.rq"),
+        ] {
+            let request = Request::new(
+                Verb::Source,
+                Iri::parse(format!("urn:river:search:{file}")).unwrap(),
+            );
+            let answer = block_on(kernel.issue(request, &Capability::root())).unwrap();
+            assert_eq!(
+                answer.bytes,
+                format!("urn:file:searches/{encoded}").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn reference_templates_validate_variables_and_preserve_quoted_text() {
+        for value in [
+            "<urn:file:{missing}>",
+            "<urn:file:{file>",
+            "<relative/{file}>",
+        ] {
+            assert!(
+                parse_binding(&format!("urn:search:{{file}} = source urn:t query={value}"))
+                    .is_err()
+            );
+        }
+        assert!(parse_binding("urn:search = source urn:t query=<urn:file:{file}>").is_err());
+        let rule =
+            parse_binding("urn:search:{file} = source urn:t query=\"<urn:file:{file}>\"").unwrap();
+        assert_eq!(
+            rule.fixes[0],
+            FixedArgument::value("query", "<urn:file:{file}>")
+        );
+        assert_eq!(
+            parse_binding(render_binding(&rule).unwrap().trim()).unwrap(),
+            rule
+        );
+    }
+
+    #[cfg(feature = "plan-reader")]
+    #[test]
+    fn reference_templates_round_trip_through_turtle() {
+        let names =
+            "urn:river:search:{file} = source urn:sparql:select query=<urn:file:searches/{file}>";
+        let turtle = names_to_turtle(names).unwrap();
+        let text = turtle_to_names(&turtle).unwrap();
+        assert_eq!(parse_names(&text).unwrap(), parse_names(names).unwrap());
+        assert_eq!(names_to_turtle(&text).unwrap(), turtle);
     }
 
     #[test]
