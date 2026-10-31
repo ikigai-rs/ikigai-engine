@@ -71,6 +71,9 @@ async-trait = "0.1"
 ikigai-fs = { workspace = true }
 # Exercise combined file-read and Lisp profiles through the real sandbox and kernel verbs.
 ikigai-lisp = "0.4.1"
+# Steel's parser accepts ordered-float 5.1+, but 5.5.1 requires Rust 1.90.
+# Keep the real-Lisp tests compatible with this workspace's Rust 1.89 MSRV.
+ordered-float = "=5.4.0"
 # The plan round-trip validates every rendered `ik:Process` graph against the published
 # shapes (`ikigai_vocab::SHAPES`). A renderer that emits a shape-invalid plan must fail the
 # build here, not the reader out there — and `ikigai-vocab` parses its shapes for SYNTAX
