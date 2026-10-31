@@ -34,6 +34,12 @@ cargo clippy -p ikigai-engine --lib --target wasm32-unknown-unknown   # the wasm
 `plan-reader` is off by default: it pulls a Turtle stack that does not build for
 `wasm32-unknown-unknown`. A native host that executes stored plans turns it on.
 
+## Accessibility
+
+What these crates emit that people read (the REPL's help, answers and errors, the intray's
+diagnostics), the rules that text follows and how to report a barrier are in
+[ACCESSIBILITY.md](ACCESSIBILITY.md).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
