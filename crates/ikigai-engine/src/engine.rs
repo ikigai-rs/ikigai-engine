@@ -2239,8 +2239,9 @@ impl Engine {
     /// named by each word, expanding registered profiles (e.g. `cap read-only lisp`)
     /// and `net-<host>` shorthand, and narrows to that union intersected with what's
     /// already held. `cap reset` returns to the session's identity. Narrowing is
-    /// REVERSIBLE — `cap reset`, `login` and `logout` widen it again — so it is how the owner steps down for a while (the runbook's and
-    /// the tutorial's narrow-then-reset). `cap seal [scope|profile…]` takes the same words
+    /// REVERSIBLE — `cap reset`, `login` and `logout` widen it again — so it is how the
+    /// owner steps down for a while (the runbook's and the tutorial's narrow-then-reset).
+    /// `cap seal [scope|profile…]` takes the same words
     /// for a hand-off: it narrows (when given words) and then makes the result the
     /// session's floor, one-way, so the holder can never widen back.
     fn run_cap(&self, rest: &str) -> Result<String, String> {
