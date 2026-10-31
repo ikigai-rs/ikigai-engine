@@ -108,8 +108,10 @@ homepage = "https://github.com/ikigai-rs/ikigai-engine"
 # 0.2.9 (core PR 277, ledger #2660) is the API floor for
 # `Representation::with_uncached_reason(UncachedReason::Mounted)`: peer cuts do not
 # reach this kernel, so forwarded answers report `mounted` rather than `declared`.
-# ⚠ `^0.2.9` is also a ceiling below 0.3.0.
-ikigai-core = "0.2.9"
+# 0.2.10 (ledger #2671/#2619) is the API floor for `FixedValue::ReferenceTemplate`
+# and `FixedArgument::reference_template`: captures in a fixed reference are percent-encoded.
+# ⚠ `^0.2.10` is also a ceiling below 0.3.0.
+ikigai-core = "0.2.10"
 # Raised with core, in lockstep. 0.1.70 is the first version carrying the PROCESS vocabulary
 # (`ik:Process`/`ik:Step`/`ik:Argument`/`ik:Fork`, the plan shapes in `SHAPES`, and the
 # `ikigai_vocab::plan` IRI builders) that the engine's `plan.rs` renders and reads; the tests
