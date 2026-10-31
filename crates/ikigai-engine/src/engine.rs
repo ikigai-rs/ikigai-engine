@@ -217,11 +217,12 @@ commands:
   :lisp                      enter multi-line Lisp mode; a blank line evaluates, `:lisp` cancels
   :load <uri> [cap=<scope>]  read a script resource and evaluate it as Lisp (cap= narrows first)
   cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
-  cap [scope…]               show the session capability, narrow it to `scope`s, or `cap reset`
+  cap [scope|profile…]       show the session capability, narrow it, or `cap reset`
+                             (profiles combine: `cap read-only lisp`);
                              (`net-<host>` is shorthand for the `urn:cap:net:<host>` scope;
                              a word that is not a `urn:cap:` scope or a profile is refused);
                              narrowing is REVERSIBLE: `cap reset` widens back to the identity
-  cap seal [scope…]          hand-off: narrow to `scope`s (or keep the current capability) and
+  cap seal [scope|profile…]  hand-off: narrow as above (or keep the current capability) and
                              make it the session's FLOOR, one-way — `cap reset`, `logout` and
                              `login` never rise above it again
   login [scope…] / logout    set the session identity to the minted `scope`s (the identity `cap
@@ -940,8 +941,8 @@ impl Engine {
     }
 
     /// Register a named capability profile — `cap <name>` then attenuates to its
-    /// scopes (e.g. `freebusy`). A host sets these so the REPL reads friendlier
-    /// than a bare scope list.
+    /// scopes (e.g. `freebusy`); multiple profile names combine their scopes. A host
+    /// sets these so the REPL reads friendlier than a bare scope list.
     pub fn define_cap_profile(
         &self,
         name: impl Into<String>,
@@ -1209,7 +1210,7 @@ impl Engine {
         // Narrow just for this load, if asked, saving the prior capability to restore.
         // A bad scope word is refused before anything narrows (ledger #105).
         let scopes = cap
-            .map(|scope| self.cap_scopes(scope, scope.split(',')))
+            .map(|scope| self.cap_scopes(scope.split(',')))
             .transpose()?;
         let saved = scopes.map(|scopes| {
             let prev = self.capability.borrow().clone();
@@ -2234,13 +2235,14 @@ impl Engine {
 
     /// `cap` command: show, narrow, reset, or seal the session capability.
     ///
-    /// `cap` shows the current authority; `cap <scope>…` narrows it to the given
-    /// `urn:cap:` scopes (intersected with what's already held); `cap reset` returns to
-    /// the session's identity. Narrowing is REVERSIBLE — `cap reset`, `login` and `logout`
-    /// widen it again — so it is how the owner steps down for a while (the runbook's and
-    /// the tutorial's narrow-then-reset). `cap seal [scope…]` is the hand-off: it narrows
-    /// (when given scopes) and then makes the result the session's floor, one-way, so the
-    /// holder can never widen back.
+    /// `cap` shows the current authority; `cap <scope|profile>…` combines the scopes
+    /// named by each word, expanding registered profiles (e.g. `cap read-only lisp`)
+    /// and `net-<host>` shorthand, and narrows to that union intersected with what's
+    /// already held. `cap reset` returns to the session's identity. Narrowing is
+    /// REVERSIBLE — `cap reset`, `login` and `logout` widen it again — so it is how the owner steps down for a while (the runbook's and
+    /// the tutorial's narrow-then-reset). `cap seal [scope|profile…]` takes the same words
+    /// for a hand-off: it narrows (when given words) and then makes the result the
+    /// session's floor, one-way, so the holder can never widen back.
     fn run_cap(&self, rest: &str) -> Result<String, String> {
         let rest = rest.trim();
         if rest.is_empty() {
@@ -2266,51 +2268,49 @@ impl Engine {
         Ok(format!("narrowed — {}", self.describe_capability()))
     }
 
-    /// Narrow the session capability to `words`: a registered profile name expands to its
-    /// scopes; otherwise each word is a scope, with a `net-<host>` shorthand for
-    /// `urn:cap:net:<host>` so a session can be narrowed to one host without typing the
-    /// full scope (e.g. `cap seal net-example.com` before handing outbound HTTP to an
+    /// Narrow the session capability to `words`: each registered profile name expands
+    /// to its scopes, so profiles combine; otherwise the word is a scope, with a
+    /// `net-<host>` shorthand for `urn:cap:net:<host>` so a session can be narrowed to
+    /// one host without typing the full scope (e.g. `cap seal net-example.com` before handing outbound HTTP to an
     /// agent). A word that is none of those is refused and nothing narrows.
     fn narrow(&self, words: &str) -> Result<(), String> {
-        let scopes = self.cap_scopes(words, words.split_whitespace())?;
+        let scopes = self.cap_scopes(words.split_whitespace())?;
         let narrowed = self.capability.borrow().attenuate(scopes);
         *self.capability.borrow_mut() = narrowed;
         Ok(())
     }
 
-    /// The scopes a `cap` argument names: `whole` as a registered profile name, else each
-    /// of `words` through the `net-<host>` shorthand. Every resulting scope must be a
-    /// `urn:cap:` IRI; the first word that is not is REFUSED by name (ledger #105), since a
-    /// scope that is not one grants nothing, and accepting it turned a misspelling into a
+    /// The scopes a `cap` argument names: each word expands as a registered profile
+    /// first, then as `net-<host>` shorthand or a `urn:cap:` IRI. Profiles combine.
+    /// The first unrecognized word is REFUSED by name (ledger #105), since a scope
+    /// that is not one grants nothing, and accepting it turned a misspelling into a
     /// silent no-op grant whose denial surfaced later, somewhere else.
-    fn cap_scopes<'w>(
-        &self,
-        whole: &str,
-        words: impl Iterator<Item = &'w str>,
-    ) -> Result<Vec<String>, String> {
+    fn cap_scopes<'w>(&self, words: impl Iterator<Item = &'w str>) -> Result<Vec<String>, String> {
         let profiles = self.profiles.borrow();
-        if let Some(scopes) = profiles.get(whole) {
-            return Ok(scopes.clone());
+        let mut scopes = Vec::new();
+        for word in words {
+            if let Some(profile) = profiles.get(word) {
+                scopes.extend(profile.iter().cloned());
+                continue;
+            }
+            let scope = expand_cap_shorthand(word);
+            if is_cap_scope(&scope) {
+                scopes.push(scope);
+                continue;
+            }
+            let mut names: Vec<&str> = profiles.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            let profiles = if names.is_empty() {
+                String::new()
+            } else {
+                format!(", or a profile ({})", names.join(", "))
+            };
+            return Err(format!(
+                "`{word}` is not a capability scope: a scope is a `urn:cap:` IRI, \
+                 `net-<host>` (for `urn:cap:net:<host>`){profiles}"
+            ));
         }
-        words
-            .map(|word| {
-                let scope = expand_cap_shorthand(word);
-                if is_cap_scope(&scope) {
-                    return Ok(scope);
-                }
-                let mut names: Vec<&str> = profiles.keys().map(String::as_str).collect();
-                names.sort_unstable();
-                let profiles = if names.is_empty() {
-                    String::new()
-                } else {
-                    format!(", or a profile ({})", names.join(", "))
-                };
-                Err(format!(
-                    "`{word}` is not a capability scope: a scope is a `urn:cap:` IRI, \
-                     `net-<host>` (for `urn:cap:net:<host>`){profiles}"
-                ))
-            })
-            .collect()
+        Ok(scopes)
     }
 
     /// A one-line summary of the session capability — and, once sealed, of its floor.
@@ -5973,6 +5973,125 @@ mod tests {
         let err = output(binary_engine().eval("source urn:test:pdf")).unwrap_err();
         assert!(err.contains("not UTF-8 text"), "{err}");
         assert!(err.contains("sink"), "{err}");
+    }
+
+    #[test]
+    fn cap_combines_registered_profiles() {
+        let engine = builtin_engine();
+        engine.define_cap_profile("read-only", ["urn:cap:fs:read:/ws"]);
+        engine.define_cap_profile("lisp", ["urn:cap:lisp"]);
+
+        output(engine.eval("cap read-only lisp")).unwrap();
+        assert!(engine.capability().allows("urn:cap:fs:read:/ws"));
+        assert!(engine.capability().allows("urn:cap:lisp"));
+        assert!(!engine.capability().allows("urn:cap:fs:write:/ws"));
+    }
+
+    #[test]
+    fn cap_and_seal_accept_profiles_scopes_and_shorthand_together() {
+        let read = "urn:cap:fs:read:/ws";
+        let lisp = "urn:cap:lisp";
+        let net = "urn:cap:net:example.com";
+        for prefix in ["cap", "cap seal"] {
+            for (words, expected) in [
+                ("read-only", vec![read]),
+                ("urn:cap:lisp", vec![lisp]),
+                ("read-only urn:cap:lisp", vec![read, lisp]),
+                ("net-example.com", vec![net]),
+                ("lisp read-only net-example.com", vec![read, lisp, net]),
+                ("read-only lisp read-only urn:cap:lisp", vec![read, lisp]),
+            ] {
+                let engine = builtin_engine();
+                engine.define_cap_profile("read-only", [read]);
+                engine.define_cap_profile("lisp", [lisp]);
+                let command = format!("{prefix} {words}");
+                output(engine.eval(&command)).unwrap_or_else(|e| panic!("{command}: {e}"));
+                assert_eq!(
+                    engine.capability(),
+                    Capability::scoped(expected),
+                    "{command}"
+                );
+                if prefix == "cap seal" {
+                    assert!(engine.is_sealed());
+                    assert_eq!(engine.floor(), engine.capability());
+                    output(engine.eval("cap reset")).unwrap();
+                    assert_eq!(engine.capability(), engine.floor());
+                }
+            }
+
+            let engine = builtin_engine();
+            engine.define_cap_profile("read-only", [read]);
+            engine.define_cap_profile("lisp", [lisp]);
+            output(engine.eval("cap read-only")).unwrap();
+            let held = engine.capability();
+            let floor = engine.floor();
+            let err =
+                output(engine.eval(&format!("{prefix} read-only lisp tyop net-"))).unwrap_err();
+            assert!(err.contains("`tyop`"), "first unknown word is named: {err}");
+            assert_eq!(engine.capability(), held, "a bad word changes nothing");
+            assert_eq!(engine.floor(), floor);
+            assert!(!engine.is_sealed());
+            output(engine.eval(&format!("{prefix} read-only lisp"))).unwrap();
+            assert_eq!(engine.capability(), held, "combining cannot add authority");
+        }
+    }
+
+    #[test]
+    fn cap_profiles_expand_before_scope_and_shorthand_interpretation() {
+        let engine = builtin_engine();
+        engine.define_cap_profile("net-example.com", ["urn:cap:lisp", "urn:cap:fs:read:/ws"]);
+        engine.define_cap_profile("urn:cap:custom", ["urn:cap:other"]);
+        output(engine.eval("cap net-example.com urn:cap:custom")).unwrap();
+        assert_eq!(
+            engine.capability(),
+            Capability::scoped(["urn:cap:lisp", "urn:cap:fs:read:/ws", "urn:cap:other"])
+        );
+    }
+
+    #[test]
+    fn combined_read_only_and_lisp_profiles_allow_reads_but_deny_sinks() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("cap-profiles-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "40").unwrap();
+
+        for command in ["cap read-only lisp", "cap seal read-only lisp"] {
+            let engine = Engine::new(Kernel::with_meta_renderer(
+                Arc::new(ikigai_core::Fallback::new(vec![
+                    Arc::new(ikigai_fs::space(&root)),
+                    Arc::new(ikigai_lisp::space()),
+                ])),
+                Arc::new(JsonRenderer),
+            ));
+            engine.define_cap_profile("read-only", [format!("urn:cap:fs:read:{}", root.display())]);
+            engine.define_cap_profile("lisp", ["urn:cap:lisp"]);
+            output(engine.eval(command)).unwrap();
+            assert_eq!(
+                output(engine.eval("source urn:file:notes.txt")).unwrap(),
+                "40"
+            );
+            assert_eq!(output(engine.eval("(+ 40 2)")).unwrap().trim_end(), "42");
+            assert_eq!(
+                output(engine.eval(r#"(+ 2 (string->number (source "urn:file:notes.txt")))"#))
+                    .unwrap()
+                    .trim_end(),
+                "42"
+            );
+            for sink in [
+                r#"(sink "urn:file:notes.txt" "nope")"#,
+                "sink urn:file:notes.txt nope",
+            ] {
+                let err = output(engine.eval(sink)).expect_err("read-only refuses writes");
+                assert!(err.to_ascii_lowercase().contains("denied"), "{sink}: {err}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+                "40"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

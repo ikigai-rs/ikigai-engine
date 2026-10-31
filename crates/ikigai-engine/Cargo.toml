@@ -69,6 +69,8 @@ plan-reader = ["dep:oxttl", "dep:oxrdf", "dep:ikigai-store", "dep:oxigraph", "ik
 async-trait = "0.1"
 # End-to-end `sink`/`source`/`cap` tests mount the real file module.
 ikigai-fs = { workspace = true }
+# Exercise combined file-read and Lisp profiles through the real sandbox and kernel verbs.
+ikigai-lisp = "0.4.1"
 # The plan round-trip validates every rendered `ik:Process` graph against the published
 # shapes (`ikigai_vocab::SHAPES`). A renderer that emits a shape-invalid plan must fail the
 # build here, not the reader out there — and `ikigai-vocab` parses its shapes for SYNTAX
