@@ -12,8 +12,10 @@ mod common;
 
 use common::{drop_tuple, iri, scratch, Counting};
 use futures::executor::block_on;
-use ikigai_core::{ArgRef, Capability, Error, Kernel, Request, Verb};
-use ikigai_intray::{space, Outcome, SpaceReactor, CAP_OUT, CAP_READ, CAP_TAKE};
+use ikigai_core::{ArgRef, Capability, EndpointSpace, Error, Kernel, Request, UriTemplate, Verb};
+use ikigai_intray::{
+    space, Outcome, SpaceEndpoint, SpaceReactor, CAP_OUT, CAP_READ, CAP_TAKE, SPACE_TEMPLATE,
+};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -321,4 +323,80 @@ fn a_reactor_dead_letters_a_file_that_is_not_its_tuple() {
         "{outcomes:?}"
     );
     assert_eq!(handler.calls(), 0, "the handler never saw the bytes");
+}
+
+/// Identity storage whose first decode stalls: it says `claimed` (the take has renamed the
+/// tuple into `.taking/`) and waits for `resume` before answering.
+struct Stalling {
+    claimed: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    resume: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl ikigai_intray::TupleCodec for Stalling {
+    fn encode(&self, plain: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(plain.to_vec())
+    }
+    fn decode(&self, stored: &[u8]) -> Result<Vec<u8>, String> {
+        if let Some(claimed) = self.claimed.lock().unwrap().take() {
+            claimed.send(()).unwrap();
+            let resume = self.resume.lock().unwrap().take().unwrap();
+            resume.recv().unwrap();
+        }
+        Ok(stored.to_vec())
+    }
+}
+
+/// Ledger #2813: a take that stalls past the claim window after its rename (a slow codec, a
+/// stopped process, the wall clock stepping forward) has its claim requeued by the next rd or
+/// take, and a second taker gets the tuple. The stalled take must then not deliver it too.
+///
+/// Five minutes pass the documented way ([`TAKING_DIR`](ikigai_intray::TAKING_DIR): a claim's
+/// age is the `millis` in its name): the live claim is renamed to one 10 minutes old. The
+/// stalled take's own claim path is gone afterwards, exactly as when the requeue moves it.
+#[test]
+fn a_take_stalled_past_the_claim_window_does_not_deliver_twice() {
+    let root = scratch("stalled-take");
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let stalling = Stalling {
+        claimed: Mutex::new(Some(claimed_tx)),
+        resume: Mutex::new(Some(resume_rx)),
+    };
+    let slow = Arc::new(Kernel::new(Arc::new(EndpointSpace::new().bind(
+        UriTemplate::parse(SPACE_TEMPLATE).unwrap(),
+        SpaceEndpoint::new(root.clone()).with_codec(Arc::new(stalling)),
+    ))));
+    let other = Kernel::new(Arc::new(space(root.clone())));
+    let id = drop_tuple(&other, &all(), "urn:space:jobs", b"once only").unwrap();
+
+    let first = {
+        let (slow, id) = (Arc::clone(&slow), id.clone());
+        std::thread::spawn(move || take(&slow, "urn:space:jobs", &[("tuple", &id)]))
+    };
+    claimed_rx.recv().unwrap();
+    let taking = root.join("jobs/.taking");
+    let live: Vec<_> = std::fs::read_dir(&taking)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(live.len(), 1, "the stalled take holds one claim: {live:?}");
+    std::fs::rename(
+        &live[0],
+        taking.join(claim_name(&id, Duration::from_secs(600))),
+    )
+    .unwrap();
+
+    // The window has passed: another take requeues the claim and gets the tuple.
+    let second = take(&other, "urn:space:jobs", &[("tuple", &id)]);
+    resume_tx.send(()).unwrap();
+    let first = first.join().unwrap();
+
+    let delivered = [&first, &second].iter().filter(|r| r.is_ok()).count();
+    assert_eq!(
+        delivered, 1,
+        "one tuple, one delivery; stalled take: {first:?}, second take: {second:?}"
+    );
+    assert_eq!(second.unwrap(), b"once only");
+    let err = first.unwrap_err().to_string();
+    assert!(err.contains(&id) && err.contains("inbox"), "{err}");
 }
