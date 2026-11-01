@@ -1120,6 +1120,57 @@ fn withdraw_note(dir: &Path, id: &str, ext: &str) {
     }
 }
 
+/// Hold the note at `<dir>/<id>.<ext>` by a second name of the caller's own (a hard link
+/// under a [`staging_name`]), so that [`clear_held_note`] can later remove that note and
+/// never one placed after it. `None` when there is no note to hold.
+fn hold_note(dir: &Path, id: &str, ext: &str) -> Option<PathBuf> {
+    let held = dir.join(staging_name(id, &format!("{ext}-held")));
+    std::fs::hard_link(dir.join(format!("{id}.{ext}")), &held)
+        .ok()
+        .map(|()| held)
+}
+
+/// Remove the note [`hold_note`] held, and only that note: `<dir>/<id>.<ext>` goes only while
+/// it is still the same file as `held`. A note placed since ([`place_note`] renames a new
+/// file over the name) belongs to the pass that placed it and stays (ledger #2812).
+///
+/// The note is first taken by a rename to a name of this call's own, and is put back if it
+/// turns out to be a newer one, so a note placed between the check and the take is not lost
+/// either: it is put back unless a newer one still has taken the name meanwhile.
+fn clear_held_note(dir: &Path, id: &str, ext: &str, held: &Path) {
+    let note = dir.join(format!("{id}.{ext}"));
+    if same_file(&note, held) {
+        let taken = dir.join(staging_name(id, &format!("{ext}-taken")));
+        if std::fs::rename(&note, &taken).is_ok() {
+            if !same_file(&taken, held) {
+                // `hard_link` refuses an existing name: a newer note is never replaced.
+                let _ = std::fs::hard_link(&taken, &note);
+            }
+            let _ = std::fs::remove_file(&taken);
+        }
+    }
+    let _ = std::fs::remove_file(held);
+}
+
+/// Whether two paths name the same file (the same inode on unix). False when either is
+/// missing.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (a.dev(), a.ino()) == (b.dev(), b.ino())
+    }
+    // No stable file identity in std off unix: a note is written once and never modified,
+    // so two different notes are told apart by their size and modification time.
+    #[cfg(not(unix))]
+    {
+        (a.len(), a.modified().ok()) == (b.len(), b.modified().ok())
+    }
+}
+
 // The test seam for ledger #1595: called on the thread that moved a tuple into a stage, the
 // moment the move lands, so a test can look at the stage exactly as a racing reader would.
 #[cfg(test)]
@@ -1476,16 +1527,31 @@ impl Endpoint for SpaceEndpoint {
                     self.modes.create_dir_all(&inbox).map_err(|e| {
                         Error::Endpoint(format!("space `{name}`: create inbox: {e}"))
                     })?;
-                    std::fs::rename(
+                    // ★ The stale note is held by a name of the retry's OWN before the tuple
+                    // moves (ledger #2812): once the tuple is back in the inbox a reactor can
+                    // claim it, fail it again and place a NEW note at `<id>.err` before this
+                    // goes on, and clearing that name then removed the fresh dead letter's
+                    // note. See [`hold_note`].
+                    let held = hold_note(&from, id, "err");
+                    if std::fs::rename(
                         from.join(format!("{id}.tuple")),
                         inbox.join(format!("{id}.tuple")),
                     )
-                    .map_err(|_| {
-                        Error::NotFound(format!("no dead-lettered tuple `{id}` in space `{name}`"))
-                    })?;
+                    .is_err()
+                    {
+                        if let Some(held) = held {
+                            let _ = std::fs::remove_file(held);
+                        }
+                        return Err(Error::NotFound(format!(
+                            "no dead-lettered tuple `{id}` in space `{name}`"
+                        )));
+                    }
+                    staged(&inbox, id);
                     // Only after the tuple is safely back: a stale note beside no tuple
                     // would read as a failure that never happened.
-                    let _ = std::fs::remove_file(from.join(format!("{id}.err")));
+                    if let Some(held) = held {
+                        clear_held_note(&from, id, "err", &held);
+                    }
                     return Ok(Representation::new(
                         ReprType::new("text/plain"),
                         format!("{id}\n").into_bytes(),
@@ -3585,6 +3651,82 @@ mod tests {
         )
         .expect_err("nothing to retry");
         assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
+
+    /// Ledger #2812: a reactor pass that claims a re-armed tuple the moment `retry=` puts it
+    /// back, and fails it again, keeps its fresh `.err` note. The retry used to clear the old
+    /// note by NAME after the tuple moved, so when the pass settled in between, the retry
+    /// removed the new note and the fresh dead letter read "(no .err note)".
+    #[test]
+    fn a_retry_never_clears_the_note_of_a_pass_that_failed_after_it() {
+        let root = reactive_root("retry-race", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![
+            CAP_OUT.to_string(),
+            CAP_READ.to_string(),
+            CAP_RETRY.to_string(),
+        ]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+        let failing = Arc::new(SpaceReactor::new(
+            root.clone(),
+            Arc::new(MockResolver::new(false)),
+            Capability::scoped(vec!["urn:cap:demo".to_string()]),
+        ));
+        assert!(matches!(failing.drain("jobs")[0].1, Outcome::Errored(_)));
+        let error = root.join("jobs").join("error");
+        std::fs::write(error.join(format!("{id}.err")), "the first failure").unwrap();
+
+        // The instant the retry has put the tuple back in the inbox, a reactor pass on
+        // ANOTHER thread claims it, fails it again and settles it, before the retry goes on.
+        let pass = Arc::clone(&failing);
+        let passes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = std::rc::Rc::clone(&passes);
+        ON_STAGED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |dir: &Path, id: &str| {
+                if dir.file_name().and_then(|n| n.to_str()) == Some(INBOX_DIR) {
+                    let (pass, id) = (Arc::clone(&pass), id.to_string());
+                    let outcome = std::thread::spawn(move || pass.process("jobs", &id))
+                        .join()
+                        .unwrap();
+                    record.borrow_mut().push(outcome);
+                }
+            }));
+        });
+        let retried = block_on(
+            k.issue(
+                Request::new(Verb::Sink, iri("urn:space:jobs"))
+                    .with_arg("retry", ArgRef::Inline(id.as_bytes().to_vec())),
+                &cap,
+            ),
+        );
+        ON_STAGED.with(|hook| *hook.borrow_mut() = None);
+        retried.expect("the retry re-arms the dead letter");
+        assert!(
+            matches!(passes.borrow().as_slice(), [Outcome::Errored(_)]),
+            "the racing pass failed the re-armed tuple: {:?}",
+            passes.borrow()
+        );
+
+        assert!(
+            error.join(format!("{id}.tuple")).exists(),
+            "dead-lettered again"
+        );
+        let note = std::fs::read_to_string(error.join(format!("{id}.err")))
+            .expect("the fresh dead letter keeps the note its own pass wrote");
+        assert_ne!(
+            note, "the first failure",
+            "and it is the new note, not the stale one"
+        );
+        let mut left: Vec<String> = std::fs::read_dir(&error)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![format!("{id}.err"), format!("{id}.tuple")],
+            "nothing held is left"
+        );
     }
 
     #[test]
