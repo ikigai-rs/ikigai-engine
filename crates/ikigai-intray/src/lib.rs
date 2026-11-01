@@ -138,8 +138,9 @@ pub const DROPPING_DIR: &str = ".dropping";
 /// milliseconds since the unix epoch, the taker's process id, and a per-process counter, so no
 /// two takers ever share one. A claim more than five minutes old by its `millis` is a taker that
 /// stopped between its claim and its read, and the next `rd` or `take` in the space puts it
-/// back in the inbox under its id. So `millis` = 1 (1970) plants a stale claim, which is how a
-/// test reproduces a crashed take:
+/// back in the inbox under its id. A taker that was only stalled and comes back after that
+/// answers an error, never the tuple: a take delivers only if it removes its own claim. So
+/// `millis` = 1 (1970) plants a stale claim, which is how a test reproduces a crashed take:
 ///
 /// ```
 /// use ikigai_core::{Capability, Iri, Kernel, Request, Verb};
@@ -569,7 +570,9 @@ impl SpaceEndpoint {
     /// the inbox (best effort) before the error returns, so a failed take is a failed take,
     /// never a lost tuple. The decoded tuple is what [`Claim::Taken`] carries. A claim left behind by
     /// a taker that died between the rename and the read is requeued by
-    /// [`requeue_stale_claims`](SpaceEndpoint::requeue_stale_claims).
+    /// [`requeue_stale_claims`](SpaceEndpoint::requeue_stale_claims), and so may one whose
+    /// taker is still alive but stalled past [`STALE_CLAIM`]: that take then answers `Err`
+    /// rather than deliver a tuple the requeue gave back.
     fn claim(&self, name: &str, id: &str) -> Result<Claim> {
         if !is_tuple_id(id) {
             return Err(Error::InvalidArgument {
@@ -609,7 +612,27 @@ impl SpaceEndpoint {
                 return Err(e);
             }
         };
-        let _ = std::fs::remove_file(&staged);
+        // ★ Removing the claim is what consumes the tuple, so it is delivered only if this
+        // take removed it (ledger #2813). A take held past [`STALE_CLAIM`] (a slow codec, a
+        // stopped process, the wall clock stepping forward) may have had its claim requeued
+        // and taken again; the requeue renames this same unique name, so exactly one of the
+        // two finds it. A claim that could not be removed for any other reason stays in
+        // `.taking/` and is requeued later, so it is not delivered now either.
+        if let Err(e) = std::fs::remove_file(&staged) {
+            let why = match e.kind() {
+                std::io::ErrorKind::NotFound => format!(
+                    "the take of tuple `{id}` held its claim past {} s, so it was put back \
+                     in the inbox; take it again",
+                    STALE_CLAIM.as_secs()
+                ),
+                _ => format!(
+                    "the take of tuple `{id}` could not remove its claim ({e}); it goes \
+                     back to the inbox after {} s",
+                    STALE_CLAIM.as_secs()
+                ),
+            };
+            return Err(Error::Endpoint(format!("space `{name}`: {why}")));
+        }
         Ok(Claim::Taken(plain))
     }
 
@@ -992,7 +1015,9 @@ pub struct Resettled {
 }
 
 /// How old a claim in [`TAKING_DIR`] must be before it counts as abandoned. A live take holds
-/// its claim for one file read; five minutes is several orders of magnitude past that.
+/// its claim for one file read and decode; five minutes is several orders of magnitude past
+/// that. A take that overruns it is not delivered twice: it consumes its tuple only by removing
+/// its own claim, which the requeue would have moved first (ledger #2813).
 const STALE_CLAIM: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// What a take's claim found.
