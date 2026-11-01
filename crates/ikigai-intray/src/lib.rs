@@ -108,8 +108,10 @@ pub const CAP_TAKE: &str = "urn:cap:space:take";
 pub const CAP_RETRY: &str = "urn:cap:space:retry";
 
 /// Where a [`SpaceReactor`] stages a tuple it has claimed for a pass:
-/// `<root>/<space>/.processing/<id>.tuple`, renamed to `outbox` or `error` when the pass
-/// settles. `rd state=processing` reads it.
+/// `<root>/<space>/.processing/{id}.{millis}.{pid}.{n}.claim`, a name of that pass's own (as
+/// a take's claim in [`TAKING_DIR`] is), renamed to `outbox` or `error` when the pass
+/// settles. `rd state=processing` reads it by its id, as does recovery; a claim staged as
+/// `<id>.tuple`, by a reactor from before these names, is read the same way.
 ///
 /// Public because it is a stage of the queue like the other three, and anything that
 /// COUNTS a space's queue must count it: a tuple here is neither waiting nor done, and a
@@ -734,8 +736,9 @@ impl SpaceEndpoint {
                 .encode(plain)
                 .map_err(|why| Error::Endpoint(format!("space `{name}`: re-encode `{id}`: {why}")))
         };
-        // (stage, old id, new id, stored bytes): old == new is a corrupt tuple, kept in place.
-        let mut tuples: Vec<(&'static str, String, String, Vec<u8>)> = Vec::new();
+        // (stage, old id, new id, old file, stored bytes): old == new is a corrupt tuple, kept
+        // in place. The old file is `{old}.tuple`, or a reactor's claim in `.processing/`.
+        let mut tuples: Vec<(&'static str, String, String, String, Vec<u8>)> = Vec::new();
         // (stage, tuple id, stored bytes) of an `.out` note.
         let mut notes: Vec<(&'static str, String, Vec<u8>)> = Vec::new();
         for stage in [ERROR_DIR, OUTBOX_DIR, PROCESSING_DIR] {
@@ -754,10 +757,18 @@ impl SpaceEndpoint {
             }
             files.sort();
             for file in files {
-                let (id, is_tuple) = match (file.strip_suffix(".tuple"), file.strip_suffix(".out"))
-                {
-                    (Some(id), _) => (id, true),
-                    (_, Some(id)) => (id, false),
+                let claim = match stage {
+                    PROCESSING_DIR => parse_staging_name(&file, "claim").map(|(id, _)| id),
+                    _ => None,
+                };
+                let (id, is_tuple) = match (
+                    &claim,
+                    file.strip_suffix(".tuple"),
+                    file.strip_suffix(".out"),
+                ) {
+                    (Some(id), _, _) => (id.as_str(), true),
+                    (_, Some(id), _) => (id, true),
+                    (_, _, Some(id)) => (id, false),
                     _ => continue,
                 };
                 if !is_tuple_id(id) {
@@ -780,7 +791,7 @@ impl SpaceEndpoint {
                         id.to_string() // held as corrupt: rewritten in place, keeping its name
                     };
                     if new != id || !hashes_to(&stored, id) {
-                        tuples.push((stage, id.to_string(), new, again));
+                        tuples.push((stage, id.to_string(), new, file.clone(), again));
                     }
                 } else {
                     let plain = self.codec.decode(&stored).map_err(|why| {
@@ -795,11 +806,12 @@ impl SpaceEndpoint {
         let mut done = Vec::new();
         // Where each moved tuple's notes went, so a re-encoded `.out` note follows its tuple.
         let mut renamed = std::collections::HashMap::new();
-        for (stage, old, new, stored) in tuples {
+        for (stage, old, new, was, stored) in tuples {
             let dir = self.root.join(name).join(stage);
             self.replace(&dir, &new, "tuple", &stored)
                 .map_err(|e| io(&format!("{stage}/{new}.tuple"), e))?;
-            if new != old {
+            // A claim is stored again as `{new}.tuple`, which recovery reads the same way.
+            if new != old || was != format!("{new}.tuple") {
                 for ext in ["err", "out"] {
                     let from = dir.join(format!("{old}.{ext}"));
                     match std::fs::rename(&from, dir.join(format!("{new}.{ext}"))) {
@@ -808,16 +820,16 @@ impl SpaceEndpoint {
                         Err(e) => return Err(io(&format!("{stage}/{old}.{ext}"), e)),
                     }
                 }
-                match std::fs::remove_file(dir.join(format!("{old}.tuple"))) {
+                match std::fs::remove_file(dir.join(&was)) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(io(&format!("{stage}/{old}.tuple"), e)),
+                    Err(e) => return Err(io(&format!("{stage}/{was}"), e)),
                 }
                 renamed.insert((stage, old.clone()), new.clone());
             }
             done.push(Resettled {
                 stage,
-                was: format!("{old}.tuple"),
+                was,
                 now: format!("{new}.tuple"),
             });
         }
@@ -970,10 +982,12 @@ pub struct Reencoded {
 pub struct Resettled {
     /// The stage it is in: [`ERROR_DIR`], [`OUTBOX_DIR`] or [`PROCESSING_DIR`].
     pub stage: &'static str,
-    /// Its file name before: `{id}.tuple`, or `{id}.out` for a note.
+    /// Its file name before: `{id}.tuple`, `{id}.out` for a note, or a reactor's claim name
+    /// in [`PROCESSING_DIR`].
     pub was: String,
     /// Its file name now. A moved tuple's is `{new}.tuple`, and its notes moved with it; a
-    /// tuple held as corrupt, or a note of a tuple that did not move, keeps its name.
+    /// tuple held as corrupt, or a note of a tuple that did not move, keeps its name, except
+    /// that a claim is always stored again as `{new}.tuple`.
     pub now: String,
 }
 
@@ -1035,6 +1049,30 @@ fn parse_staging_name(file: &str, suffix: &str) -> Option<(String, std::time::Sy
         id.to_string(),
         std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis),
     ))
+}
+
+/// The reactor claims in a space's [`PROCESSING_DIR`], `dir`: `(tuple id, file)` for each,
+/// in file-name order, so two passes of the same id are listed twice. A claim is named by
+/// [`staging_name`] (`.claim`), or `<id>.tuple` by a reactor from before those names.
+fn list_claims(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new(); // nothing has ever been claimed here
+    };
+    let mut files: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .collect();
+    files.sort();
+    files
+        .into_iter()
+        .filter_map(|file| {
+            let id = match parse_staging_name(&file, "claim") {
+                Some((id, _)) => id,
+                None => file.strip_suffix(".tuple")?.to_string(),
+            };
+            Some((id, dir.join(file)))
+        })
+        .collect()
 }
 
 /// Do these bytes hash to this tuple id? Every reader checks before it trusts a tuple: the id
@@ -1490,6 +1528,22 @@ impl Endpoint for SpaceEndpoint {
                 // `state=` selects which stage of the machine to read: the live `inbox`
                 // (default), or the reactor's `outbox` (handled) / `error` (dead-letter).
                 let dir = self.state_dir(name, opt_str(inv, "state")?.unwrap_or("inbox"))?;
+                // A stage's tuples by id, and the file each is in: `<id>.tuple`, except in
+                // `.processing/`, where a pass's claim has a name of its own ([`list_claims`]).
+                let in_flight = dir.ends_with(PROCESSING_DIR);
+                let tuples = move |dir: &Path| -> Vec<(String, PathBuf)> {
+                    if !in_flight {
+                        let ids = Self::list_ids(dir).into_iter();
+                        return ids
+                            .map(|id| (id.clone(), dir.join(format!("{id}.tuple"))))
+                            .collect();
+                    }
+                    let mut seen = std::collections::HashSet::new();
+                    let mut claims = list_claims(dir);
+                    claims.retain(|(id, _)| seen.insert(id.clone()));
+                    claims.sort_by(|a, b| a.0.cmp(&b.0));
+                    claims
+                };
                 if let Some(id) = opt_str(inv, "tuple")? {
                     if !is_tuple_id(id) {
                         return Err(Error::InvalidArgument {
@@ -1497,7 +1551,15 @@ impl Endpoint for SpaceEndpoint {
                             detail: "a tuple id is a content hash".to_string(),
                         });
                     }
-                    let bytes = std::fs::read(dir.join(format!("{id}.tuple"))).map_err(|_| {
+                    let file = match in_flight {
+                        false => dir.join(format!("{id}.tuple")),
+                        true => tuples(&dir)
+                            .into_iter()
+                            .find(|(held, _)| held == id)
+                            .map(|(_, file)| file)
+                            .unwrap_or_default(),
+                    };
+                    let bytes = std::fs::read(file).map_err(|_| {
                         Error::NotFound(format!("no tuple `{id}` in space `{name}`"))
                     })?;
                     if !hashes_to(&bytes, id) {
@@ -1524,11 +1586,11 @@ impl Endpoint for SpaceEndpoint {
                         query,
                         move |template, token| {
                             let mut hits = Vec::new();
-                            for id in Self::list_ids(&dir) {
+                            for (id, file) in tuples(&dir) {
                                 if token.is_cancelled() {
                                     return Err(canceled());
                                 }
-                                if let Ok(bytes) = std::fs::read(dir.join(format!("{id}.tuple"))) {
+                                if let Ok(bytes) = std::fs::read(file) {
                                     // A file that is not the tuple its name says never matches.
                                     if !hashes_to(&bytes, &id) {
                                         continue;
@@ -1552,7 +1614,12 @@ impl Endpoint for SpaceEndpoint {
                     // The tuple ids, one per line (the newline-list `..` map convention).
                     Ok(Representation::new(
                         ReprType::new("text/plain").with_param("charset", "utf-8"),
-                        Self::list_ids(&dir).join("\n").into_bytes(),
+                        tuples(&dir)
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                            .into_bytes(),
                     ))
                 }
             }
@@ -2144,8 +2211,7 @@ impl SpaceReactor {
         let mut recovered = Vec::new();
         for name in names {
             let staging = self.root.join(&name).join(PROCESSING_DIR);
-            for id in SpaceEndpoint::list_ids(&staging) {
-                let claimed = staging.join(format!("{id}.tuple"));
+            for (id, claimed) in list_claims(&staging) {
                 let outcome = match self.interrupted {
                     Interrupted::DeadLetter => {
                         let note = interrupted_note(&name, &id);
@@ -2569,6 +2635,14 @@ impl SpaceReactor {
     /// Atomically claim a tuple by renaming it out of the inbox into a private `.processing`
     /// dir (the same compare-and-swap as the endpoint's `take`). `Ok(None)` if it's already
     /// gone — another pass won the race.
+    ///
+    /// ★ The claim is staged under a name of this pass's OWN ([`staging_name`], `.claim`),
+    /// as a take's is. It used to be `.processing/<id>.tuple`, shared by every pass of that
+    /// id, and the pass lock is per reactor: with two reactors over one root and an identical
+    /// re-drop (a new request) claimed while the first pass ran, the second claim renamed over
+    /// the first one's staged file, the first settle moved the second pass's tuple, and the
+    /// second settle failed its move and withdrew its own note. A failed pass left no dead
+    /// letter and the tuple read as handled (ledger #2786). Now each settle moves its own file.
     fn claim(&self, name: &str, id: &str) -> std::result::Result<Option<PathBuf>, String> {
         let src = self
             .root
@@ -2577,7 +2651,7 @@ impl SpaceReactor {
             .join(format!("{id}.tuple"));
         let staging = self.root.join(name).join(PROCESSING_DIR);
         std::fs::create_dir_all(&staging).map_err(|e| format!("staging: {e}"))?;
-        let staged = staging.join(format!("{id}.tuple"));
+        let staged = staging.join(staging_name(id, "claim"));
         match std::fs::rename(&src, &staged) {
             Ok(()) => Ok(Some(staged)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -3753,7 +3827,7 @@ mod tests {
     fn interrupt(root: &Path, space_name: &str, id: &str) -> PathBuf {
         let staging = root.join(space_name).join(".processing");
         std::fs::create_dir_all(&staging).unwrap();
-        let staged = staging.join(format!("{id}.tuple"));
+        let staged = staging.join(staging_name(id, "claim"));
         std::fs::rename(
             root.join(space_name)
                 .join("inbox")

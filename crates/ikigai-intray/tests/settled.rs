@@ -448,3 +448,29 @@ mod modes {
         assert_eq!(mode(&inbox), mode(&inbox.join("witness-dir")));
     }
 }
+
+/// A reactor's claim in `.processing/` has a name of its pass's own (ledger #2786), and a
+/// stranded one is stored again like the legacy `<id>.tuple`, as `{new}.tuple`.
+#[test]
+fn a_claim_in_processing_is_stored_again_under_its_new_id() {
+    let root = scratch("settled-claim");
+    let stored = sealed(1, b"running");
+    let id = tuple_id(&stored);
+    let dir = stage(&root, PROCESSING_DIR);
+    std::fs::create_dir_all(&dir).unwrap();
+    let claim = format!("{id}.1.0.0.claim");
+    std::fs::write(dir.join(&claim), &stored).unwrap();
+
+    let moved = space(&root, 2).reencode_settled("jobs").unwrap();
+
+    let new = tuple_id(&sealed(2, b"running"));
+    let names: Vec<_> = moved
+        .iter()
+        .map(|r| (r.stage, r.was.clone(), r.now.clone()))
+        .collect();
+    assert_eq!(names, vec![(PROCESSING_DIR, claim, format!("{new}.tuple"))]);
+    assert_eq!(
+        tree(&root).keys().cloned().collect::<Vec<_>>(),
+        vec![format!("jobs/{PROCESSING_DIR}/{new}.tuple")]
+    );
+}

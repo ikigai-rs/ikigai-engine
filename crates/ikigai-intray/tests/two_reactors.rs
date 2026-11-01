@@ -116,7 +116,10 @@ fn two_reactors_over_one_root_keep_each_passs_record() {
     wait_for(|| slow.started.load(Ordering::SeqCst));
 
     // The same bytes again, while A is mid-pass: a new request, and B takes it.
-    assert_eq!(drop_tuple(&k, &out, "urn:space:jobs", b"book me").unwrap(), id);
+    assert_eq!(
+        drop_tuple(&k, &out, "urn:space:jobs", b"book me").unwrap(),
+        id
+    );
     assert_eq!(b.process("jobs", &id), Outcome::Handled);
 
     slow.go.store(true, Ordering::SeqCst);
@@ -141,6 +144,8 @@ fn two_reactors_over_one_root_keep_each_passs_record() {
         !at(OUTBOX_DIR, "tuple").exists(),
         "the tuple reads as handled although its last pass failed"
     );
-    let processing = std::fs::read_dir(root.join("jobs/.processing")).unwrap().count();
+    let processing = std::fs::read_dir(root.join("jobs/.processing"))
+        .unwrap()
+        .count();
     assert_eq!(processing, 0, "a claim was left behind");
 }
