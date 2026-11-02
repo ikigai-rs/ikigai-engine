@@ -2471,8 +2471,11 @@ impl SpaceReactor {
 
     /// Process every pending tuple in a space's inbox — the startup catch-up pass, and the
     /// deterministic entry the live watcher and the tests both drive. Returns each
-    /// `(tuple id, outcome)`.
+    /// `(tuple id, outcome)`. A name that the endpoint refuses returns an empty list.
     pub fn drain(&self, name: &str) -> Vec<(String, Outcome)> {
+        if name.contains('.') || !ikigai_resolve::is_plain_file_name(name) {
+            return Vec::new();
+        }
         // Before listing, so a REQUEUED interrupted tuple is in the list. The first call is
         // the startup recovery; later ones recover what a crashed SIBLING left, once it is
         // the only reactor left over the root.
@@ -2493,7 +2496,11 @@ impl SpaceReactor {
     }
 
     /// Process ONE tuple: claim it, fire the handler, move it to `outbox`/`error`.
+    /// A name that the endpoint refuses returns [`Outcome::Skipped`].
     pub fn process(&self, name: &str, id: &str) -> Outcome {
+        if name.contains('.') || !ikigai_resolve::is_plain_file_name(name) {
+            return Outcome::Skipped("invalid space name");
+        }
         // Before this reactor's first claim, whichever entry point makes it.
         let _ = self.recover_interrupted();
         let handler = match self.handler_target(name) {
