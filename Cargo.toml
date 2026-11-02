@@ -60,7 +60,12 @@ members = ["crates/*"]
 # 0.2.12 (ledger #2667): take vocab 0.2.9's fixed fork binding shapes, so a later
 # step can cite a fork's join through plan-eval and a bound name; and (ledger #2660) a
 # mounted peer's answer reports the `mounted` uncached reason, on core 0.2.9. A patch.
-version = "0.2.12"
+# 0.2.13 (ledger #2886, the engine half of #2437): `Engine::set_piped_input_probed_for` hands
+# the host's stdin reader the NAME of the argument it will fill (`content` for a sink or a
+# delete, the routed argument for a `source` stage), so an idle-stdin hint can name it. The
+# older setters are unchanged. Also carries the fixes merged since 0.2.12 (PRs 28 to 32).
+# Additive: a patch.
+version = "0.2.13"
 edition = "2021"
 # Measured 2026-10-26, not assumed: 1.89 is the first toolchain that builds the workspace.
 # `ikigai-intray` takes the lease with `std::fs::File::try_lock` (stable in 1.89; 1.88 refuses
@@ -133,7 +138,7 @@ ikigai-fs = "0.2.2"
 # 0.3.4 is a SECURITY floor (ledger #1326) and 0.3.6 was cli's pin. 0.5.0 is the newest
 # release and the one on core 0.2 (ledger #2349). `"0.5.0"` is `<0.6.0`.
 ikigai-shacl = "0.5.0"
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.2.12" }
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.2.13" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face, reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins

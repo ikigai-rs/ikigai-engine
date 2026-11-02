@@ -378,11 +378,18 @@ enum PipedInput {
     /// The second field, when present, answers WITHOUT reading whether stdin is already at
     /// its end having offered nothing (`/dev/null`, a closed empty pipe, a file read to its
     /// end). See [`Engine::set_piped_input_probed`].
-    Deferred(
-        Box<dyn FnOnce() -> Option<Vec<u8>>>,
-        Option<Box<dyn Fn() -> bool>>,
-    ),
+    ///
+    /// The reader is handed the NAME of the argument the bytes will fill (`content` for a
+    /// sink or a delete, the routed argument for a `source` stage), so a host that gives up
+    /// on an idle stdin can say which argument to name instead (ledger #2886).
+    Deferred(StdinReader, Option<StdinProbe>),
 }
+
+/// A deferred stdin reader, handed the name of the argument its bytes will fill.
+type StdinReader = Box<dyn FnOnce(&str) -> Option<Vec<u8>>>;
+
+/// Answers, without reading, whether stdin is already at its end having offered nothing.
+type StdinProbe = Box<dyn Fn() -> bool>;
 
 impl PipedInput {
     /// Whether this stdin may still offer a value: not KNOWN to be empty. A reader with no
@@ -395,11 +402,12 @@ impl PipedInput {
         }
     }
 
-    /// Take the bytes: the ready ones, or whatever the deferred reader finds.
-    fn read(self) -> Option<Vec<u8>> {
+    /// Take the bytes: the ready ones, or whatever the deferred reader finds for `argument`,
+    /// the name of the argument they will fill.
+    fn read(self, argument: &str) -> Option<Vec<u8>> {
         match self {
             PipedInput::Ready(bytes) => Some(bytes),
-            PipedInput::Deferred(read, _) => read(),
+            PipedInput::Deferred(read, _) => read(argument),
         }
     }
 }
@@ -721,7 +729,7 @@ impl Engine {
     /// is when a command has asked for its content.
     pub fn set_piped_input_with(&self, read: impl FnOnce() -> Vec<u8> + 'static) {
         *self.piped_input.borrow_mut() =
-            Some(PipedInput::Deferred(Box::new(move || Some(read())), None));
+            Some(PipedInput::Deferred(Box::new(move |_| Some(read())), None));
     }
 
     /// [`set_piped_input_with`](Self::set_piped_input_with) for a reader that may find stdin
@@ -734,7 +742,8 @@ impl Engine {
     /// `content`, a sink that requires it refuses (nothing is written) and one where it is
     /// optional (a ledger close's note) proceeds as asked.
     pub fn set_piped_input_polled(&self, read: impl FnOnce() -> Option<Vec<u8>> + 'static) {
-        *self.piped_input.borrow_mut() = Some(PipedInput::Deferred(Box::new(read), None));
+        *self.piped_input.borrow_mut() =
+            Some(PipedInput::Deferred(Box::new(move |_| read()), None));
     }
 
     /// [`set_piped_input_polled`](Self::set_piped_input_polled) with a PROBE that answers,
@@ -756,6 +765,22 @@ impl Engine {
     pub fn set_piped_input_probed(
         &self,
         read: impl FnOnce() -> Option<Vec<u8>> + 'static,
+        ended_empty: impl Fn() -> bool + 'static,
+    ) {
+        self.set_piped_input_probed_for(move |_| read(), ended_empty);
+    }
+
+    /// [`set_piped_input_probed`](Self::set_piped_input_probed) whose reader is handed the
+    /// NAME of the argument stdin will fill: `content` for a content-less `sink` or `delete`,
+    /// and for a `source` stage the one required argument the routing rule chose (`in` for
+    /// `urn:fn:toUpper`). A host that gives up on an idle stdin can then tell the user which
+    /// argument to name instead of guessing (ledger #2886, the engine half of #2437).
+    ///
+    /// The reader runs at most once, and only where the request needs the value; the probe
+    /// is as in `set_piped_input_probed`.
+    pub fn set_piped_input_probed_for(
+        &self,
+        read: impl FnOnce(&str) -> Option<Vec<u8>> + 'static,
         ended_empty: impl Fn() -> bool + 'static,
     ) {
         *self.piped_input.borrow_mut() = Some(PipedInput::Deferred(
@@ -1919,7 +1944,7 @@ impl Engine {
             // Take FIRST, then read: a deferred reader may block, and holding the
             // RefCell borrow across that is a deadlock waiting to happen.
             let piped = self.piped_input.borrow_mut().take();
-            match piped.map(PipedInput::read) {
+            match piped.map(|piped| piped.read("content")) {
                 Some(Some(bytes)) => bytes,
                 // An idle stdin: no content at all (see `set_piped_input_polled`).
                 Some(None) => return Ok(request),
@@ -1934,7 +1959,9 @@ impl Engine {
             // costs nothing (the ledger #1088 hazard). An idle stdin sends what a delete
             // without one always sent.
             let piped = self.piped_input.borrow_mut().take();
-            piped.and_then(PipedInput::read).unwrap_or_default()
+            piped
+                .and_then(|piped| piped.read("content"))
+                .unwrap_or_default()
         } else if verb == Verb::Sink {
             // The NARROW quote rule (ledger #1069): a remainder that is one quoted token is
             // unquoted exactly as `content="…"` is; anything else is verbatim.
@@ -2106,7 +2133,7 @@ impl Engine {
         // Take FIRST, then read: a deferred reader may block, and holding the RefCell
         // borrow across that is a deadlock waiting to happen (as in `write_request`).
         let piped = self.piped_input.borrow_mut().take();
-        piped?.read()
+        piped?.read(&name)
     }
 
     /// Build the `Sink` [`Request`] for a `sink <iri> [key=value …]` pipeline
@@ -5188,6 +5215,71 @@ mod tests {
         engine.set_piped_input_probed(|| Some(b"note".to_vec()), || false);
         assert_eq!(run("delete urn:claim"), "content:note");
         assert_eq!(metas.load(Ordering::SeqCst), 1);
+    }
+
+    /// ledger #2886 (the engine half of #2437): the host's deferred reader is handed the
+    /// NAME of the argument stdin will fill, so a host that gives up on an idle stdin can say
+    /// which argument to name instead. Before, the reader took no argument and the cli
+    /// guessed `content=` for every stage, so `sleep 4 | ikigai -c 'source urn:fn:toUpper'`
+    /// told the user to name `content=` and the engine then refused the missing `in`.
+    #[test]
+    fn a_deferred_reader_is_handed_the_argument_it_fills() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let asked: Rc<RefCell<Vec<String>>> = Rc::default();
+        let record = |value: &'static [u8]| {
+            let asked = Rc::clone(&asked);
+            move |argument: &str| {
+                asked.borrow_mut().push(argument.to_string());
+                Some(value.to_vec())
+            }
+        };
+
+        // A source: the one required argument of `urn:test:upper` is `in`.
+        let engine = Engine::new(select_kernel());
+        let run = |engine: &Engine, cmd: &str| match engine.eval(cmd) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        engine.set_piped_input_probed_for(record(b"hi"), || false);
+        assert_eq!(run(&engine, "source urn:test:upper"), "HI");
+        assert_eq!(*asked.borrow(), ["in"]);
+
+        // A content-less top-level sink fills `content`.
+        asked.borrow_mut().clear();
+        let echo = FnEndpoint::new("echo", |inv: &Invocation<'_>| {
+            let body = inv.inline_str("content").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("stored:{body}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("echo")
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("content").summary("the body"))
+                .output("text/plain"),
+        );
+        let sinks = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:echo"), echo)),
+            Arc::new(JsonRenderer),
+        ));
+        sinks.set_piped_input_probed_for(record(b"body"), || false);
+        assert_eq!(run(&sinks, "sink urn:echo"), "stored:body");
+        assert_eq!(*asked.borrow(), ["content"]);
+
+        // A content-less delete whose contract declares `content` (ledger #1230) fills it too.
+        asked.borrow_mut().clear();
+        let deletes = Engine::new(delete_probe_kernel());
+        deletes.set_piped_input_probed_for(record(b"note"), || false);
+        assert_eq!(run(&deletes, "delete urn:claim"), "content:note");
+        assert_eq!(*asked.borrow(), ["content"]);
+
+        // The old setters still compile and still read, ignoring the name.
+        let engine = Engine::new(select_kernel());
+        engine.set_piped_input_probed(|| Some(b"hi".to_vec()), || false);
+        assert_eq!(run(&engine, "source urn:test:upper"), "HI");
     }
 
     /// ledger #1272: `printf q | ikigai --mount "urn:gk:=…" -c 'source urn:gk:nl:sparql:check
