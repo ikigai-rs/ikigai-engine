@@ -25,7 +25,8 @@ blake3 = "1"
 # in the build graph via ikigai-sparql; the space is embedded-only — nothing serves it over
 # the wire — so the heavy Oxigraph dependency is acceptable here. (The crate itself has been
 # published since 0.1.14; it was `publish = false` until #296.)
-oxigraph = "0.5"
+# Matching uses only Store::new() (in memory); persistent stores are the host's choice.
+oxigraph = { version = "0.5", default-features = false }
 # The `match=` template is parsed to ALGEBRA so a `SERVICE` clause can be refused wherever it
 # hides (a `FILTER EXISTS`, an `OPTIONAL`, a sub-select) rather than by scanning text (audit
 # round 5, ledger #877); the walk itself is `ikigai_store::service::refuse_service`, which takes
