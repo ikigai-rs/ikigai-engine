@@ -128,6 +128,8 @@ fn config_home_from(
 }
 
 /// The stored value of `key`, or `None` if the file or key is absent.
+// ambient: fs: reads the person's own REPL settings (config.toml in the config home the host named), for the `config` command and the TUI; no endpoint reaches it; a config-home resource read under ledger #2400
+#[allow(clippy::disallowed_methods)]
 pub fn get(key: &str) -> Option<String> {
     let text = std::fs::read_to_string(path()?).ok()?;
     value_for(&text, key)
@@ -135,6 +137,8 @@ pub fn get(key: &str) -> Option<String> {
 
 /// Persist `key = value`, creating the config directory and file as needed and
 /// preserving any other lines. Returns the path written.
+// ambient: fs: writes the person's own REPL settings (config.toml in the config home the host named), only from the `config` command they typed; no endpoint reaches it; a config-home resource write under ledger #2400
+#[allow(clippy::disallowed_methods)]
 pub fn set(key: &str, value: &str) -> std::io::Result<PathBuf> {
     let path = path().ok_or_else(|| {
         std::io::Error::new(
