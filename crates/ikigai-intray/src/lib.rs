@@ -57,7 +57,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod disk;
-use disk::Modes;
+use disk::{Modes, Rel, Root};
 
 /// The tuplespace URI template: `urn:space:{name}` — the `{name}` is the space's identity.
 pub const SPACE_TEMPLATE: &str = "urn:space:{name}";
@@ -377,15 +377,19 @@ fn is_tuple_id(id: &str) -> bool {
 
 /// A directory-backed tuplespace. Each named space is `<root>/<name>/inbox/`, and a tuple is
 /// a `<blake3>.tuple` file in it.
+///
+/// Nothing outside `root` is ever reached: every path is a list of single names below it, and
+/// no symbolic link below it is followed (ledger #2875). A space, a stage or a tuple file that
+/// is a link reads as absent; a take that claims a linked tuple moves the link, unread, to
+/// `error/` beside a note saying so. The root itself may be a link.
 pub struct SpaceEndpoint {
-    root: PathBuf,
+    /// The root, and the only door to the disk ([`disk`]).
+    root: Root,
     /// The time budget every `match=` runs within, shared by every space under this root (and
     /// by every clone of it), so its overdue cap bounds the whole mount (ledger #1327).
     budget: EvaluationBudget,
     /// How a tuple is stored at rest (see [`TupleCodec`]).
     codec: Arc<dyn TupleCodec>,
-    /// The permissions of what it creates ([`with_modes`](SpaceEndpoint::with_modes)).
-    modes: Modes,
 }
 
 impl SpaceEndpoint {
@@ -393,10 +397,9 @@ impl SpaceEndpoint {
     /// its tuples stored as dropped ([`IdentityCodec`]).
     pub fn new(root: PathBuf) -> Self {
         SpaceEndpoint {
-            root,
+            root: Root::new(root),
             budget: EvaluationBudget::default(),
             codec: Arc::new(IdentityCodec),
-            modes: Modes::default(),
         }
     }
 
@@ -440,23 +443,23 @@ impl SpaceEndpoint {
     /// let _space = SpaceEndpoint::new("/tmp/spaces".into()).with_modes(0o600, 0o700);
     /// ```
     pub fn with_modes(mut self, file: u32, dir: u32) -> Self {
-        self.modes = Modes(Some((file, dir)));
+        self.root = self.root.with_modes(Modes(Some((file, dir))));
         self
     }
 
     /// The inbox directory of a named space. The name is a single segment (validated).
-    fn inbox(&self, name: &str) -> PathBuf {
-        self.root.join(name).join(INBOX_DIR)
+    fn inbox(&self, name: &str) -> Rel {
+        Rel::top().join(name).join(INBOX_DIR)
     }
 
     /// A named stage of the space's state machine: `inbox` (live drops), `processing`
     /// (claimed by a reactor pass that has not settled yet — [`PROCESSING_DIR`]), `outbox`
     /// (handled by the reactor), or `error` (dead-letter). Any other name is rejected —
     /// the stage names are a fixed, inspectable set, not a path.
-    fn state_dir(&self, name: &str, state: &str) -> Result<PathBuf> {
+    fn state_dir(&self, name: &str, state: &str) -> Result<Rel> {
         match state {
-            INBOX_DIR | OUTBOX_DIR | ERROR_DIR => Ok(self.root.join(name).join(state)),
-            "processing" => Ok(self.root.join(name).join(PROCESSING_DIR)),
+            INBOX_DIR | OUTBOX_DIR | ERROR_DIR => Ok(Rel::top().join(name).join(state)),
+            "processing" => Ok(Rel::top().join(name).join(PROCESSING_DIR)),
             other => Err(Error::InvalidArgument {
                 name: "state".to_string(),
                 detail: format!("`{other}` is not a stage (inbox | processing | outbox | error)"),
@@ -466,13 +469,12 @@ impl SpaceEndpoint {
 
     /// The tuple ids currently in a space's inbox, sorted (a deterministic scan order — note
     /// this is id order, not arrival order; a FIFO queue is a later refinement).
-    fn list_ids(inbox: &Path) -> Vec<String> {
-        let mut ids: Vec<String> = match disk::read_dir(inbox) {
+    fn list_ids(root: &Root, inbox: &Rel) -> Vec<String> {
+        let mut ids: Vec<String> = match root.list(inbox) {
             Ok(entries) => entries
                 .filter_map(|e| e.ok())
                 .filter_map(|e| {
-                    e.file_name()
-                        .to_str()
+                    e.name()
                         .and_then(|n| n.strip_suffix(".tuple"))
                         .map(String::from)
                 })
@@ -509,26 +511,32 @@ impl SpaceEndpoint {
             });
         }
         let src = self.inbox(name).join(format!("{id}.tuple"));
-        let staging = self.root.join(name).join(TAKING_DIR);
-        self.modes
+        let staging = Rel::top().join(name).join(TAKING_DIR);
+        self.root
             .create_dir_all(&staging)
             .map_err(|e| Error::Endpoint(format!("space `{name}`: staging: {e}")))?;
         let staged = staging.join(staging_name(id, "claim"));
-        match disk::rename(&src, &staged) {
+        match self.root.rename(&src, &staged) {
             Ok(()) => {}
             // The source is gone — someone else claimed it first (or it never existed).
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Claim::Gone),
             Err(e) => return Err(Error::Endpoint(format!("space `{name}`: take: {e}"))),
         }
-        let bytes = match disk::read(&staged) {
+        let bytes = match self.root.read(&staged) {
             Ok(bytes) => bytes,
+            // A link in the inbox: never read through, so never delivered. It is moved to
+            // `error/` as a link, beside a note saying so, as a file that is not its tuple is.
+            Err(e) if disk::is_refused(&e) => {
+                let why = quarantine(&self.root, name, id, &staged, Unfit::Refused(e));
+                return Ok(Claim::Corrupt(why));
+            }
             Err(e) => {
-                let _ = disk::rename(&staged, &src);
+                let _ = self.root.rename(&staged, &src);
                 return Err(Error::Endpoint(format!("space `{name}`: take read: {e}")));
             }
         };
         if !hashes_to(&bytes, id) {
-            let why = quarantine(&self.root.join(name), id, &staged, self.modes);
+            let why = quarantine(&self.root, name, id, &staged, Unfit::Corrupt);
             return Ok(Claim::Corrupt(why));
         }
         // Decoded BEFORE the claim is removed: a tuple this codec cannot read stays in the
@@ -536,7 +544,7 @@ impl SpaceEndpoint {
         let plain = match decode(self.codec.as_ref(), name, id, &bytes) {
             Ok(plain) => plain,
             Err(e) => {
-                let _ = disk::rename(&staged, &src);
+                let _ = self.root.rename(&staged, &src);
                 return Err(e);
             }
         };
@@ -546,7 +554,7 @@ impl SpaceEndpoint {
         // and taken again; the requeue renames this same unique name, so exactly one of the
         // two finds it. A claim that could not be removed for any other reason stays in
         // `.taking/` and is requeued later, so it is not delivered now either.
-        if let Err(e) = disk::remove_file(&staged) {
+        if let Err(e) = self.root.remove_file(&staged) {
             let why = match e.kind() {
                 std::io::ErrorKind::NotFound => format!(
                     "the take of tuple `{id}` held its claim past {} s, so it was put back \
@@ -598,8 +606,8 @@ impl SpaceEndpoint {
         }
         let inbox = self.inbox(name);
         let mut planned = Vec::new();
-        for id in Self::list_ids(&inbox) {
-            let Ok(stored) = disk::read(inbox.join(format!("{id}.tuple"))) else {
+        for id in Self::list_ids(&self.root, &inbox) {
+            let Ok(stored) = self.root.read(&inbox.join(format!("{id}.tuple"))) else {
                 continue; // taken since it was listed
             };
             if !hashes_to(&stored, &id) || self.codec.is_current(&stored) {
@@ -617,21 +625,21 @@ impl SpaceEndpoint {
         let mut moved = Vec::new();
         for (old, new, stored) in planned {
             let src = inbox.join(format!("{old}.tuple"));
-            let staging = self.root.join(name).join(TAKING_DIR);
-            self.modes
+            let staging = Rel::top().join(name).join(TAKING_DIR);
+            self.root
                 .create_dir_all(&staging)
                 .map_err(|e| Error::Endpoint(format!("space `{name}`: staging: {e}")))?;
             let claimed = staging.join(staging_name(&old, "claim"));
-            match disk::rename(&src, &claimed) {
+            match self.root.rename(&src, &claimed) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // a rival took it
                 Err(e) => return Err(Error::Endpoint(format!("space `{name}`: reencode: {e}"))),
             }
             if let Err(e) = self.publish(name, &new, &stored) {
-                let _ = disk::rename(&claimed, &src);
+                let _ = self.root.rename(&claimed, &src);
                 return Err(e);
             }
-            let _ = disk::remove_file(&claimed);
+            let _ = self.root.remove_file(&claimed);
             moved.push(Reencoded { old, new });
         }
         Ok(moved)
@@ -693,8 +701,8 @@ impl SpaceEndpoint {
         // (stage, tuple id, stored bytes) of an `.out` note.
         let mut notes: Vec<(&'static str, String, Vec<u8>)> = Vec::new();
         for stage in [ERROR_DIR, OUTBOX_DIR, PROCESSING_DIR] {
-            let dir = self.root.join(name).join(stage);
-            let entries = match disk::read_dir(&dir) {
+            let dir = Rel::top().join(name).join(stage);
+            let entries = match self.root.list(&dir) {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(io(stage, e)),
@@ -702,7 +710,7 @@ impl SpaceEndpoint {
             let mut files = Vec::new();
             for entry in entries {
                 let entry = entry.map_err(|e| io(stage, e))?;
-                if let Some(file) = entry.file_name().to_str() {
+                if let Some(file) = entry.name() {
                     files.push(file.to_string());
                 }
             }
@@ -725,7 +733,7 @@ impl SpaceEndpoint {
                 if !is_tuple_id(id) {
                     continue;
                 }
-                let stored = match disk::read(dir.join(&file)) {
+                let stored = match self.root.read(&dir.join(&file)) {
                     Ok(stored) => stored,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(io(&format!("{stage}/{file}"), e)),
@@ -758,20 +766,20 @@ impl SpaceEndpoint {
         // Where each moved tuple's notes went, so a re-encoded `.out` note follows its tuple.
         let mut renamed = std::collections::HashMap::new();
         for (stage, old, new, was, stored) in tuples {
-            let dir = self.root.join(name).join(stage);
+            let dir = Rel::top().join(name).join(stage);
             self.replace(&dir, &new, "tuple", &stored)
                 .map_err(|e| io(&format!("{stage}/{new}.tuple"), e))?;
             // A claim is stored again as `{new}.tuple`, which recovery reads the same way.
             if new != old || was != format!("{new}.tuple") {
                 for ext in ["err", "out"] {
                     let from = dir.join(format!("{old}.{ext}"));
-                    match disk::rename(&from, dir.join(format!("{new}.{ext}"))) {
+                    match self.root.rename(&from, &dir.join(format!("{new}.{ext}"))) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => return Err(io(&format!("{stage}/{old}.{ext}"), e)),
                     }
                 }
-                match disk::remove_file(dir.join(&was)) {
+                match self.root.remove_file(&dir.join(&was)) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(io(&format!("{stage}/{was}"), e)),
@@ -785,7 +793,7 @@ impl SpaceEndpoint {
             });
         }
         for (stage, id, stored) in notes {
-            let dir = self.root.join(name).join(stage);
+            let dir = Rel::top().join(name).join(stage);
             let now = renamed.get(&(stage, id.clone())).unwrap_or(&id).clone();
             self.replace(&dir, &now, "out", &stored)
                 .map_err(|e| io(&format!("{stage}/{now}.out"), e))?;
@@ -801,14 +809,14 @@ impl SpaceEndpoint {
     /// Put `bytes` at `<dir>/<id>.<ext>` whole: written under a staging name of its own in
     /// `dir`, then renamed over whatever is there, so a reader finds the old file or the new
     /// one, never part of either.
-    fn replace(&self, dir: &Path, id: &str, ext: &str, bytes: &[u8]) -> std::io::Result<()> {
+    fn replace(&self, dir: &Rel, id: &str, ext: &str, bytes: &[u8]) -> std::io::Result<()> {
         let tmp = dir.join(staging_name(id, &format!("{ext}-reencode")));
         let placed = self
-            .modes
+            .root
             .write(&tmp, bytes)
-            .and_then(|()| disk::rename(&tmp, dir.join(format!("{id}.{ext}"))));
+            .and_then(|()| self.root.rename(&tmp, &dir.join(format!("{id}.{ext}"))));
         if placed.is_err() {
-            let _ = disk::remove_file(&tmp);
+            let _ = self.root.remove_file(&tmp);
         }
         placed
     }
@@ -838,16 +846,17 @@ impl SpaceEndpoint {
         }
         let mut removed = 0;
         for stage in [DROPPING_DIR, TAKING_DIR] {
-            let dir = self.root.join(name).join(stage);
-            let entries = match disk::read_dir(&dir) {
+            let dir = Rel::top().join(name).join(stage);
+            let entries = match self.root.list(&dir) {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
             for entry in entries {
-                let path = entry?.path();
-                if disk::is_file(&path) {
-                    disk::remove_file(&path)?;
+                let entry = entry?;
+                // A link is removed as a link (never what it points at): the root follows none.
+                if entry.is_file() || entry.is_link() {
+                    self.root.remove_file(&dir.join(entry.os_name()))?;
                     removed += 1;
                 }
             }
@@ -860,24 +869,25 @@ impl SpaceEndpoint {
     /// nothing (see the Sink arm).
     fn publish(&self, name: &str, id: &str, stored: &[u8]) -> Result<()> {
         let inbox = self.inbox(name);
-        self.modes
+        self.root
             .create_dir_all(&inbox)
             .map_err(|e| Error::Endpoint(format!("space `{name}`: create inbox: {e}")))?;
-        let staging = self.root.join(name).join(DROPPING_DIR);
-        self.modes
+        let staging = Rel::top().join(name).join(DROPPING_DIR);
+        self.root
             .create_dir_all(&staging)
             .map_err(|e| Error::Endpoint(format!("space `{name}`: staging: {e}")))?;
         let tmp = staging.join(staging_name(id, "drop"));
         let published = self
-            .modes
+            .root
             .write(&tmp, stored)
             .map_err(|e| Error::Endpoint(format!("space `{name}`: out: {e}")))
             .and_then(|()| {
-                disk::rename(&tmp, inbox.join(format!("{id}.tuple")))
+                self.root
+                    .rename(&tmp, &inbox.join(format!("{id}.tuple")))
                     .map_err(|e| Error::Endpoint(format!("space `{name}`: out publish: {e}")))
             });
         if published.is_err() {
-            let _ = disk::remove_file(&tmp);
+            let _ = self.root.remove_file(&tmp);
         }
         published
     }
@@ -889,13 +899,13 @@ impl SpaceEndpoint {
     /// take in the space. A live take holds its claim for one read, so the age bound only
     /// has to exceed that by a wide margin.
     fn requeue_stale_claims(&self, name: &str) {
-        let staging = self.root.join(name).join(TAKING_DIR);
-        let Ok(entries) = disk::read_dir(&staging) else {
+        let staging = Rel::top().join(name).join(TAKING_DIR);
+        let Ok(entries) = self.root.list(&staging) else {
             return; // nothing has ever been taken here
         };
         let now = wall_clock();
         for entry in entries.filter_map(|e| e.ok()) {
-            let Some(file) = entry.file_name().to_str().map(String::from) else {
+            let Some(file) = entry.name().map(String::from) else {
                 continue;
             };
             let Some((id, claimed_at)) = parse_staging_name(&file, "claim").or_else(|| {
@@ -903,7 +913,7 @@ impl SpaceEndpoint {
                 // the name, and its mtime is the DROP time (rename keeps it), so it is judged
                 // by that, which is never younger than the claim.
                 let id = file.strip_suffix(".tuple")?;
-                let at = entry.metadata().and_then(|m| m.modified()).ok()?;
+                let at = self.root.modified(&staging.join(&file)).ok()?;
                 Some((id.to_string(), at))
             }) else {
                 continue;
@@ -912,8 +922,10 @@ impl SpaceEndpoint {
                 continue;
             }
             let inbox = self.inbox(name);
-            let _ = self.modes.create_dir_all(&inbox);
-            let _ = disk::rename(entry.path(), inbox.join(format!("{id}.tuple")));
+            let _ = self.root.create_dir_all(&inbox);
+            let _ = self
+                .root
+                .rename(&staging.join(&file), &inbox.join(format!("{id}.tuple")));
         }
     }
 }
@@ -1007,13 +1019,13 @@ fn parse_staging_name(file: &str, suffix: &str) -> Option<(String, std::time::Sy
 /// The reactor claims in a space's [`PROCESSING_DIR`], `dir`: `(tuple id, file)` for each,
 /// in file-name order, so two passes of the same id are listed twice. A claim is named by
 /// [`staging_name`] (`.claim`), or `<id>.tuple` by a reactor from before those names.
-fn list_claims(dir: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(entries) = disk::read_dir(dir) else {
+fn list_claims(root: &Root, dir: &Rel) -> Vec<(String, Rel)> {
+    let Ok(entries) = root.list(dir) else {
         return Vec::new(); // nothing has ever been claimed here
     };
     let mut files: Vec<String> = entries
         .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .filter_map(|e| e.name().map(String::from))
         .collect();
     files.sort();
     files
@@ -1053,13 +1065,13 @@ fn corrupt_note(id: &str) -> String {
 /// note to follow, so a reader in between (`dead_letters`, the heartbeat's FAILING line,
 /// `rd state=error`) saw a fresh dead letter with "(no .err note)" or an empty one: 7 of
 /// 1,440 runs of gonk's trigger test under load.
-fn place_note(dir: &Path, id: &str, ext: &str, text: &[u8], modes: Modes) -> std::io::Result<()> {
+fn place_note(root: &Root, dir: &Rel, id: &str, ext: &str, text: &[u8]) -> std::io::Result<()> {
     let tmp = dir.join(staging_name(id, &format!("{ext}-note")));
-    let placed = modes
+    let placed = root
         .write(&tmp, text)
-        .and_then(|()| disk::rename(&tmp, dir.join(format!("{id}.{ext}"))));
+        .and_then(|()| root.rename(&tmp, &dir.join(format!("{id}.{ext}"))));
     if placed.is_err() {
-        let _ = disk::remove_file(&tmp);
+        let _ = root.remove_file(&tmp);
     }
     placed
 }
@@ -1067,18 +1079,18 @@ fn place_note(dir: &Path, id: &str, ext: &str, text: &[u8], modes: Modes) -> std
 /// Take back a note [`place_note`] placed for a tuple whose own move then failed, unless a
 /// tuple with that id already sits in `dir` (an earlier pass of the same bytes, which the
 /// note now describes): a note beside no tuple reads as a failure that never happened.
-fn withdraw_note(dir: &Path, id: &str, ext: &str) {
-    if !disk::exists(dir.join(format!("{id}.tuple"))) {
-        let _ = disk::remove_file(dir.join(format!("{id}.{ext}")));
+fn withdraw_note(root: &Root, dir: &Rel, id: &str, ext: &str) {
+    if !root.exists(&dir.join(format!("{id}.tuple"))) {
+        let _ = root.remove_file(&dir.join(format!("{id}.{ext}")));
     }
 }
 
 /// Hold the note at `<dir>/<id>.<ext>` by a second name of the caller's own (a hard link
 /// under a [`staging_name`]), so that [`clear_held_note`] can later remove that note and
 /// never one placed after it. `None` when there is no note to hold.
-fn hold_note(dir: &Path, id: &str, ext: &str) -> Option<PathBuf> {
+fn hold_note(root: &Root, dir: &Rel, id: &str, ext: &str) -> Option<Rel> {
     let held = dir.join(staging_name(id, &format!("{ext}-held")));
-    disk::hard_link(dir.join(format!("{id}.{ext}")), &held)
+    root.hard_link(&dir.join(format!("{id}.{ext}")), &held)
         .ok()
         .map(|()| held)
 }
@@ -1090,25 +1102,25 @@ fn hold_note(dir: &Path, id: &str, ext: &str) -> Option<PathBuf> {
 /// The note is first taken by a rename to a name of this call's own, and is put back if it
 /// turns out to be a newer one, so a note placed between the check and the take is not lost
 /// either: it is put back unless a newer one still has taken the name meanwhile.
-fn clear_held_note(dir: &Path, id: &str, ext: &str, held: &Path) {
+fn clear_held_note(root: &Root, dir: &Rel, id: &str, ext: &str, held: &Rel) {
     let note = dir.join(format!("{id}.{ext}"));
-    if same_file(&note, held) {
+    if same_file(root, &note, held) {
         let taken = dir.join(staging_name(id, &format!("{ext}-taken")));
-        if disk::rename(&note, &taken).is_ok() {
-            if !same_file(&taken, held) {
+        if root.rename(&note, &taken).is_ok() {
+            if !same_file(root, &taken, held) {
                 // `hard_link` refuses an existing name: a newer note is never replaced.
-                let _ = disk::hard_link(&taken, &note);
+                let _ = root.hard_link(&taken, &note);
             }
-            let _ = disk::remove_file(&taken);
+            let _ = root.remove_file(&taken);
         }
     }
-    let _ = disk::remove_file(held);
+    let _ = root.remove_file(held);
 }
 
 /// Whether two paths name the same file (the same inode on unix). False when either is
 /// missing.
-fn same_file(a: &Path, b: &Path) -> bool {
-    let (Ok(a), Ok(b)) = (disk::metadata(a), disk::metadata(b)) else {
+fn same_file(root: &Root, a: &Rel, b: &Rel) -> bool {
+    let (Ok(a), Ok(b)) = (root.metadata(a), root.metadata(b)) else {
         return false;
     };
     #[cfg(unix)]
@@ -1135,39 +1147,67 @@ thread_local! {
 }
 
 /// A tuple `id` has just landed in the stage `dir` (a no-op outside this crate's tests).
-fn staged(dir: &Path, id: &str) {
+fn staged(root: &Root, dir: &Rel, id: &str) {
     #[cfg(test)]
     ON_STAGED.with(|hook| {
         if let Some(hook) = hook.borrow().as_ref() {
-            hook(dir, id);
+            hook(&root.shown(dir), id);
         }
     });
     #[cfg(not(test))]
-    let _ = (dir, id);
+    let _ = (root, dir, id);
 }
 
-/// Move a claimed file that failed [`hashes_to`] into the space's `error/` stage beside a
-/// note saying why, and return a reason naming where it went (or why it could not). The
-/// note goes first ([`place_note`]), so the quarantined file is never seen without it.
-fn quarantine(space_dir: &Path, id: &str, claimed: &Path, modes: Modes) -> String {
-    let error = space_dir.join(ERROR_DIR);
-    let moved = modes.create_dir_all(&error).and_then(|()| {
-        let noted = place_note(&error, id, "err", corrupt_note(id).as_bytes(), modes).is_ok();
-        let moved = disk::rename(claimed, error.join(format!("{id}.tuple")));
+/// Why a claimed file is not delivered but moved to `error/` ([`quarantine`]).
+enum Unfit {
+    /// Its bytes do not hash to its id ([`hashes_to`]).
+    Corrupt,
+    /// It is a symbolic link, which the root never reads through ([`disk`]).
+    Refused(std::io::Error),
+}
+
+impl Unfit {
+    /// The `.err` note it is dead-lettered with.
+    fn note(&self, id: &str) -> String {
+        match self {
+            Unfit::Corrupt => corrupt_note(id),
+            Unfit::Refused(e) => format!(
+                "refused: {e}; this file was moved here as it was, unread, and was not delivered"
+            ),
+        }
+    }
+
+    /// What it is, for the reason the caller is answered with.
+    fn what(&self) -> &'static str {
+        match self {
+            Unfit::Corrupt => "does not hash to its id",
+            Unfit::Refused(_) => "is a symbolic link, which the intray never reads through",
+        }
+    }
+}
+
+/// Move a claimed file that is not fit to deliver (see [`Unfit`]) into the space's `error/`
+/// stage beside a note saying why, and return a reason naming where it went (or why it could
+/// not). The note goes first ([`place_note`]), so the quarantined file is never seen without it.
+fn quarantine(root: &Root, space: &str, id: &str, claimed: &Rel, unfit: Unfit) -> String {
+    let error = Rel::top().join(space).join(ERROR_DIR);
+    let what = unfit.what();
+    let moved = root.create_dir_all(&error).and_then(|()| {
+        let noted = place_note(root, &error, id, "err", unfit.note(id).as_bytes()).is_ok();
+        let moved = root.rename(claimed, &error.join(format!("{id}.tuple")));
         if moved.is_err() && noted {
-            withdraw_note(&error, id, "err");
+            withdraw_note(root, &error, id, "err");
         }
         moved
     });
     match moved {
         Ok(()) => {
-            staged(&error, id);
-            format!("tuple `{id}` does not hash to its id; it was moved to `error/`")
+            staged(root, &error, id);
+            format!("tuple `{id}` {what}; it was moved to `error/`")
         }
         Err(e) => format!(
-            "tuple `{id}` does not hash to its id, and moving it to `error/` failed: {e} \
-             (it is at {})",
-            claimed.display()
+            "tuple `{id}` {what}, and moving it to `error/` failed: {e} (it is at {})",
+            root.shown(claimed).display()
         ),
     }
 }
@@ -1476,8 +1516,8 @@ impl Endpoint for SpaceEndpoint {
                             detail: "a tuple id is a content hash".to_string(),
                         });
                     }
-                    let from = self.root.join(name).join(ERROR_DIR);
-                    self.modes.create_dir_all(&inbox).map_err(|e| {
+                    let from = Rel::top().join(name).join(ERROR_DIR);
+                    self.root.create_dir_all(&inbox).map_err(|e| {
                         Error::Endpoint(format!("space `{name}`: create inbox: {e}"))
                     })?;
                     // ★ The stale note is held by a name of the retry's OWN before the tuple
@@ -1485,25 +1525,27 @@ impl Endpoint for SpaceEndpoint {
                     // claim it, fail it again and place a NEW note at `<id>.err` before this
                     // goes on, and clearing that name then removed the fresh dead letter's
                     // note. See [`hold_note`].
-                    let held = hold_note(&from, id, "err");
-                    if disk::rename(
-                        from.join(format!("{id}.tuple")),
-                        inbox.join(format!("{id}.tuple")),
-                    )
-                    .is_err()
+                    let held = hold_note(&self.root, &from, id, "err");
+                    if self
+                        .root
+                        .rename(
+                            &from.join(format!("{id}.tuple")),
+                            &inbox.join(format!("{id}.tuple")),
+                        )
+                        .is_err()
                     {
                         if let Some(held) = held {
-                            let _ = disk::remove_file(held);
+                            let _ = self.root.remove_file(&held);
                         }
                         return Err(Error::NotFound(format!(
                             "no dead-lettered tuple `{id}` in space `{name}`"
                         )));
                     }
-                    staged(&inbox, id);
+                    staged(&self.root, &inbox, id);
                     // Only after the tuple is safely back: a stale note beside no tuple
                     // would read as a failure that never happened.
                     if let Some(held) = held {
-                        clear_held_note(&from, id, "err", &held);
+                        clear_held_note(&self.root, &from, id, "err", &held);
                     }
                     return Ok(Representation::new(
                         ReprType::new("text/plain"),
@@ -1549,16 +1591,17 @@ impl Endpoint for SpaceEndpoint {
                 let dir = self.state_dir(name, opt_str(inv, "state")?.unwrap_or("inbox"))?;
                 // A stage's tuples by id, and the file each is in: `<id>.tuple`, except in
                 // `.processing/`, where a pass's claim has a name of its own ([`list_claims`]).
-                let in_flight = dir.ends_with(PROCESSING_DIR);
-                let tuples = move |dir: &Path| -> Vec<(String, PathBuf)> {
+                let in_flight = dir.last() == Some(std::ffi::OsStr::new(PROCESSING_DIR));
+                let root = self.root.clone();
+                let tuples = move |dir: &Rel| -> Vec<(String, Rel)> {
                     if !in_flight {
-                        let ids = Self::list_ids(dir).into_iter();
+                        let ids = Self::list_ids(&root, dir).into_iter();
                         return ids
                             .map(|id| (id.clone(), dir.join(format!("{id}.tuple"))))
                             .collect();
                     }
                     let mut seen = std::collections::HashSet::new();
-                    let mut claims = list_claims(dir);
+                    let mut claims = list_claims(&root, dir);
                     claims.retain(|(id, _)| seen.insert(id.clone()));
                     claims.sort_by(|a, b| a.0.cmp(&b.0));
                     claims
@@ -1570,17 +1613,17 @@ impl Endpoint for SpaceEndpoint {
                             detail: "a tuple id is a content hash".to_string(),
                         });
                     }
+                    let missing = || Error::NotFound(format!("no tuple `{id}` in space `{name}`"));
                     let file = match in_flight {
                         false => dir.join(format!("{id}.tuple")),
                         true => tuples(&dir)
                             .into_iter()
                             .find(|(held, _)| held == id)
                             .map(|(_, file)| file)
-                            .unwrap_or_default(),
+                            .ok_or_else(missing)?,
                     };
-                    let bytes = disk::read(file).map_err(|_| {
-                        Error::NotFound(format!("no tuple `{id}` in space `{name}`"))
-                    })?;
+                    // A file the root refuses (a link) is no tuple of this space's either.
+                    let bytes = self.root.read(&file).map_err(|_| missing())?;
                     if !hashes_to(&bytes, id) {
                         // rd is non-destructive (and holds only read), so it reports the file
                         // rather than moving it; a take or a reactor pass dead-letters it.
@@ -1599,6 +1642,7 @@ impl Endpoint for SpaceEndpoint {
                     // template matches the PLAINTEXT, and a tuple that does not decode refuses
                     // the match rather than reading as absent.
                     let (codec, space) = (Arc::clone(&self.codec), name.to_string());
+                    let root = self.root.clone();
                     let bytes = with_template(
                         &self.budget,
                         inv.capability,
@@ -1609,7 +1653,7 @@ impl Endpoint for SpaceEndpoint {
                                 if token.is_cancelled() {
                                     return Err(canceled());
                                 }
-                                if let Ok(bytes) = disk::read(file) {
+                                if let Ok(bytes) = root.read(&file) {
                                     // A file that is not the tuple its name says never matches.
                                     if !hashes_to(&bytes, &id) {
                                         continue;
@@ -1675,7 +1719,7 @@ impl Endpoint for SpaceEndpoint {
                     ))
                 };
                 let Some(query) = opt_str(inv, "match")? else {
-                    for id in Self::list_ids(&inbox) {
+                    for id in Self::list_ids(&self.root, &inbox) {
                         // Lost the race, or a file that is not its tuple (now in `error/`): next.
                         if let Claim::Taken(bytes) = self.claim(name, &id)? {
                             return taken(bytes);
@@ -1689,10 +1733,10 @@ impl Endpoint for SpaceEndpoint {
                 // overdue scan runs on, but only reads). A claim lost to a rival resumes the
                 // scan after that tuple under a fresh budget; each loss is a tuple another
                 // taker consumed, so the reruns are bounded by the snapshot.
-                let ids = Arc::new(Self::list_ids(&inbox));
+                let ids = Arc::new(Self::list_ids(&self.root, &inbox));
                 let mut from = 0;
                 loop {
-                    let (scan, dir) = (Arc::clone(&ids), inbox.clone());
+                    let (scan, dir, root) = (Arc::clone(&ids), inbox.clone(), self.root.clone());
                     let (codec, space) = (Arc::clone(&self.codec), name.to_string());
                     let found = with_template(
                         &self.budget,
@@ -1704,7 +1748,7 @@ impl Endpoint for SpaceEndpoint {
                                     return Err(canceled());
                                 }
                                 // A tuple that vanished between listing and read is no match.
-                                if let Ok(bytes) = disk::read(dir.join(format!("{id}.tuple"))) {
+                                if let Ok(bytes) = root.read(&dir.join(format!("{id}.tuple"))) {
                                     // A file that is not the tuple its name says is matched as
                                     // stored, as it always was here: if it matches, the claim
                                     // quarantines it and the scan goes on. Anything else is
@@ -1958,7 +2002,8 @@ fn interrupted_note(space: &str, id: &str) -> String {
 /// This is the deterministic core (`drain`/`process`); the live filesystem watcher that calls
 /// `process` on each drop is a thin wrapper the host installs (Slice 3b).
 pub struct SpaceReactor {
-    root: PathBuf,
+    /// The root, and the only door to the disk ([`disk`]).
+    root: Root,
     // Path-qualified rather than `use`d: `ikigai_resolve::Resolver` has a 1-arg `issue` that
     // would shadow the inherent async `Kernel::issue` in this module's tests.
     resolver: Arc<dyn ikigai_resolve::Resolver>,
@@ -2032,13 +2077,19 @@ impl SpaceReactor {
     ///
     /// `capability` is the CEILING for every handler this reactor fires: a space's `cap`
     /// file can narrow it per space, never widen it.
+    ///
+    /// Like [`SpaceEndpoint`], the reactor reaches nothing outside `root`: a space name
+    /// given to [`drain`](SpaceReactor::drain) or [`process`](SpaceReactor::process) that is not
+    /// one name below the root (`..`, an absolute path) names no space, and a space, stage,
+    /// `handler` or `cap` file that is a symbolic link is not followed. A linked space is not a
+    /// space: it is never drained, swept or recovered.
     pub fn new(
         root: PathBuf,
         resolver: Arc<dyn ikigai_resolve::Resolver>,
         capability: Capability,
     ) -> Self {
         SpaceReactor {
-            root,
+            root: Root::new(root),
             resolver,
             capability,
             host_authority: None,
@@ -2126,14 +2177,14 @@ impl SpaceReactor {
             Err(std::fs::TryLockError::WouldBlock) => Err(format!(
                 "another live reactor shares {}, so a tuple in its `{PROCESSING_DIR}/` may \
                  be in flight there; nothing was recovered",
-                self.root.display()
+                self.root.path().display()
             )),
             Err(std::fs::TryLockError::Error(e)) => {
                 return Recovery {
                     lease: std::sync::Mutex::new(None),
                     report: Err(format!(
                         "cannot lock {}: {e}; nothing was recovered",
-                        self.root.join(LEASE_FILE).display()
+                        self.root.shown(&Rel::top().join(LEASE_FILE)).display()
                     )),
                 }
             }
@@ -2199,7 +2250,7 @@ impl SpaceReactor {
                 eprintln!(
                     "ikigai-intray: reactor over {} lost its lease ({e}); another reactor's \
                      recovery could now move this one's in-flight tuples",
-                    self.root.display()
+                    self.root.path().display()
                 );
                 *lease = None;
             }
@@ -2211,11 +2262,16 @@ impl SpaceReactor {
     }
 
     fn open_lease(&self) -> std::result::Result<std::fs::File, String> {
-        disk::create_dir_all(&self.root)
-            .map_err(|e| format!("cannot create {}: {e}", self.root.display()))?;
-        let path = self.root.join(LEASE_FILE);
-        disk::open_lease(&path)
-            .map_err(|e| format!("cannot open {}: {e}; nothing was recovered", path.display()))
+        self.root
+            .create_dir_all(&Rel::top())
+            .map_err(|e| format!("cannot create {}: {e}", self.root.path().display()))?;
+        let lease = Rel::top().join(LEASE_FILE);
+        self.root.open_lease(&lease).map_err(|e| {
+            format!(
+                "cannot open {}: {e}; nothing was recovered",
+                self.root.shown(&lease).display()
+            )
+        })
     }
 
     /// Apply the [`Interrupted`] policy to every tuple in every space's `.processing/`.
@@ -2225,8 +2281,8 @@ impl SpaceReactor {
         names.sort();
         let mut recovered = Vec::new();
         for name in names {
-            let staging = self.root.join(&name).join(PROCESSING_DIR);
-            for (id, claimed) in list_claims(&staging) {
+            let staging = Rel::top().join(&name).join(PROCESSING_DIR);
+            for (id, claimed) in list_claims(&self.root, &staging) {
                 let outcome = match self.interrupted {
                     Interrupted::DeadLetter => {
                         let note = interrupted_note(&name, &id);
@@ -2237,10 +2293,12 @@ impl SpaceReactor {
                         }
                     }
                     Interrupted::Requeue => {
-                        let inbox = self.root.join(&name).join(INBOX_DIR);
-                        disk::create_dir_all(&inbox)
+                        let inbox = Rel::top().join(&name).join(INBOX_DIR);
+                        self.root
+                            .create_dir_all(&inbox)
                             .and_then(|()| {
-                                disk::rename(&claimed, inbox.join(format!("{id}.tuple")))
+                                self.root
+                                    .rename(&claimed, &inbox.join(format!("{id}.tuple")))
                             })
                             .map(|()| Interrupted::Requeue)
                             .map_err(|e| format!("move back to `inbox`: {e}"))
@@ -2299,7 +2357,7 @@ impl SpaceReactor {
         let mut names: Vec<String> = self
             .space_names()
             .into_iter()
-            .filter(|name| disk::is_file(self.root.join(name).join("cap")))
+            .filter(|name| self.root.is_file(&Rel::top().join(name).join("cap")))
             .collect();
         names.sort();
         names
@@ -2309,7 +2367,10 @@ impl SpaceReactor {
     /// handler URI a dropped tuple is fired at. Self-describing + inspectable — no config
     /// schema to invent. `None` = not reactive (drops just accumulate for `rd`/`take`).
     fn handler_uri(&self, name: &str) -> Option<String> {
-        let raw = disk::read_to_string(self.root.join(name).join("handler")).ok()?;
+        let raw = self
+            .root
+            .read_to_string(&Rel::top().join(name).join("handler"))
+            .ok()?;
         let uri = raw.trim();
         (!uri.is_empty()).then(|| uri.to_string())
     }
@@ -2392,7 +2453,7 @@ impl SpaceReactor {
         if let Some(decide) = &self.host_authority {
             return decide(name).unwrap_or_else(|| self.capability.clone());
         }
-        match disk::read_to_string(self.root.join(name).join("cap")) {
+        match self.root.read_to_string(&Rel::top().join(name).join("cap")) {
             Ok(raw) => {
                 let scopes = parse_scopes(&raw);
                 if scopes.is_empty() {
@@ -2422,7 +2483,7 @@ impl SpaceReactor {
     /// [`drain`](SpaceReactor::drain) without the recovery sweep, for a caller that has just
     /// swept once for every space.
     fn drain_inbox(&self, name: &str) -> Vec<(String, Outcome)> {
-        SpaceEndpoint::list_ids(&self.root.join(name).join(INBOX_DIR))
+        SpaceEndpoint::list_ids(&self.root, &Rel::top().join(name).join(INBOX_DIR))
             .into_iter()
             .map(|id| {
                 let outcome = self.process(name, &id);
@@ -2473,7 +2534,7 @@ impl SpaceReactor {
             Ok(None) => return Outcome::Skipped("already claimed"),
             Err(e) => return Outcome::Errored(e),
         };
-        let stored = match disk::read(&claimed) {
+        let stored = match self.root.read(&claimed) {
             Ok(b) if hashes_to(&b, id) => b,
             // Never fire a handler on bytes that are not the tuple that was dropped.
             Ok(_) => return self.settle(name, id, &claimed, Err(corrupt_note(id)), heard),
@@ -2536,7 +2597,7 @@ impl SpaceReactor {
         &self,
         name: &str,
         id: &str,
-        claimed: &Path,
+        claimed: &Rel,
         result: std::result::Result<String, String>,
         heard: &mut Vec<Heard>,
     ) -> Outcome {
@@ -2564,7 +2625,7 @@ impl SpaceReactor {
         &self,
         name: &str,
         id: &str,
-        claimed: &Path,
+        claimed: &Rel,
         result: std::result::Result<String, String>,
     ) -> Outcome {
         let (stage, outcome) = match &result {
@@ -2576,8 +2637,8 @@ impl SpaceReactor {
             Err(why) => Outcome::Errored(format!("{why} (and then {what})")),
             Ok(_) => Outcome::Errored(what),
         };
-        let dir = self.root.join(name).join(stage);
-        if let Err(e) = disk::create_dir_all(&dir) {
+        let dir = Rel::top().join(name).join(stage);
+        if let Err(e) = self.root.create_dir_all(&dir) {
             return failed(format!("create `{stage}`: {e}"));
         }
         // ★ The note FIRST, atomically, and only then the tuple (ledger #1595): a reader that
@@ -2590,7 +2651,7 @@ impl SpaceReactor {
             // `error/` with no record of WHY, which is the one thing `rd state=error` exists
             // to show, so the reason goes to stderr instead of being dropped (ledger #1548).
             // The tuple still moves.
-            Err(msg) => match place_note(&dir, id, "err", msg.as_bytes(), Modes::default()) {
+            Err(msg) => match place_note(&self.root, &dir, id, "err", msg.as_bytes()) {
                 Ok(()) => Some("err"),
                 Err(e) => {
                     eprintln!(
@@ -2606,7 +2667,7 @@ impl SpaceReactor {
             // cannot be written is said on stderr, without the answer itself (which may be
             // long, and is the handler's to log), so its absence is not mistaken for silence.
             Ok(said) if !said.trim().is_empty() => {
-                match place_note(&dir, id, "out", said.as_bytes(), Modes::default()) {
+                match place_note(&self.root, &dir, id, "out", said.as_bytes()) {
                     Ok(()) => Some("out"),
                     Err(e) => {
                         eprintln!(
@@ -2620,17 +2681,17 @@ impl SpaceReactor {
             // Said nothing THIS pass: an answer left by an earlier pass must not stand in
             // for it, not even for the moment before the tuple moves in.
             Ok(_) => {
-                let _ = disk::remove_file(dir.join(format!("{id}.out")));
+                let _ = self.root.remove_file(&dir.join(format!("{id}.out")));
                 None
             }
         };
-        if let Err(e) = disk::rename(claimed, dir.join(format!("{id}.tuple"))) {
+        if let Err(e) = self.root.rename(claimed, &dir.join(format!("{id}.tuple"))) {
             if let Some(ext) = placed {
-                withdraw_note(&dir, id, ext);
+                withdraw_note(&self.root, &dir, id, ext);
             }
             return failed(format!("move to `{stage}`: {e}"));
         }
-        staged(&dir, id);
+        staged(&self.root, &dir, id);
         // ★ A tuple's record describes its LAST pass, so it is in exactly one terminal stage.
         // The same bytes can be handled more than once — an identical drop after a pass has
         // settled is a NEW request (see the Sink arm) — and before this a success left the
@@ -2641,9 +2702,9 @@ impl SpaceReactor {
             OUTBOX_DIR => (ERROR_DIR, "err"),
             _ => (OUTBOX_DIR, "out"),
         };
-        let other = self.root.join(name).join(other);
-        let _ = disk::remove_file(other.join(format!("{id}.tuple")));
-        let _ = disk::remove_file(other.join(format!("{id}.{note}")));
+        let other = Rel::top().join(name).join(other);
+        let _ = self.root.remove_file(&other.join(format!("{id}.tuple")));
+        let _ = self.root.remove_file(&other.join(format!("{id}.{note}")));
         outcome
     }
 
@@ -2658,29 +2719,31 @@ impl SpaceReactor {
     /// the first one's staged file, the first settle moved the second pass's tuple, and the
     /// second settle failed its move and withdrew its own note. A failed pass left no dead
     /// letter and the tuple read as handled (ledger #2786). Now each settle moves its own file.
-    fn claim(&self, name: &str, id: &str) -> std::result::Result<Option<PathBuf>, String> {
-        let src = self
-            .root
+    fn claim(&self, name: &str, id: &str) -> std::result::Result<Option<Rel>, String> {
+        let src = Rel::top()
             .join(name)
             .join(INBOX_DIR)
             .join(format!("{id}.tuple"));
-        let staging = self.root.join(name).join(PROCESSING_DIR);
-        disk::create_dir_all(&staging).map_err(|e| format!("staging: {e}"))?;
+        let staging = Rel::top().join(name).join(PROCESSING_DIR);
+        self.root
+            .create_dir_all(&staging)
+            .map_err(|e| format!("staging: {e}"))?;
         let staged = staging.join(staging_name(id, "claim"));
-        match disk::rename(&src, &staged) {
+        match self.root.rename(&src, &staged) {
             Ok(()) => Ok(Some(staged)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(format!("claim: {e}")),
         }
     }
 
-    /// The names of the spaces currently on disk (the immediate subdirectories of `root`).
+    /// The names of the spaces currently on disk (the immediate subdirectories of `root`; a
+    /// link is not one, the root follows none).
     fn space_names(&self) -> Vec<String> {
-        match disk::read_dir(&self.root) {
+        match self.root.list(&Rel::top()) {
             Ok(entries) => entries
                 .filter_map(|e| e.ok())
-                .filter(|e| disk::is_dir(e.path()))
-                .filter_map(|e| e.file_name().to_str().map(String::from))
+                .filter(|e| e.is_dir())
+                .filter_map(|e| e.name().map(String::from))
                 .collect(),
             Err(_) => Vec::new(),
         }
@@ -2696,7 +2759,7 @@ impl SpaceReactor {
     /// a reactor that is not reacting looked exactly like a quiet one); use
     /// [`try_watch`](SpaceReactor::try_watch) to get the reason and refuse to start instead.
     pub fn watch(self: Arc<Self>) {
-        let root = self.root.clone();
+        let root = self.root.path().to_path_buf();
         if let Err(why) = self.try_watch() {
             eprintln!(
                 "ikigai-intray: the reactor over {} is NOT watching: {why}; tuples dropped \
@@ -2726,8 +2789,9 @@ impl SpaceReactor {
     /// crashed sibling reactor left claimed, or one whose event was missed, is not stranded
     /// for the life of the process.
     pub fn try_watch(self: Arc<Self>) -> std::result::Result<(), String> {
-        disk::create_dir_all(&self.root)
-            .map_err(|e| format!("cannot create {}: {e}", self.root.display()))?;
+        self.root
+            .create_dir_all(&Rel::top())
+            .map_err(|e| format!("cannot create {}: {e}", self.root.path().display()))?;
         // Make every known space's inbox exist BEFORE the watch is established.
         //
         // A recursive watch only covers directories that are there when it starts; one
@@ -2737,14 +2801,17 @@ impl SpaceReactor {
         // and a missed tuple is silent, sitting in an inbox nobody looks at again until
         // something restarts. Creating them up front removes the race for known spaces.
         for name in self.space_names() {
-            let inbox = self.root.join(&name).join(INBOX_DIR);
-            disk::create_dir_all(&inbox)
-                .map_err(|e| format!("cannot create {}: {e}", inbox.display()))?;
+            let inbox = Rel::top().join(&name).join(INBOX_DIR);
+            self.root
+                .create_dir_all(&inbox)
+                .map_err(|e| format!("cannot create {}: {e}", self.root.shown(&inbox).display()))?;
         }
         // Canonicalize so the paths `notify` reports (it resolves symlinks — macOS maps
         // /var → /private/var) line up with `root` when we strip the prefix.
-        let root = disk::canonicalize(&self.root)
-            .map_err(|e| format!("cannot resolve {}: {e}", self.root.display()))?;
+        let root = self
+            .root
+            .canonical()
+            .map_err(|e| format!("cannot resolve {}: {e}", self.root.path().display()))?;
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |res| {
             let _ = tx.send(res);
@@ -2863,16 +2930,17 @@ pub struct DeadLetter {
 /// sharing the workspace reports the same facts. Directory enumeration failures (other than
 /// absent directories) are reported on stderr; the returned report may then be incomplete.
 pub fn dead_letters(root: &Path) -> Vec<SpaceDeadLetters> {
-    let spaces: Vec<String> = dead_letter_entries(root)
-        .filter(|e| disk::is_dir(e.path()))
-        .filter_map(|e| e.file_name().to_str().map(String::from))
+    let root = Root::new(root.to_path_buf());
+    let spaces: Vec<String> = dead_letter_entries(&root, &Rel::top())
+        .filter(|e| e.is_dir())
+        .filter_map(|e| e.name().map(String::from))
         .filter(|name| {
-            disk::read_to_string(root.join(name).join("handler"))
+            root.read_to_string(&Rel::top().join(name).join("handler"))
                 .map(|raw| !raw.trim().is_empty())
                 .unwrap_or(false)
         })
         .collect();
-    dead_letters_of(root, spaces)
+    dead_letters_in(&root, spaces)
 }
 
 /// [`dead_letters`] for the spaces the CALLER names, sorted and deduplicated — for a host that
@@ -2884,6 +2952,11 @@ pub fn dead_letters_of(
     root: &Path,
     spaces: impl IntoIterator<Item = String>,
 ) -> Vec<SpaceDeadLetters> {
+    dead_letters_in(&Root::new(root.to_path_buf()), spaces)
+}
+
+/// [`dead_letters_of`] under a [`Root`].
+fn dead_letters_in(root: &Root, spaces: impl IntoIterator<Item = String>) -> Vec<SpaceDeadLetters> {
     let mut spaces: Vec<String> = spaces
         .into_iter()
         .filter(|name| {
@@ -2895,21 +2968,20 @@ pub fn dead_letters_of(
     spaces
         .into_iter()
         .map(|space| {
-            let error = root.join(&space).join(ERROR_DIR);
-            let ids: Vec<String> = dead_letter_entries(&error)
+            let error = Rel::top().join(&space).join(ERROR_DIR);
+            let ids: Vec<String> = dead_letter_entries(root, &error)
                 .filter_map(|e| {
-                    e.file_name()
-                        .to_str()
+                    e.name()
                         .and_then(|n| n.strip_suffix(".tuple"))
                         .map(String::from)
                 })
                 .collect();
-            let modified = |path: &Path| disk::metadata(path).and_then(|m| m.modified()).ok();
+            let modified = |rel: &Rel| root.metadata(rel).and_then(|m| m.modified()).ok();
             let newest = ids
                 .iter()
                 .map(|id| {
                     let note = error.join(format!("{id}.err"));
-                    match disk::read_to_string(&note) {
+                    match root.read_to_string(&note) {
                         Ok(reason) => DeadLetter {
                             tuple: id.clone(),
                             reason,
@@ -2934,14 +3006,15 @@ pub fn dead_letters_of(
 
 /// Enumerate dead-letter directories, reporting failures instead of silently claiming
 /// they were empty. An absent root or stage is normal before the first drop or failure.
-fn dead_letter_entries(path: &Path) -> impl Iterator<Item = std::fs::DirEntry> + '_ {
+fn dead_letter_entries(root: &Root, dir: &Rel) -> impl Iterator<Item = disk::Listed> {
+    let path = root.shown(dir);
     let report = move |e| {
         eprintln!(
             "ikigai-intray: cannot read dead letters in {}: {e}; report may be incomplete",
             path.display()
         );
     };
-    let entries = match disk::read_dir(path) {
+    let entries = match root.list(dir) {
         Ok(entries) => Some(entries),
         Err(e) => {
             if e.kind() != std::io::ErrorKind::NotFound {

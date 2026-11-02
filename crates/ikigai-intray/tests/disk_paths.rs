@@ -3,8 +3,8 @@
 //! files it leaves. The confinement changed how every path is built, so these say the paths
 //! did not move.
 
-// Planting the files a crash leaves behind: a native integration test of a native-only crate
-// (notify, std::fs), never built for wasm.
+// Wall time, to plant a live claim and an old one: a native integration test of a native-only
+// crate (notify, std::fs), never built for wasm.
 #![allow(clippy::disallowed_methods)]
 
 mod common;
