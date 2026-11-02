@@ -65,9 +65,9 @@ members = ["crates/*"]
 # delete, the routed argument for a `source` stage), so an idle-stdin hint can name it. The
 # older setters are unchanged. Also carries the fixes merged since 0.2.12 (PRs 28 to 32).
 # Additive: a patch.
-# 0.2.14 (ledger #2441): shared peer silence retains its stamping clock, so mounts
-# with independent clocks pay one describe deadline per cooldown. Internal fix: a patch.
-version = "0.2.14"
+# Also (ledger #2441): shared peer silence retains its stamping clock, so mounts with
+# independent clocks pay one describe deadline per cooldown. 0.2.13 is unpublished, so it rides here.
+version = "0.2.13"
 edition = "2021"
 # Measured 2026-10-26, not assumed: 1.89 is the first toolchain that builds the workspace.
 # `ikigai-intray` takes the lease with `std::fs::File::try_lock` (stable in 1.89; 1.88 refuses
@@ -140,7 +140,7 @@ ikigai-fs = "0.2.2"
 # 0.3.4 is a SECURITY floor (ledger #1326) and 0.3.6 was cli's pin. 0.5.0 is the newest
 # release and the one on core 0.2 (ledger #2349). `"0.5.0"` is `<0.6.0`.
 ikigai-shacl = "0.5.0"
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.2.14" }
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.2.13" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face, reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins
