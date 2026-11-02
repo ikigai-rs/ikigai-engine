@@ -361,7 +361,8 @@ struct ForwardingEndpoint {
     /// The mount's memo of contracts its peer declared, shared by every endpoint the mount
     /// hands out, so a hot read does not forward a `Meta` per read. See [`ContractMemo`].
     contracts: Arc<ContractMemo>,
-    /// The mount's clock, which `health` and `contracts` are measured on. See
+    /// The mount's clock for contracts and new silence records. A shared silence record
+    /// retains its stamping clock. See
     /// [`default_clock`].
     clock: Option<Arc<dyn Clock>>,
 }
@@ -412,10 +413,7 @@ impl ForwardingEndpoint {
     /// to be silent is not asked here either — [`DescribeHealth`] — and describes as
     /// [`unavailable`] exactly as before.
     fn resolution(mut self, request: &Request) -> Resolution {
-        let silent = self
-            .health
-            .as_ref()
-            .is_some_and(|h| h.failing(self.now()).is_some());
+        let silent = self.health.as_ref().is_some_and(|h| h.failing().is_some());
         if request.verb == Verb::Meta && !silent {
             // ★ A `Meta` is the "describe it NOW" operation, so it never takes the memo's
             // word for it — it refreshes the memo instead (see `ContractMemo`).
@@ -502,7 +500,7 @@ impl ForwardingEndpoint {
                 // Silence here is the same silence an enumeration would meet, so it counts
                 // against the same health — one row's timeout spares every later row.
                 if let Some(health) = &self.health {
-                    health.record(&error, self.now());
+                    health.record(&error, self.clock.as_ref());
                 }
                 Err(Lookup::Unavailable(format!(
                     "it refused the Meta request: {error}"
@@ -593,7 +591,7 @@ impl Endpoint for ForwardingEndpoint {
             Some(Contract::Unavailable(reason)) => reason.clone(),
             None => {
                 let now = self.now();
-                if let Some(reason) = self.health.as_ref().and_then(|health| health.failing(now)) {
+                if let Some(reason) = self.health.as_ref().and_then(|health| health.failing()) {
                     return unavailable(
                         self.origin.as_deref(),
                         self.request.target.as_str(),
@@ -747,9 +745,15 @@ const DESCRIBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30
 /// a manifold read makes and one peer's silence should be learned once, not per row.
 #[derive(Default)]
 struct DescribeHealth {
-    /// `Some((when, why))` while the peer is considered undescribable, `when` read from the
-    /// clock of the mount that saw it go silent.
-    failed: Mutex<Option<(Time, String)>>,
+    failed: Mutex<Option<DescribeFailure>>,
+}
+
+/// Keep the stamping clock with the verdict: mounts sharing a peer can have independent
+/// clocks whose millisecond readings differ, even when both are monotonic (ledger #2441).
+struct DescribeFailure {
+    at: Time,
+    why: String,
+    clock: Arc<dyn Clock>,
 }
 
 /// One kernel's view of which of its PEERS can describe themselves — handed to every
@@ -785,15 +789,17 @@ impl PeerHealth {
 impl DescribeHealth {
     /// Why the peer is currently considered undescribable, if it is — clearing a record
     /// that has aged past [`DESCRIBE_COOLDOWN`] so the next call tries the peer again.
-    /// With no clock (`now` is `None`) nothing is recorded, so nothing is failing.
-    fn failing(&self, now: Option<Time>) -> Option<String> {
+    /// Read the same clock that stamped the failure, regardless of which mount asks.
+    fn failing(&self) -> Option<String> {
         let mut failed = match self.failed.lock() {
             Ok(failed) => failed,
             // A poisoned lock must cost knowledge, never a describe: forget the record.
             Err(poisoned) => poisoned.into_inner(),
         };
         match &*failed {
-            Some((at, why)) if within(*at, now, DESCRIBE_COOLDOWN) => Some(why.clone()),
+            Some(failure) if within(failure.at, Some(failure.clock.now()), DESCRIBE_COOLDOWN) => {
+                Some(failure.why.clone())
+            }
             Some(_) => {
                 *failed = None;
                 None
@@ -808,21 +814,26 @@ impl DescribeHealth {
     /// error, a contract that parsed badly — is the peer ANSWERING, and a peer that answers
     /// is not one to stop asking.
     ///
-    /// `now` is the mount's clock (see [`default_clock`]). With none — wasm32 with no clock
+    /// `clock` is the mount's clock (see [`default_clock`]). With none — wasm32 with no clock
     /// installed — a silence is not remembered and every describe asks the peer, which is
     /// what a mount did before it kept this record; there is no cooldown to measure.
-    fn record(&self, error: &Error, now: Option<Time>) {
+    fn record(&self, error: &Error, clock: Option<&Arc<dyn Clock>>) {
         if !matches!(error, Error::Timeout(_) | Error::Unavailable(_)) {
             return;
         }
-        let Some(now) = now else {
+        let Some(clock) = clock else {
             return;
         };
+        let now = clock.now();
         let mut failed = match self.failed.lock() {
             Ok(failed) => failed,
             Err(poisoned) => poisoned.into_inner(),
         };
-        *failed = Some((now, error.to_string()));
+        *failed = Some(DescribeFailure {
+            at: now,
+            why: error.to_string(),
+            clock: Arc::clone(clock),
+        });
     }
 
     /// Forget any record — the peer just answered.
@@ -1113,7 +1124,7 @@ pub struct MountedRemote {
     /// The contracts this mount has read from its peer, shared with every
     /// [`ForwardingEndpoint`] it hands out. See [`ContractMemo`].
     contracts: Arc<ContractMemo>,
-    /// What `health` and `contracts` are measured on. See [`default_clock`].
+    /// The clock for contracts and new silence records. See [`default_clock`].
     clock: Option<Arc<dyn Clock>>,
 }
 
@@ -1200,15 +1211,11 @@ impl MountedRemote {
     /// every describe (ledger #2194).
     ///
     /// Call it at construction, like [`sharing`](Self::sharing): a record already made was
-    /// stamped by the clock it replaces.
+    /// stamped by the clock it replaces. A shared silence verdict retains the clock that
+    /// recorded it, so other mounts check its cooldown on that same clock.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = Some(clock);
         self
-    }
-
-    /// What this mount's clock reads, if it has one.
-    fn now(&self) -> Option<Time> {
-        self.clock.as_ref().map(|clock| clock.now())
     }
 
     /// The one row a mount contributes when its peer did not answer an enumeration:
@@ -1256,7 +1263,7 @@ impl Space for MountedRemote {
                 Arc::new(MountUnavailable {
                     prefix: self.prefix.clone(),
                     origin: self.origin.clone(),
-                    reason: self.health.failing(self.now()),
+                    reason: self.health.failing(),
                 }),
                 Bindings::new(),
             ));
@@ -1309,7 +1316,7 @@ impl Space for MountedRemote {
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         // A peer already known to be silent is not asked again for the cooldown — a
         // manifold read must cost ONE deadline per unhealthy mount, not one per attempt.
-        if let Some(reason) = self.health.failing(self.now()) {
+        if let Some(reason) = self.health.failing() {
             return Some(vec![self.unenumerated(&reason)]);
         }
         let entries = match self.resolver.try_entries() {
@@ -1327,7 +1334,7 @@ impl Space for MountedRemote {
             // silent peer read like an empty one; instead the mount contributes exactly
             // one row, which says whose resources are missing and why.
             Err(error) => {
-                self.health.record(&error, self.now());
+                self.health.record(&error, self.clock.as_ref());
                 return Some(vec![self.unenumerated(&error.to_string())]);
             }
         };
@@ -3568,6 +3575,49 @@ mod tests {
             .entries()
             .expect("a silent peer contributes its status row");
         assert_eq!(asked(&silent), 2, "no clock, no cooldown: every walk asks");
+    }
+
+    /// Shared silence must survive the millisecond skew of independently made clocks.
+    #[test]
+    fn two_mounts_with_offset_clocks_share_one_silent_peer_deadline() {
+        let silent = Arc::new(Silent(Default::default()));
+        let peers = PeerHealth::default();
+        let first_clock = Stepped::at(1_001);
+        let second_clock = Stepped::at(1_000);
+        let first = MountedRemote::new(silent.clone(), "urn:first:", "test://shared")
+            .with_clock(Arc::new(first_clock.clone()))
+            .sharing(&peers);
+        let second = MountedRemote::new(silent.clone(), "urn:second:", "test://shared")
+            .sharing(&peers)
+            .with_clock(Arc::new(second_clock.clone()));
+
+        let first_rows = first.entries().expect("first mount's status row");
+        let second_rows = second.entries().expect("second mount's status row");
+        assert_eq!(first_rows.len(), 1);
+        assert_eq!(second_rows.len(), 1);
+        assert_eq!(first_rows[0].pattern, mount_status_iri("urn:first:"));
+        assert_eq!(second_rows[0].pattern, mount_status_iri("urn:second:"));
+        assert_eq!(first_rows[0].origin.as_deref(), Some("test://shared"));
+        assert_eq!(second_rows[0].origin.as_deref(), Some("test://shared"));
+        assert_eq!(
+            silent.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a second mount with a clock 1 ms behind must not ask the silent peer"
+        );
+
+        // Advancing the checking mount's clock cannot expire the first mount's verdict.
+        second_clock.advance(DESCRIBE_COOLDOWN);
+        second
+            .entries()
+            .expect("the stamping clock still holds the verdict");
+        assert_eq!(silent.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        first_clock.advance(DESCRIBE_COOLDOWN);
+        second.entries().expect("retry after the shared cooldown");
+        assert_eq!(silent.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        first
+            .entries()
+            .expect("the retry is shared in both directions");
+        assert_eq!(silent.0.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// A clock that reads EARLIER than a record (an injected wall clock that stepped back)
