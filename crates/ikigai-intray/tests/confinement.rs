@@ -84,6 +84,52 @@ fn a_reactor_never_reaches_a_space_outside_its_root() {
     untouched(&outside, &id);
 }
 
+/// Reactor entry points use the endpoint's space-name rule, even for confined names.
+#[test]
+fn process_refuses_names_the_endpoint_refuses() {
+    assert_invalid_space_names_refused(false);
+}
+
+#[test]
+fn drain_refuses_names_the_endpoint_refuses() {
+    assert_invalid_space_names_refused(true);
+}
+
+fn assert_invalid_space_names_refused(drain: bool) {
+    for name in [
+        "jobs.pending",
+        "jobs ",
+        "CON",
+        "jobs:pending",
+        "jobs\\pending",
+    ] {
+        let root = scratch(if drain {
+            "drain-space-name"
+        } else {
+            "process-space-name"
+        });
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join(INBOX_DIR)).unwrap();
+        std::fs::write(dir.join("handler"), "urn:test:handler").unwrap();
+        let id = tuple_id(b"pending");
+        let tuple = dir.join(INBOX_DIR).join(format!("{id}.tuple"));
+        std::fs::write(&tuple, b"pending").unwrap();
+        let handler = Arc::new(Counting::new());
+        let reactor = SpaceReactor::new(root, handler.clone(), Capability::root());
+        if drain {
+            assert!(reactor.drain(name).is_empty(), "drain accepted {name:?}");
+        } else {
+            let outcome = reactor.process(name, &id);
+            assert!(
+                matches!(outcome, ikigai_intray::Outcome::Skipped(_)),
+                "process accepted {name:?}: {outcome:?}"
+            );
+        }
+        assert_eq!(handler.calls(), 0, "no handler fired for {name:?}");
+        assert_eq!(std::fs::read(tuple).unwrap(), b"pending");
+    }
+}
+
 /// A tuple id is one file name too: one that climbs out of the stage is refused.
 #[test]
 fn a_reactor_never_claims_a_tuple_id_that_climbs_out() {
