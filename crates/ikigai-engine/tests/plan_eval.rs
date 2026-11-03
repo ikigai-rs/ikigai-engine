@@ -630,6 +630,35 @@ fn as_names_the_face_and_an_unreachable_one_is_refused() {
     }
 }
 
+#[test]
+fn eval_media_type_agreement_ignores_case_and_allows_parameters() {
+    let w = world();
+    let plan = fixture("plan-linkcheck-strict");
+    for face in ["TEXT/PLAIN", "Text/Plain; charset=utf-8"] {
+        let same = w
+            .eval(&plan, &[("as", face)], &Capability::root())
+            .expect("the result already has the requested media type");
+        assert_eq!(same.repr_type.media_type, "text/plain");
+    }
+}
+
+#[test]
+fn report_media_type_essence_ignores_case_and_parameters() {
+    let w = world();
+    let plan = fixture("plan-linkcheck-strict");
+    for endpoint in ["urn:plan:validate", "urn:plan:requires"] {
+        for (face, expected) in [
+            ("TEXT/PLAIN", "text/plain"),
+            ("Text/Turtle; charset=utf-8", "text/turtle"),
+        ] {
+            let report = w
+                .issue(endpoint, &plan, &[("as", face)], &Capability::root())
+                .expect("a report face is a case-insensitive media type essence");
+            assert_eq!(report.repr_type.media_type, expected);
+        }
+    }
+}
+
 // --- validation ----------------------------------------------------------------------
 
 /// A step fed two ways — the shapes catch this one.
