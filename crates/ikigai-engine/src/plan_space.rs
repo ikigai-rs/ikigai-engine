@@ -43,8 +43,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ikigai_core::{
-    space_iri, ArgRef, ArgSpec, AsyncFnEndpoint, Body, ContentId, Description, EndpointSpace,
-    Error, Exact, Invocation, Iri, Provenance, ReprType, Representation, Request, Result, Verb,
+    media_type_essence, media_types_agree, space_iri, ArgRef, ArgSpec, AsyncFnEndpoint, Body,
+    ContentId, Description, EndpointSpace, Error, Exact, Invocation, Iri, Provenance, ReprType,
+    Representation, Request, Result, Verb,
 };
 use oxigraph::io::RdfFormat;
 use oxrdf::{Literal, NamedNode, NamedOrBlankNode, Term, Triple};
@@ -248,7 +249,7 @@ async fn plan_text(inv: &Invocation<'_>) -> Result<String> {
 
 /// The requested face of a report: `text/plain` unless `as` says `text/turtle`.
 fn report_face(inv: &Invocation<'_>, endpoint: &str) -> Result<bool> {
-    match inv.inline_str("as").ok().map(|s| bare(s.trim())) {
+    match inv.inline_str("as").ok().map(media_type_essence).as_deref() {
         None | Some(TEXT) => Ok(false),
         Some(TURTLE) => Ok(true),
         Some(other) => Err(Error::InvalidArgument {
@@ -256,10 +257,6 @@ fn report_face(inv: &Invocation<'_>, endpoint: &str) -> Result<bool> {
             detail: format!("`{other}` is not a face of {endpoint} (text/plain, text/turtle)"),
         }),
     }
-}
-
-fn bare(media: &str) -> &str {
-    media.split(';').next().unwrap_or("").trim()
 }
 
 fn text(body: String) -> Representation {
@@ -708,7 +705,7 @@ async fn eval(inv: &Invocation<'_>) -> Result<Representation> {
         return Ok(answer);
     };
     let served = answer.repr_type.media_type.clone();
-    if bare(wanted) == bare(&served) {
+    if media_types_agree(wanted, &served) {
         return Ok(answer);
     }
     let chain = inv
