@@ -65,6 +65,14 @@ ikigai-store = "0.3.0"
 # 0.3.0 is the newest release and the one on core 0.2 (ledger #2349), the line ikigai-store 0.3 takes.
 ikigai-rdf = "0.3.0"
 
+# The disk module's `openat` family (ledger #2959): every operation below the root is made
+# relative to a held directory handle, refusing a symlinked name, with no gap between a check and
+# an act. std does not offer these, and this crate forbids `unsafe`, so `libc` cannot serve.
+# Already resolved in this workspace, through `polling` under the engine's dev dependencies; this
+# line makes it a normal dependency of the intray on unix.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [dev-dependencies]
 futures = { workspace = true }
 # oxigraph's HTTP `SERVICE` client, ON for this crate's tests. The host build already has it
@@ -79,5 +87,5 @@ oxigraph = { version = "0.5", features = ["http-client", "rdf-12"] }
 # engine's write path, and a hand-built request would only restate what we believe it sends.
 # serde_json renders the Meta the engine reads to route named arguments (without a JSON Meta
 # renderer the engine fails open and a routing defect is invisible — field guide).
-ikigai-engine = { path = "../ikigai-engine", version = "0.2.13" }
+ikigai-engine = { path = "../ikigai-engine", version = "0.2.14" }
 serde_json = { workspace = true }

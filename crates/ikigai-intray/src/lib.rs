@@ -1123,17 +1123,7 @@ fn same_file(root: &Root, a: &Rel, b: &Rel) -> bool {
     let (Ok(a), Ok(b)) = (root.metadata(a), root.metadata(b)) else {
         return false;
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        (a.dev(), a.ino()) == (b.dev(), b.ino())
-    }
-    // No stable file identity in std off unix: a note is written once and never modified,
-    // so two different notes are told apart by their size and modification time.
-    #[cfg(not(unix))]
-    {
-        (a.len(), a.modified().ok()) == (b.len(), b.modified().ok())
-    }
+    a.same_file(&b)
 }
 
 // The test seam for ledger #1595: called on the thread that moved a tuple into a stage, the
