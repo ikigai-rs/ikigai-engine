@@ -133,6 +133,27 @@ enum Last {
     Named,
 }
 
+/// Where a rival could change the tree under an operation: called wherever an operation has
+/// finished looking at a name and is about to act on the next. Nothing outside this crate's
+/// tests ever runs anything here.
+#[cfg(not(test))]
+fn race_point() {}
+
+#[cfg(test)]
+thread_local! {
+    static RACE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn race_point() {
+    RACE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
 /// The directory the intray works in, and the only door to it.
 #[derive(Debug, Clone)]
 pub(crate) struct Root {
@@ -205,6 +226,7 @@ impl Root {
                 Err(_) => checking = false,
             }
         }
+        race_point();
         Ok(path)
     }
 }
@@ -494,5 +516,256 @@ mod tests {
         let file = Rel::top().join("jobs").join("t");
         root.write(&file, b"in").unwrap();
         assert_eq!(root.read(&file).unwrap(), b"in");
+    }
+
+    /// What a rival does to the tree between a check and an act.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum Swap {
+        /// `jobs`, a directory the path passes through, becomes a link to `outside`.
+        Component,
+        /// `jobs/t`, the path's last name, becomes a link to `outside/t`.
+        Leaf,
+    }
+
+    #[cfg(unix)]
+    impl Swap {
+        fn apply(self, base: &Path) {
+            use std::os::unix::fs::symlink;
+            let jobs = base.join("root").join("jobs");
+            match self {
+                Swap::Component => {
+                    std::fs::rename(&jobs, base.join("root").join("jobs.real")).unwrap();
+                    symlink(base.join("outside"), &jobs).unwrap();
+                }
+                Swap::Leaf => {
+                    std::fs::rename(jobs.join("t"), jobs.join("t.real")).unwrap();
+                    symlink(base.join("outside").join("t"), jobs.join("t")).unwrap();
+                }
+            }
+        }
+    }
+
+    /// A time no file here has but `outside/t`, so a stat can show which file it reached.
+    #[cfg(unix)]
+    fn outside_time() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000)
+    }
+
+    /// `<base>/root` holding `jobs/t` and `keep`, and `<base>/outside` holding its own `t` and
+    /// `only`, each marked so reaching it shows.
+    #[cfg(unix)]
+    fn race_tree(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir()
+            .join("ikigai-intray-disk")
+            .join(format!("race-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (jobs, outside) = (base.join("root").join("jobs"), base.join("outside"));
+        std::fs::create_dir_all(&jobs).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(jobs.join("t"), b"inside").unwrap();
+        std::fs::write(base.join("root").join("keep"), b"inside").unwrap();
+        std::fs::write(outside.join("t"), b"outside").unwrap();
+        std::fs::write(outside.join("only"), b"outside").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(outside.join("t"))
+            .unwrap()
+            .set_modified(outside_time())
+            .unwrap();
+        base
+    }
+
+    /// Everything in `outside`: each name, its bytes when it is a file, and its mode.
+    #[cfg(unix)]
+    fn outside_now(base: &Path) -> Vec<(OsString, Vec<u8>, u32)> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut seen: Vec<_> = std::fs::read_dir(base.join("outside"))
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let meta = entry.metadata().unwrap();
+                let bytes = std::fs::read(entry.path()).unwrap_or_default();
+                (entry.file_name(), bytes, meta.permissions().mode())
+            })
+            .collect();
+        seen.sort();
+        seen
+    }
+
+    /// Every operation, each answering whether it SAW something from outside the root (what it
+    /// changed there shows in [`outside_now`]).
+    #[cfg(unix)]
+    #[allow(clippy::type_complexity)]
+    fn operations() -> Vec<(&'static str, fn(&Root) -> bool)> {
+        fn jobs() -> Rel {
+            Rel::top().join("jobs")
+        }
+        fn t() -> Rel {
+            jobs().join("t")
+        }
+        vec![
+            ("read", |r| r.read(&t()).is_ok_and(|b| b == b"outside")),
+            ("read_to_string", |r| {
+                r.read_to_string(&t()).is_ok_and(|b| b == "outside")
+            }),
+            ("metadata", |r| {
+                r.metadata(&t())
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|at| at == outside_time())
+            }),
+            ("modified", |r| {
+                r.modified(&t()).is_ok_and(|at| at == outside_time())
+            }),
+            ("is_file", |r| r.is_file(&jobs().join("only"))),
+            ("exists", |r| r.exists(&jobs().join("only"))),
+            ("list", |r| {
+                r.list(&jobs()).is_ok_and(|mut entries| {
+                    entries.any(|e| e.is_ok_and(|e| e.name() == Some("only")))
+                })
+            }),
+            ("write", |r| {
+                let _ = r.write(&t(), b"written");
+                false
+            }),
+            ("write with modes", |r| {
+                let r = r.clone().with_modes(Modes(Some((0o666, 0o777))));
+                let _ = r.write(&t(), b"written");
+                false
+            }),
+            ("write a new name", |r| {
+                let _ = r.write(&jobs().join("new"), b"written");
+                false
+            }),
+            ("rename from", |r| {
+                let _ = r.rename(&t(), &Rel::top().join("stolen"));
+                false
+            }),
+            ("rename to", |r| {
+                let _ = r.rename(&Rel::top().join("keep"), &jobs().join("planted"));
+                false
+            }),
+            ("remove_file", |r| {
+                let _ = r.remove_file(&t());
+                false
+            }),
+            ("hard_link original", |r| {
+                let _ = r.hard_link(&t(), &Rel::top().join("held"));
+                r.read(&Rel::top().join("held"))
+                    .is_ok_and(|b| b == b"outside")
+            }),
+            ("hard_link name", |r| {
+                let _ = r.hard_link(&Rel::top().join("keep"), &jobs().join("held"));
+                false
+            }),
+            ("open_lease", |r| {
+                let _ = r.open_lease(&jobs().join("lease"));
+                false
+            }),
+            ("create_dir_all", |r| {
+                let _ = r.create_dir_all(&jobs().join("made").join("deep"));
+                false
+            }),
+            ("create_dir_all with modes", |r| {
+                let r = r.clone().with_modes(Modes(Some((0o666, 0o777))));
+                let _ = r.create_dir_all(&jobs().join("made").join("deep"));
+                false
+            }),
+        ]
+    }
+
+    /// The check-then-act race (ledger #2959), made deterministic: each operation runs once per
+    /// [`race_point`] it passes, with a rival swapping a link in at exactly that point. Whatever
+    /// the operation then answers, it must not have seen or changed anything outside the root.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_swapped_in_mid_operation_reaches_nothing_outside_the_root() {
+        let mut escapes = Vec::new();
+        for (name, operation) in operations() {
+            for swap in [Swap::Component, Swap::Leaf] {
+                for point in 0..32 {
+                    let base = race_tree(&format!("{}-{swap:?}-{point}", name.replace(' ', "-")));
+                    let before = outside_now(&base);
+                    let (fired, rival_base) =
+                        (std::rc::Rc::new(std::cell::Cell::new(0)), base.clone());
+                    let count = fired.clone();
+                    RACE_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            if count.get() == point {
+                                swap.apply(&rival_base);
+                            }
+                            count.set(count.get() + 1);
+                        }));
+                    });
+                    let saw = operation(&Root::new(base.join("root")));
+                    RACE_HOOK.with(|hook| *hook.borrow_mut() = None);
+                    if saw {
+                        escapes.push(format!("{name}, {swap:?} at point {point}: read outside"));
+                    }
+                    if outside_now(&base) != before {
+                        escapes.push(format!(
+                            "{name}, {swap:?} at point {point}: changed outside"
+                        ));
+                    }
+                    let _ = std::fs::remove_dir_all(&base);
+                    if fired.get() <= point {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            escapes.is_empty(),
+            "{} escapes from the root:\n{}",
+            escapes.len(),
+            escapes.join("\n")
+        );
+    }
+
+    /// The same race with no seam: a real rival thread flipping `jobs` between the directory and
+    /// a link to `outside`, while this thread reads and writes through it. It only ever finds
+    /// an escape by luck, but no run may find one.
+    #[cfg(unix)]
+    #[test]
+    fn a_rival_thread_flipping_a_component_never_gets_a_read_or_write_out() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let base = race_tree("rival");
+        let before = outside_now(&base);
+        let stop = Arc::new(AtomicBool::new(false));
+        let rival = {
+            let (base, stop) = (base.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let (jobs, real) = (
+                    base.join("root").join("jobs"),
+                    base.join("root").join("jobs.real"),
+                );
+                while !stop.load(Ordering::Relaxed) {
+                    std::fs::rename(&jobs, &real).unwrap();
+                    std::os::unix::fs::symlink(base.join("outside"), &jobs).unwrap();
+                    std::thread::yield_now();
+                    std::fs::remove_file(&jobs).unwrap();
+                    std::fs::rename(&real, &jobs).unwrap();
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let root = Root::new(base.join("root"));
+        let t = Rel::top().join("jobs").join("t");
+        let mut read_outside = 0;
+        for i in 0..20_000 {
+            if i % 2 == 0 {
+                read_outside += root.read(&t).is_ok_and(|b| b == b"outside") as u32;
+            } else {
+                let _ = root.write(&t, b"inside");
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        rival.join().unwrap();
+        assert_eq!(
+            read_outside, 0,
+            "reads that came back from outside the root"
+        );
+        assert_eq!(outside_now(&base), before, "outside the root is as it was");
     }
 }
