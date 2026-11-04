@@ -915,12 +915,17 @@ fn assert_fork_runs(plan: &str) -> (String, Vec<String>) {
     assert!(w.drain().is_empty(), "validating runs nothing");
     let by_run = w.run(plan, Capability::root()).expect("execute");
     let transcript = w.drain();
-    let by_eval = w
+    // Its own world, like `every_fixture_runs_the_same_through_eval_as_through_run`. The stubs
+    // are cacheable, and from core 0.3.0 (ledger #2926) `execute`'s first stage and
+    // `urn:plan:eval` share a cache entry, so on one kernel this run would issue nothing at all
+    // and compare no requests.
+    let resource = world();
+    let by_eval = resource
         .eval(plan, &[], &Capability::root())
         .expect("urn:plan:eval");
     assert_eq!(
         transcript,
-        w.drain(),
+        resource.drain(),
         "urn:plan:eval issued different requests"
     );
     assert_eq!(by_run, String::from_utf8(by_eval.bytes).expect("text"));
