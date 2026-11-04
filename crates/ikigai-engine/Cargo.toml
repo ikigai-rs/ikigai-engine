@@ -34,8 +34,9 @@ oxrdf = { workspace = true, optional = true }
 # version is the root's and `ikigai-intray`'s so the pins cannot resolve apart. No features:
 # `persistent` (RocksDB) is the host's, and nothing here opens a store. Optional with the
 # reader, so a wasm build (plan-reader off) does not get oxigraph.
-# 0.3.0 is the newest release and the one on core 0.2 (ledger #2349); it carries every 0.2 floor.
-ikigai-store = { version = "0.3.0", optional = true }
+# 0.3.0 was the release on core 0.2 (ledger #2349). 0.4.0 is the release on core 0.3 (ledger
+# #3061); it carries every 0.2 floor.
+ikigai-store = { version = "0.4.0", optional = true }
 # Only for the `RdfFormat` that scan takes (the store re-exports none of oxigraph's io types),
 # so it is the store's own oxigraph line. Without default features: the default is RocksDB.
 oxigraph = { version = "0.5", default-features = false, optional = true }
@@ -69,11 +70,10 @@ plan-reader = ["dep:oxttl", "dep:oxrdf", "dep:ikigai-store", "dep:oxigraph", "ik
 async-trait = "0.1"
 # End-to-end `sink`/`source`/`cap` tests mount the real file module.
 ikigai-fs = { workspace = true }
-# Exercise combined file-read and Lisp profiles through the real sandbox and kernel verbs.
-ikigai-lisp = "0.4.1"
-# Steel's parser accepts ordered-float 5.1+, but 5.5.1 requires Rust 1.90.
-# Keep the real-Lisp tests compatible with this workspace's Rust 1.89 MSRV.
-ordered-float = "=5.4.0"
+# ikigai-lisp is out for now (ledger #3061), and ordered-float's Rust 1.89 pin with it, which only
+# the real-Lisp test needed: lisp's own tests depend on this crate, so lisp cannot reach core 0.3
+# first, and a dev-dependency on its core 0.2 release would link a second core into the test
+# build. Ledger #3062 restores both, and the test, once ikigai-lisp is on core 0.3.
 # The plan round-trip validates every rendered `ik:Process` graph against the published
 # shapes (`ikigai_vocab::SHAPES`). A renderer that emits a shape-invalid plan must fail the
 # build here, not the reader out there — and `ikigai-vocab` parses its shapes for SYNTAX
@@ -97,4 +97,5 @@ serde_json = { workspace = true }
 # 0.12.0 (ledger #2569, wave #2559): BODIES and BODY-INPUTS run by default. BODIES probes only
 # with `Suite::body_space` (the kernel's shared root); no plan door declares `reads_body`, so
 # BODY-INPUTS needs no content store. ⚠ `^0.12.0` is also a ceiling below 0.13.0.
-ikigai-conformance = "0.12.0"
+# 0.14.0 (ledger #3061) is the release on core 0.3. ⚠ `^0.14.0` is also a ceiling below 0.15.0.
+ikigai-conformance = "0.14.0"

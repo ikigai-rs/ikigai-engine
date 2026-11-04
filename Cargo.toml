@@ -70,7 +70,10 @@ members = ["crates/*"]
 # 0.2.14 (ledger #2959): the intray's disk module opens every path relative to a held directory
 # handle on unix, refusing a symlinked name, so a link swapped in mid-operation reaches nothing
 # outside the root. No public type changed: a patch. Takes `rustix` as a unix dependency.
-version = "0.2.14"
+# 0.3.0 (ledger #3061, wave 3 of the core 0.3.0 cascade, epic #2975): the re-pin onto ikigai-core
+# 0.3.0 and every ikigai dependency's release on it. Core's types are in all three crates' APIs,
+# so linking a new core is a breaking change for their consumers: the next minor.
+version = "0.3.0"
 edition = "2021"
 # Measured 2026-10-26, not assumed: 1.89 is the first toolchain that builds the workspace.
 # `ikigai-intray` takes the lease with `std::fs::File::try_lock` (stable in 1.89; 1.88 refuses
@@ -122,8 +125,11 @@ homepage = "https://github.com/ikigai-rs/ikigai-engine"
 # and `FixedArgument::reference_template`: captures in a fixed reference are percent-encoded.
 # 0.2.12 (ledger #2879) is the API floor for `media_type_essence` and
 # `media_types_agree`, used by plan report faces and result type comparisons.
-# ⚠ `^0.2.12` is also a ceiling below 0.3.0.
-ikigai-core = "0.2.12"
+# 0.3.0 (ledger #2965, taken by the cascade, ledger #3061) is the scoped content store: held
+# content is scoped to whoever delivered it, a principal-less hold is root's, and
+# `ContentStore::put` / `put_replay` are root-only. No crate here calls either. It carries every
+# floor above. ⚠ `^0.3.0` is also a ceiling below 0.4.0.
+ikigai-core = "0.3.0"
 # Raised with core, in lockstep. 0.1.70 is the first version carrying the PROCESS vocabulary
 # (`ik:Process`/`ik:Step`/`ik:Argument`/`ik:Fork`, the plan shapes in `SHAPES`, and the
 # `ikigai_vocab::plan` IRI builders) that the engine's `plan.rs` renders and reads; the tests
@@ -135,17 +141,21 @@ ikigai-core = "0.2.12"
 # checks against these shapes.
 # 0.2.9 (ledger #2667, core PR 279) fixes process:local-refs so a fork's binding
 # counts when a later step cites its join. Required by plan-eval, which validates first.
-ikigai-vocab = "0.2.9"
+# 0.3.0 (ledger #2965, #3061) moves with core's scoped content store; it carries every floor
+# above. ⚠ `^0.3.0` is also a ceiling below 0.4.0.
+ikigai-vocab = "0.3.0"
 # Dev-dependency of the engine (its end-to-end tests mount the real file module). 0.1.8 is a
 # SECURITY floor (audit round 3, ledger #856): the jail authorizes the file it actually opens.
-# 0.2.2 is the newest release and the one on core 0.2 (ledger #2349); it carries that floor.
-ikigai-fs = "0.2.2"
+# 0.2.2 was the release on core 0.2 (ledger #2349). 0.4.0 is the release on core 0.3 (ledger
+# #3061); it carries that floor.
+ikigai-fs = "0.4.0"
 # Dev-dependency of the engine: every rendered `ik:Process` graph is validated against the
 # published shapes. Default features stay on, so the validator is rudof, as on a cli host.
 # 0.3.4 is a SECURITY floor (ledger #1326) and 0.3.6 was cli's pin. 0.5.0 is the newest
-# release and the one on core 0.2 (ledger #2349). `"0.5.0"` is `<0.6.0`.
-ikigai-shacl = "0.5.0"
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.2.14" }
+# release and the one on core 0.2 (ledger #2349). 0.6.0 is the release on core 0.3 (ledger
+# #3061). `"0.6.0"` is `<0.7.0`.
+ikigai-shacl = "0.6.0"
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.3.0" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face, reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins
