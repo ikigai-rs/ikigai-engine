@@ -70,10 +70,14 @@ plan-reader = ["dep:oxttl", "dep:oxrdf", "dep:ikigai-store", "dep:oxigraph", "ik
 async-trait = "0.1"
 # End-to-end `sink`/`source`/`cap` tests mount the real file module.
 ikigai-fs = { workspace = true }
-# ikigai-lisp is out for now (ledger #3061), and ordered-float's Rust 1.89 pin with it, which only
-# the real-Lisp test needed: lisp's own tests depend on this crate, so lisp cannot reach core 0.3
-# first, and a dev-dependency on its core 0.2 release would link a second core into the test
-# build. Ledger #3062 restores both, and the test, once ikigai-lisp is on core 0.3.
+# Exercise combined file-read and Lisp profiles through the real sandbox and kernel verbs.
+# 0.5.0 is the release on core 0.3 (ledger #3062). Lisp's own tests dev-depend on this crate, so
+# at a core move this line comes out first and returns after lisp's release, as it did for
+# ledger #3061.
+ikigai-lisp = "0.5.0"
+# Steel's parser accepts ordered-float 5.1+, but 5.5.1 requires Rust 1.90.
+# Keep the real-Lisp tests compatible with this workspace's Rust 1.89 MSRV.
+ordered-float = "=5.4.0"
 # The plan round-trip validates every rendered `ik:Process` graph against the published
 # shapes (`ikigai_vocab::SHAPES`). A renderer that emits a shape-invalid plan must fail the
 # build here, not the reader out there — and `ikigai-vocab` parses its shapes for SYNTAX
