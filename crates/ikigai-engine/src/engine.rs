@@ -6141,10 +6141,51 @@ mod tests {
         );
     }
 
-    // `combined_read_only_and_lisp_profiles_allow_reads_but_deny_sinks` was here. It ran the real
-    // `ikigai_lisp::space()`, and lisp's own tests depend on this crate, so the dev-dependency is
-    // a cycle that cannot move to core 0.3 first (ledger #3061). Ledger #3062 restores it once
-    // ikigai-lisp is on core 0.3.
+    #[test]
+    fn combined_read_only_and_lisp_profiles_allow_reads_but_deny_sinks() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("cap-profiles-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "40").unwrap();
+
+        for command in ["cap read-only lisp", "cap seal read-only lisp"] {
+            let engine = Engine::new(Kernel::with_meta_renderer(
+                Arc::new(ikigai_core::Fallback::new(vec![
+                    Arc::new(ikigai_fs::space(&root)),
+                    Arc::new(ikigai_lisp::space()),
+                ])),
+                Arc::new(JsonRenderer),
+            ));
+            engine.define_cap_profile("read-only", [format!("urn:cap:fs:read:{}", root.display())]);
+            engine.define_cap_profile("lisp", ["urn:cap:lisp"]);
+            output(engine.eval(command)).unwrap();
+            assert_eq!(
+                output(engine.eval("source urn:file:notes.txt")).unwrap(),
+                "40"
+            );
+            assert_eq!(output(engine.eval("(+ 40 2)")).unwrap().trim_end(), "42");
+            assert_eq!(
+                output(engine.eval(r#"(+ 2 (string->number (source "urn:file:notes.txt")))"#))
+                    .unwrap()
+                    .trim_end(),
+                "42"
+            );
+            for sink in [
+                r#"(sink "urn:file:notes.txt" "nope")"#,
+                "sink urn:file:notes.txt nope",
+            ] {
+                let err = output(engine.eval(sink)).expect_err("read-only refuses writes");
+                assert!(err.to_ascii_lowercase().contains("denied"), "{sink}: {err}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+                "40"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn cap_net_shorthand_expands_to_a_net_scope() {
