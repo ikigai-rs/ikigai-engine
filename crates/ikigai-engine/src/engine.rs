@@ -223,11 +223,12 @@ commands:
                              a word that is not a `urn:cap:` scope or a profile is refused);
                              narrowing is REVERSIBLE: `cap reset` widens back to the identity
   cap seal [scope|profile…]  hand-off: narrow as above (or keep the current capability) and
-                             make it the session's FLOOR, one-way — `cap reset`, `logout` and
-                             `login` never rise above it again
+                             make it the session's FLOOR, one-way — `cap reset` never rises
+                             above it again, and `login` and `logout` are refused
   login [scope…] / logout    set the session identity to the minted `scope`s (the identity `cap
                              reset` returns to), or drop to the floor — auth-scheme-agnostic
-                             (also `sink urn:host:login <scope…>` / `sink urn:host:logout`)
+                             (also `sink urn:host:login <scope…>` / `sink urn:host:logout`);
+                             refused once the session is sealed
   trace [--defaults] <iri> [args]
                             resolve a resource and show its path; --defaults includes defaulted inputs
   explain <iri> [verb] [scopes=…]  a DRY RUN of resolving it (nothing is invoked): rewrites, each
@@ -420,7 +421,8 @@ pub struct Engine {
     cache: Cell<CacheStats>,
     /// The session's current authority — every request resolves under it. It starts at
     /// `identity`, and the `cap` command narrows it. ⚠ Narrowing is REVERSIBLE: `cap
-    /// reset`, `login` and `logout` widen it again, up to [`floor`](Self::floor). That is
+    /// reset`, `login` and `logout` widen it again, up to [`floor`](Self::floor), though a
+    /// sealed session refuses the typed `login` and `logout`. That is
     /// what the runbook, the tutorial and the web demo rely on (narrow, show a refusal,
     /// reset). To hand a session to someone who must NOT widen it back, seal it
     /// (`cap seal`, [`seal`](Self::seal)), which lowers the floor itself.
@@ -940,6 +942,9 @@ impl Engine {
     /// last is deliberate and is NOT re-minted, though core's design note lists this site:
     /// `login`'s scopes are typed (`login …`, `sink urn:host:login …`), so a re-mint would let
     /// whoever holds a sealed session name itself anyone and pass that name's `acts_as` gates.
+    ///
+    /// This method is the host's and is not refused by a seal (ledger #3082): it still clamps
+    /// to the floor. The typed forms are what a sealed session refuses.
     pub fn login(&self, identity: Capability) {
         let identity = self.floor.borrow().clamp(&identity);
         *self.identity.borrow_mut() = identity.clone();
@@ -949,14 +954,17 @@ impl Engine {
     /// Drop the session back to its [`floor`](Self::floor) — the anonymous state before
     /// any `login`. Root for an engine built with [`new`](Self::new) and never sealed;
     /// the scoped identity for one built with [`with_identity`](Self::with_identity); the
-    /// sealed floor after `cap seal`.
+    /// sealed floor after `cap seal`. Like [`login`](Self::login), this method is the host's:
+    /// a sealed session refuses only the typed forms.
     pub fn logout(&self) {
         self.login(self.floor());
     }
 
     /// Seal the session at its CURRENT capability: it becomes the [`floor`](Self::floor)
     /// and the identity, so `cap reset`, `logout` and `login` can never rise above it
-    /// again. One-way for this engine — a later seal can only lower the floor further.
+    /// again, and the typed `login <scope…>` and `logout` are refused from here on, by their
+    /// `sink urn:host:…` forms too (ledger #3082). One-way for this engine — a later seal can
+    /// only lower the floor further.
     /// This is the hand-off: narrow (`cap …`), then seal, then give the session away.
     pub fn seal(&self) {
         let capability = self.capability();
@@ -1805,11 +1813,15 @@ impl Engine {
     /// The minted identity is clamped to the session's [`floor`](Self::floor), and a
     /// scope the floor does not grant is NAMED in the reply rather than dropped silently.
     /// Under a root floor nothing is dropped and the reply is unchanged.
+    ///
+    /// A sealed session refuses it (ledger #3082), since it could only narrow what the host
+    /// fixed. Bare `login` changes nothing, so it still reports.
     fn run_login(&self, rest: &str) -> Result<String, String> {
         let rest = rest.trim();
         if rest.is_empty() {
             return Ok(self.describe_capability());
         }
+        self.refuse_if_sealed("login")?;
         let scopes: Vec<String> = rest.split_whitespace().map(expand_cap_shorthand).collect();
         self.login(Capability::root().attenuate(scopes.clone()));
         let granted = self.identity();
@@ -1830,10 +1842,22 @@ impl Engine {
 
     /// `logout` / `sink urn:host:logout` — drop the session back to its
     /// [`floor`](Self::floor): root for a fresh unsealed session (the state before any
-    /// `login`), the starting identity of a scoped one, the sealed floor after `cap seal`.
+    /// `login`), the starting identity of a scoped one. A sealed session refuses it (ledger
+    /// #3082).
     fn run_logout(&self) -> Result<String, String> {
+        self.refuse_if_sealed("logout")?;
         self.logout();
         Ok(format!("logged out — {}", self.describe_capability()))
+    }
+
+    /// The refusal of a typed session operation, `word`, once the session is sealed.
+    fn refuse_if_sealed(&self, word: &str) -> Result<(), String> {
+        if self.sealed.get() {
+            return Err(format!(
+                "this session is sealed, so {word} is refused: its authority was fixed by the host"
+            ));
+        }
+        Ok(())
     }
 
     /// `delete` command: remove a resource (the `Delete` verb). Same
@@ -2350,7 +2374,7 @@ impl Engine {
         }
         let floor = self.floor.borrow().clone();
         if floor == capability {
-            format!("{summary} · sealed (this is the floor: `cap reset`, `logout` and `login` cannot rise above it)")
+            format!("{summary} · sealed (this is the floor: `cap reset` cannot rise above it, and `login` and `logout` are refused)")
         } else {
             format!("{summary} · sealed at {}", summarize(&floor))
         }
@@ -6736,12 +6760,12 @@ mod tests {
             output(engine.eval("cap urn:cap:x")).unwrap();
             output(engine.eval("cap seal")).unwrap();
             assert!(engine.is_sealed());
-            output(engine.eval(form)).unwrap();
+            output(engine.eval(form)).unwrap_err();
             anonymous(&engine, &format!("sealed, `{form}`"));
             // …and neither `cap reset` nor `logout` recovers a name or root.
             output(engine.eval("cap reset")).unwrap();
             anonymous(&engine, &format!("sealed then reset, `{form}`"));
-            output(engine.eval("logout")).unwrap();
+            output(engine.eval("logout")).unwrap_err();
             anonymous(&engine, &format!("sealed then logout, `{form}`"));
 
             // A root floor: the name passes, and the session is NARROWER than root —
@@ -6939,7 +6963,7 @@ mod tests {
         assert_eq!(
             sealed,
             "sealed — capability: urn:cap:net:example.com · sealed (this is the floor: \
-             `cap reset`, `logout` and `login` cannot rise above it)"
+             `cap reset` cannot rise above it, and `login` and `logout` are refused)"
         );
         assert!(engine.is_sealed());
         let floor = Capability::scoped(["urn:cap:net:example.com".to_string()]);
@@ -6961,12 +6985,9 @@ mod tests {
             "a sealed session widened via `cap reset`"
         );
 
-        let login = output(engine.eval("login urn:cap:demo:cal:read:detail")).unwrap();
+        let login = output(engine.eval("login urn:cap:demo:cal:read:detail")).unwrap_err();
         assert!(!engine.capability().allows("urn:cap:demo:cal:read:detail"));
-        assert!(
-            login.contains("not granted, above the floor: urn:cap:demo:cal:read:detail"),
-            "{login}"
-        );
+        assert!(login.contains("sealed"), "{login}");
         assert_eq!(
             output(engine.eval("source urn:demo:cal")).unwrap(),
             "freebusy"
@@ -6996,6 +7017,111 @@ mod tests {
         );
     }
 
+    /// ledger #3082: once sealed, the typed `login` and `logout` are refused in a plain
+    /// sentence, in the command form and the resource form alike, and nothing moves: a person
+    /// at a door cannot narrow a session by accident and leave it locked down.
+    #[test]
+    fn a_sealed_session_refuses_login_and_logout_and_keeps_its_capability() {
+        const FREEBUSY: &str = "urn:cap:demo:cal:read:freebusy";
+        const DETAIL: &str = "urn:cap:demo:cal:read:detail";
+        let floor = Capability::scoped([FREEBUSY.to_string(), DETAIL.to_string()]);
+        let engine = cal_engine(Capability::root());
+        output(engine.eval(&format!("cap {FREEBUSY} {DETAIL}"))).unwrap();
+        engine.seal();
+        assert!(engine.is_sealed());
+
+        // A login naming a scope the floor grants is the one that used to narrow.
+        let refusals = [
+            (format!("login {FREEBUSY}"), "login"),
+            (format!("sink urn:host:login {FREEBUSY}"), "login"),
+            ("logout".to_string(), "logout"),
+            ("sink urn:host:logout".to_string(), "logout"),
+        ];
+        for (line, word) in &refusals {
+            assert_eq!(
+                output(engine.eval(line)).unwrap_err(),
+                format!(
+                    "this session is sealed, so {word} is refused: its authority was fixed by \
+                     the host"
+                ),
+                "`{line}` was not refused"
+            );
+            assert_eq!(engine.capability(), floor, "`{line}` moved the capability");
+            assert_eq!(engine.identity(), floor, "`{line}` moved the identity");
+            assert_eq!(engine.floor(), floor, "`{line}` moved the floor");
+            assert_eq!(
+                output(engine.eval("source urn:demo:cal")).unwrap(),
+                "DETAIL",
+                "`{line}` changed what the session reads"
+            );
+        }
+
+        // A refused `logout` does not undo a narrower `cap` either; `cap reset` still does.
+        output(engine.eval(&format!("cap {FREEBUSY}"))).unwrap();
+        let narrowed = Capability::scoped([FREEBUSY.to_string()]);
+        for (line, _) in &refusals {
+            output(engine.eval(line)).unwrap_err();
+            assert_eq!(engine.capability(), narrowed, "`{line}` moved a `cap`");
+        }
+        output(engine.eval("cap reset")).unwrap();
+        assert_eq!(engine.capability(), floor);
+    }
+
+    /// ledger #3082: bare `login` changes nothing, so a sealed session still answers it with
+    /// the same report `cap` gives.
+    #[test]
+    fn bare_login_still_reports_a_sealed_session() {
+        let engine = cal_engine(Capability::root());
+        output(engine.eval("cap seal net-example.com")).unwrap();
+        let report = output(engine.eval("cap")).unwrap();
+        assert!(report.contains("sealed"), "{report}");
+        assert_eq!(output(engine.eval("login")).unwrap(), report);
+        assert_eq!(output(engine.eval("sink urn:host:login")).unwrap(), report);
+    }
+
+    /// ledger #3082: the other half. A session that was never sealed, at a root or a scoped
+    /// floor, still narrows with `login` and restores with `logout`, by either form.
+    #[test]
+    fn an_unsealed_session_still_narrows_with_login_and_restores_with_logout() {
+        const FREEBUSY: &str = "urn:cap:demo:cal:read:freebusy";
+        const DETAIL: &str = "urn:cap:demo:cal:read:detail";
+        let floors = [
+            Capability::root(),
+            Capability::scoped([FREEBUSY.to_string(), DETAIL.to_string()]),
+        ];
+        let forms = [
+            (format!("login {FREEBUSY}"), "logout"),
+            (
+                format!("sink urn:host:login {FREEBUSY}"),
+                "sink urn:host:logout",
+            ),
+        ];
+        for floor in floors {
+            for (login, logout) in &forms {
+                let engine = cal_engine(floor.clone());
+                assert_eq!(
+                    output(engine.eval(login)).unwrap(),
+                    format!("logged in — capability: {FREEBUSY}")
+                );
+                assert_eq!(
+                    engine.capability(),
+                    Capability::scoped([FREEBUSY.to_string()])
+                );
+                assert_eq!(
+                    output(engine.eval("source urn:demo:cal")).unwrap(),
+                    "freebusy"
+                );
+                output(engine.eval(logout)).unwrap();
+                assert_eq!(engine.capability(), floor, "`{logout}` did not restore");
+                assert_eq!(
+                    output(engine.eval("source urn:demo:cal")).unwrap(),
+                    "DETAIL"
+                );
+                assert!(!engine.is_sealed());
+            }
+        }
+    }
+
     /// `cap seal <scopes|profile>` narrows and seals in one line; the profile form reads
     /// the host's registered profiles exactly as `cap` does.
     #[test]
@@ -7020,8 +7146,8 @@ mod tests {
         );
         assert_eq!(
             output(other.eval("cap")).unwrap(),
-            "capability: urn:cap:net:example.com · sealed (this is the floor: `cap reset`, \
-             `logout` and `login` cannot rise above it)"
+            "capability: urn:cap:net:example.com · sealed (this is the floor: `cap reset` \
+             cannot rise above it, and `login` and `logout` are refused)"
         );
     }
 

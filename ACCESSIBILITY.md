@@ -20,7 +20,7 @@ template](https://github.com/mgifford/ACCESSIBILITY.md) (MIT).
   `help` (`src/engine.rs`); each evaluated line as an `Action::Output` entry whose result is the
   answer or an error string; the cache verdict of a line as a word (`CacheStats::label`); the
   `explain`, `why` and `dependents` views (`src/engine/why.rs`), which pass core's own text
-  through; `bind` and names-file messages (`src/engine/bind.rs`, `src/names.rs`); script and
+  through; the refusal of `login` and `logout` in a sealed session (`src/engine.rs`); `bind` and names-file messages (`src/engine/bind.rs`, `src/names.rs`); script and
   plan refusals (`src/script.rs`, `src/plan.rs`); and a near-name suggestion under an unresolved
   name (`src/suggest.rs`).
 - **One stderr line** from the engine, when a configured keybinding is not supported
@@ -62,7 +62,8 @@ Verified by reading the source on 2026-10-31:
   pin the argument help; `an_unresolved_name_names_the_near_binding_that_is_bound` and
   `an_unresolved_name_names_the_host_build_and_its_upgrade` pin the lines under an unresolved
   name; `cache_label_formats_single_and_mixed_outcomes` and
-  `non_resolving_commands_have_no_cache_label` pin the verdict words.
+  `non_resolving_commands_have_no_cache_label` pin the verdict words;
+  `a_sealed_session_refuses_login_and_logout_and_keeps_its_capability` pins the sealed refusal.
 - `crates/ikigai-engine/src/suggest.rs`'s unit tests pin when a suggestion is made and its
   wording; `src/engine/why.rs`'s `every_command_is_in_help_and_dispatched` holds `HELP` against
   the dispatcher.
