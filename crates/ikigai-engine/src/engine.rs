@@ -484,10 +484,14 @@ pub struct Engine {
     /// The resolution chain the CURRENT line resolves in — every stage, fork branch, mapped
     /// item, contract fetch and cache probe of the line reads it, so a pipeline runs inside
     /// ONE chain (`Kernel::issue_with_incoming_in` per stage) rather than pinning its first
-    /// stage and resolving the rest live. The empty chain outside an `as-of=` line, and
-    /// restored after one, so nothing leaks into the next line: a per-request corridor needs
-    /// no session state, which is why this is not (yet) a `scope` command.
+    /// stage and resolving the rest live. [`host_scope`](Self::host_scope) outside an `as-of=`
+    /// line, and restored after one, so nothing leaks into the next line: a per-request
+    /// corridor needs no session state, which is why this is not (yet) a `scope` command.
     scope: RefCell<Scope>,
+    /// The chain every line starts from, the HOST's to set
+    /// ([`with_scope`](Self::with_scope)): empty unless it set one, so an engine with no scope
+    /// issues exactly what it always did. An `as-of=` line stacks its corridor inside it.
+    host_scope: Scope,
     /// What `show` hands a picture to — the FACE's to supply ([`with_viewer`](Self::with_viewer)),
     /// because writing a file and opening it is a fact about the medium, not the grammar (a
     /// browser frontend draws it inline; a terminal cannot). `None` ⇒ `show` is refused by name.
@@ -633,6 +637,7 @@ impl Engine {
             piped_input: RefCell::new(None),
             as_of_doors: None,
             scope: RefCell::new(Scope::empty()),
+            host_scope: Scope::empty(),
             viewer: None,
             host_build: None,
             names_atom: None,
@@ -679,10 +684,35 @@ impl Engine {
         self
     }
 
-    /// The chain an `as-of=` line resolves in, or the empty chain for a line without one.
+    /// Run every request this engine issues inside `scope`: a host's corridor, such as a
+    /// player's personal corridor at a game door. `source`, `sink`, `exists`, `delete`, the
+    /// `Meta` that fetches a contract, attached bodies, cache checks, forks and maps, stored
+    /// plans and the views all resolve in it, and an `as-of=` line stacks its temporal corridor
+    /// inside it. This replaces a [`Resolver`] wrapper that adds the corridor to each issue
+    /// method, where a method it misses silently resolves outside the corridor.
+    ///
+    /// Name the corridor ([`Scope::with_named`]): the name is its cache identity, so sessions
+    /// holding one name share cache entries. An anonymous corridor ([`Scope::with`]) shares
+    /// them only with clones of this very scope.
+    ///
+    /// A scope is spaces and a clock held in this process, so it needs an in-process kernel.
+    /// Over a resolver that cannot carry one (a wire resolver, by the trait's defaults) every
+    /// request is refused and `cache` answers `not cached`; nothing resolves outside it.
+    ///
+    /// A scope covers REQUESTS. [`Resolver::entries`] takes no chain, so `list`,
+    /// [`entries`](Self::entries) and the near-name suggestion under an unresolved name read
+    /// the root's catalog, without the corridor's names.
+    pub fn with_scope(mut self, scope: Scope) -> Self {
+        self.scope = RefCell::new(scope.clone());
+        self.host_scope = scope;
+        self
+    }
+
+    /// The chain a line resolves in: the host's ([`with_scope`](Self::with_scope), empty unless
+    /// it set one), with an `as-of=` line's temporal corridor innermost.
     fn as_of_scope(&self, as_of: Option<&AsOf>) -> Result<Scope, String> {
         let Some(as_of) = as_of else {
-            return Ok(Scope::empty());
+            return Ok(self.host_scope.clone());
         };
         let doors = self.as_of_doors.as_ref().ok_or_else(|| {
             format!(
@@ -699,7 +729,7 @@ impl Engine {
         }
         let name = Iri::parse(format!("{AS_OF_CORRIDOR_PREFIX}{}", as_of.canonical))
             .map_err(|e| e.to_string())?;
-        Ok(Scope::empty().with_named_at(
+        Ok(self.host_scope.clone().with_named_at(
             name,
             Arc::clone(doors),
             Arc::new(FixedClock::at(as_of.millis)),
@@ -1621,7 +1651,8 @@ impl Engine {
         // must not happen on a spawned worker. Stringify on this thread, after the join.
         type Slot = Arc<Mutex<Option<Result<(Representation, CacheStatus), ikigai_core::Error>>>>;
         let capability = self.capability.borrow().clone();
-        // Every branch resolves in the line's chain — a fork under `as-of=` is as-of too.
+        // Every branch resolves in the line's chain — a fork under `as-of=` or in a host's
+        // scope is in it too.
         let scope = self.line_scope();
         // The width this fan-out will actually reach: the request count bounded by how
         // many tasks the spawner carries at once, with an unknown width read as 1. The
@@ -2434,7 +2465,7 @@ impl Engine {
             ),
             format!("  transport   {}", self.resolver.transport()),
         ];
-        // An as-of line says so in the header too: the chain it resolved in, and the instant
+        // A line in a chain says so in the header too: the chain it resolved in, and the instant
         // its clock was pinned at. The kernel ALSO stamps both on every event (`scope=`,
         // `scope-clock=` — `SCOPE_NOTE`, `SCOPE_CLOCK_NOTE`), which is where they show per node.
         let scope = self.line_scope();
@@ -2719,7 +2750,8 @@ impl Engine {
     ) -> Result<Representation, String> {
         let capability = self.capability.borrow().clone();
         // The empty chain takes the unscoped path inside `issue_as_async_in` on every resolver,
-        // so a line without `as-of=` issues exactly what it issued before chains existed.
+        // so a line with no `as-of=` and no host scope issues exactly what it issued before
+        // chains existed.
         // The request is consumed by the issue; keep what the error path's argument help
         // needs to read the contract with.
         let shape = RequestShape::of(&request);

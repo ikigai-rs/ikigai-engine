@@ -78,6 +78,17 @@ With the `plan-reader` feature, `plan_space::space()` binds `urn:plan:eval`,
 `urn:plan:validate` and `urn:plan:requires`, and names itself
 `urn:iki:space:engine:plan` (`plan_space::SPACE_ID`).
 
+`Engine::with_scope(scope)` runs every request the engine issues inside a host's corridor,
+such as a player's personal corridor at a game door: `source`, `sink`, `exists`, `delete`, the
+`Meta` of a contract fetch, attached bodies, cache checks, forks and maps, stored plans and the
+views. This replaces a `Resolver` wrapper that adds the corridor to each issue method, where a
+method the wrapper misses silently resolves outside the corridor. An `as-of=` line stacks its
+temporal corridor inside the host's, and the next line is back in the host's alone. A scope is
+spaces and a clock held in this process, so a resolver that cannot carry one (a wire resolver)
+refuses the request rather than answering outside the corridor. `Resolver::entries` takes no
+chain, so `list`, `Engine::entries` and the near-name suggestion still read the root's catalog,
+without the corridor's names.
+
 `bind <name> = <verb> <target> [key=value …]` and `unbind <name>` write a named request into
 the host's names atom (`Engine::with_names_atom`); a host that names none refuses them. A
 binding is checked against its target's contract when it is written (`bind urn:x = source
