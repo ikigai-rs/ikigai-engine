@@ -1783,6 +1783,15 @@ impl Engine {
     /// of the REPL. `sink <iri> [key=value …] <content>` issues a `Sink` under the
     /// session capability (so a `cap`-narrowed session is refused by a gated
     /// endpoint exactly as a read is) and shows the endpoint's reply.
+    ///
+    /// ⚠ `sink <iri>` with nothing after the target sends `content=""`: present and empty,
+    /// not absent. Only a batch's idle stdin sends no `content` at all
+    /// ([`set_piped_input_polled`](Self::set_piped_input_polled)), and only to the one sink
+    /// that took it. A caller issuing the `Request` itself may leave `content` out, so an
+    /// endpoint that tells the two apart answers the REPL differently from a direct call.
+    /// A Sink endpoint should treat blank content as a missing argument when that is what it
+    /// means. This is the REPL's settled behavior, which modules rely on, and
+    /// `a_sink_with_nothing_after_its_target_delivers_empty_content` pins it.
     async fn run_sink(&self, rest: &str) -> Result<String, String> {
         // `urn:host:login` / `urn:host:logout` are session operations, not kernel
         // resources — the engine owns the session capability, so it handles them here
@@ -1963,7 +1972,8 @@ impl Engine {
         }
         // The verbatim remainder is the content. When a `sink` carries none, a one-shot piped
         // stdin payload feeds it instead — so a value (e.g. a secret) can be piped in without
-        // ever appearing on the command line. Empty otherwise (e.g. a no-body delete).
+        // ever appearing on the command line. Empty otherwise (e.g. a no-body delete): a
+        // content-less `sink` still sends `content`, empty (see `run_sink`).
         let content = if tail.is_empty() && verb == Verb::Sink {
             // Take FIRST, then read: a deferred reader may block, and holding the
             // RefCell borrow across that is a deadlock waiting to happen.
@@ -4691,9 +4701,9 @@ mod tests {
         )
     }
 
-    /// A Sink that treats an empty body as no body at all, as a store does: the
-    /// engine always sends `content`, so the refusal reaches a person who typed
-    /// `sink <iri>` with nothing after it.
+    /// A Sink that treats an empty body as no body at all, as a store does: a bare
+    /// `sink <iri>` sends an empty `content`, so this is what makes the refusal reach a
+    /// person who typed it with nothing after it.
     fn store_endpoint() -> FnEndpoint {
         FnEndpoint::new("store", |inv: &Invocation<'_>| {
             match inv.inline_str("content") {
@@ -5408,7 +5418,11 @@ mod tests {
                 .output("text/plain"),
         );
         Engine::new(Kernel::with_meta_renderer(
-            Arc::new(EndpointSpace::new().bind(Exact::new("urn:echo"), echo)),
+            Arc::new(
+                EndpointSpace::new()
+                    .bind(Exact::new("urn:echo"), echo)
+                    .bind(Exact::new("urn:nothing"), fixed_list("")),
+            ),
             Arc::new(JsonRenderer),
         ))
     }
@@ -5432,6 +5446,103 @@ mod tests {
         assert_eq!(run(&engine, "sink urn:echo"), "content:");
         // No piped input at all (a terminal) is unchanged: an empty body.
         assert_eq!(run(&engine, "sink urn:echo"), "content:");
+    }
+
+    /// Ledger #3079: `sink X` with nothing after it delivers `content=""`, never no `content`.
+    /// Every module's behavior at the REPL depends on this, so each spelling of "nothing" is
+    /// pinned: bare, trailing blanks, after a named argument, a quoted empty token, a named
+    /// empty `content=`, a sink stage nothing flows into, and an empty upstream.
+    #[test]
+    fn a_sink_with_nothing_after_its_target_delivers_empty_content() {
+        let engine = content_probe_engine();
+        for line in [
+            "sink urn:echo",
+            "sink urn:echo    ",
+            "sink urn:echo note=x",
+            "sink urn:echo \"\"",
+            "sink urn:echo content=",
+            "source sink urn:echo",
+            "source urn:nothing | sink urn:echo",
+        ] {
+            let Action::Output(entry) = engine.eval(line) else {
+                panic!("expected Action::Output");
+            };
+            assert_eq!(entry.result.as_deref(), Ok("content:"), "{line}");
+        }
+    }
+
+    /// Ledger #3079: the one way a `sink` line goes with NO `content` is a batch's idle stdin,
+    /// and the stdin is one-shot, so only the first content-less `sink` sees it: the next is
+    /// back to an empty body.
+    #[test]
+    fn only_an_idle_stdin_delivers_no_content_and_only_once() {
+        let engine = content_probe_engine();
+        let run = |line: &str| match engine.eval(line) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        engine.set_piped_input_polled(|| None);
+        assert_eq!(run("sink urn:echo"), "no-content");
+        assert_eq!(run("sink urn:echo"), "content:");
+        // A stdin at its end having offered nothing (`< /dev/null`) is an empty body, not idle.
+        engine.set_piped_input_probed(|| Some(Vec::new()), || true);
+        assert_eq!(run("sink urn:echo"), "content:");
+    }
+
+    /// Ledger #3079, the trap the documentation warns of: a request made directly with no
+    /// `content` reaches the endpoint with none and the same `sink` typed at the REPL reaches
+    /// it with an empty one, so an endpoint that refuses only a MISSING `content` answers the
+    /// two differently. One that treats blank as missing refuses both.
+    #[test]
+    fn a_bare_sink_differs_from_a_direct_call_unless_the_endpoint_treats_blank_as_missing() {
+        // Refuses a missing `content`, as `inline_str` does, and takes any value it is given.
+        let unchecked = FnEndpoint::new("unchecked", |inv: &Invocation<'_>| {
+            let body = inv.inline_str("content")?;
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("took:{body}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("unchecked")
+                .verb(Verb::Sink)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("content").summary("the body")),
+        );
+        let kernel = Arc::new(Kernel::with_meta_renderer(
+            Arc::new(
+                EndpointSpace::new()
+                    .bind(Exact::new("urn:test:unchecked"), unchecked)
+                    .bind(Exact::new("urn:test:store"), store_endpoint()),
+            ),
+            Arc::new(JsonRenderer),
+        ));
+        let direct = |target: &str| {
+            let request = Request::new(Verb::Sink, Iri::parse(target).unwrap());
+            kernel.issue(request).map(|(answer, _)| answer)
+        };
+        let engine = Engine::new(Arc::clone(&kernel));
+        let at_the_repl = |target: &str| match engine.eval(&format!("sink {target}")) {
+            Action::Output(entry) => entry.result,
+            _ => panic!("expected Action::Output"),
+        };
+
+        // Called directly, the argument is absent, and that is refused...
+        assert!(matches!(
+            direct("urn:test:unchecked"),
+            Err(ikigai_core::Error::MissingArgument(_))
+        ));
+        // ...and at the REPL it is present and empty, so the endpoint runs on it.
+        assert_eq!(at_the_repl("urn:test:unchecked").as_deref(), Ok("took:"));
+
+        // An endpoint that treats blank as missing answers the same both ways.
+        assert!(matches!(
+            direct("urn:test:store"),
+            Err(ikigai_core::Error::MissingArgument(_))
+        ));
+        assert!(at_the_repl("urn:test:store")
+            .unwrap_err()
+            .starts_with("missing required argument `content`"));
     }
 
     /// Two DELETE endpoints: `urn:claim` declares `content` on its per-verb Delete (a release

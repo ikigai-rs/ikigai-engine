@@ -123,6 +123,31 @@ for ordered, independent steps (`ik:step` is unordered, and the runner runs only
 `config` is a small user-settings reader (used by the `config` command and the TUI's
 keybindings); on a target with no config directory it reports defaults.
 
+## What a Sink endpoint receives
+
+`sink <iri>` with nothing after the target sends `content=""`: the argument is present and
+empty, not absent. The same goes for `sink <iri> key=value` with no remainder, `sink <iri> ""`,
+`sink <iri> content=`, and a `sink` stage that nothing flows into or whose upstream produced
+nothing. Only a batch's idle stdin (a `-c` run whose piped stdin never offered a byte, see
+`Engine::set_piped_input_polled`) sends no `content` at all, and only to the one `sink` that
+took it; a stdin already at its end (`< /dev/null`) sends an empty body.
+
+A caller that builds the `Request` itself can leave `content` out, so an endpoint that tells
+missing from empty behaves differently at the REPL than when called directly. If blank content
+means a missing argument to your endpoint, treat it as one, so that both ways of calling it get
+the same refusal:
+
+```rust,ignore
+let body = inv.inline_str("content").unwrap_or("");
+if body.trim().is_empty() {
+    return Err(ikigai_core::Error::MissingArgument("content".to_string()));
+}
+```
+
+A declared `content` argument does not do this for you: an empty value is a value. Every
+module's behavior at the REPL depends on these semantics, so they will not change; the engine's
+tests pin them.
+
 ## License
 
 MIT OR Apache-2.0.
