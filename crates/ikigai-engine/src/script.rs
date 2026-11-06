@@ -28,10 +28,26 @@
 //! A value is substituted as ONE word: outside a `"…"` span it is quoted when it would
 //! otherwise split (whitespace, an operator, a quote, or empty), and inside one its `"` and
 //! `\` are escaped. So `in={who}` with `who=two words` sends `two words` to `in`.
+//!
+//! A script runs another with the `script <iri> [key=value …]` command (ledger #3185), which
+//! the engine dispatches like any other, so a script run as a file accepts every line the REPL
+//! does. It reads the stored script under the session capability, runs its lines as
+//! [`Engine::run_script`] does, and answers their answers one per line; a failing line stops it
+//! and is its error, naming the script and the line.
 
 use std::collections::BTreeMap;
 
-use crate::engine::{Action, Engine};
+use ikigai_core::{Request, Verb};
+
+use crate::engine::{parse_target, Action, Engine, HELP};
+
+/// How deep `script` commands may run inside one another before the next is refused. A
+/// script that runs itself is refused at once, by name.
+pub const MAX_DEPTH: usize = 16;
+
+/// The usage line of the `script` command, for its refusals.
+const USAGE: &str = "usage: `script <iri> [key=value …]` runs the `.iki` script stored at \
+                     <iri>, one line at a time, stopping at the first that fails";
 
 /// One declared parameter: `# @param <name> [= <default>]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -408,4 +424,131 @@ impl Engine {
             error: None,
         }
     }
+}
+
+impl Engine {
+    /// The `script <iri> [key=value …]` command: read the script stored at `<iri>` and run its
+    /// lines, with each `key=value` one of its declared parameters. The answer is each line's
+    /// answer, one per line; the error is the first failing line's, or why no line ran.
+    pub(crate) async fn run_script_command(&self, rest: &str) -> Result<String, String> {
+        let mut words = words(rest)?.into_iter();
+        let iri = words.next().ok_or_else(|| USAGE.to_string())?;
+        if iri.contains('=') && !iri.contains(':') {
+            return Err(format!(
+                "`{iri}` is a parameter; the script's IRI comes first. {USAGE}"
+            ));
+        }
+        let supplied = params(words)?;
+        let target = parse_target(&iri)?;
+        let running = self.scripts.borrow().clone();
+        if running.contains(&iri) {
+            return Err(format!(
+                "the script {iri} is already running, so it would run itself without end: {} → \
+                 {iri}",
+                running.join(" → ")
+            ));
+        }
+        if running.len() >= MAX_DEPTH {
+            return Err(format!(
+                "`script {iri}` would run scripts more than {MAX_DEPTH} deep, inside one another"
+            ));
+        }
+        let text = self
+            .run(Request::new(Verb::Source, target))
+            .await
+            .map_err(|e| format!("cannot read the script {iri}: {e}"))?;
+        let lines = Script::parse(&text)
+            .and_then(|script| script.bind(&supplied))
+            .map_err(|error| format!("the script {iri}: {error}"))?;
+        self.scripts.borrow_mut().push(iri.clone());
+        let _running = Running(&self.scripts);
+        self.run_script_lines(&iri, lines).await
+    }
+
+    async fn run_script_lines(
+        &self,
+        iri: &str,
+        lines: Vec<(usize, String)>,
+    ) -> Result<String, String> {
+        let mut answers = Vec::new();
+        for (number, line) in lines {
+            // Boxed: a line may itself be a `script` command, so this future may hold itself.
+            match Box::pin(self.eval_async(&line)).await {
+                Action::Output(entry) => match entry.result {
+                    Ok(answer) => answers.push(answer),
+                    Err(e) => {
+                        return Err(format!("the script {iri} stopped at line {number}: {e}"))
+                    }
+                },
+                Action::Help => answers.push(HELP.to_string()),
+                Action::Quit => break,
+                Action::Clear | Action::Noop => {}
+            }
+        }
+        Ok(answers.join("\n"))
+    }
+}
+
+/// Takes the innermost running script off the stack when its run ends, however it ends.
+struct Running<'a>(&'a std::cell::RefCell<Vec<String>>);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.borrow_mut().pop();
+    }
+}
+
+/// The words of a `script` command: split at whitespace, where `"…"` keeps a span together
+/// and `\"` and `\\` inside it are a quote and a backslash, as the engine reads them. So
+/// `who="two words"` gives `who` the value `two words`.
+fn words(text: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => words.extend(word.take()),
+            '"' => {
+                let word = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(e @ ('"' | '\\')) => word.push(e),
+                            Some(other) => {
+                                word.push('\\');
+                                word.push(other);
+                            }
+                            None => return Err("an unterminated `\\` escape".to_string()),
+                        },
+                        Some(c) => word.push(c),
+                        None => return Err("an unterminated `\"`".to_string()),
+                    }
+                }
+            }
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    Ok(words)
+}
+
+/// `key=value` words as a script's parameters. A word with no `=` and a name given twice are
+/// refused; whether the script declares each name is [`Script::bind`]'s to say.
+fn params(words: impl IntoIterator<Item = String>) -> Result<BTreeMap<String, String>, String> {
+    let mut params = BTreeMap::new();
+    for word in words {
+        let Some((name, value)) = word.split_once('=') else {
+            return Err(format!(
+                "`{word}` is not a parameter: give a script's parameters as `name=value`"
+            ));
+        };
+        if name.is_empty() {
+            return Err(format!("`{word}` names no parameter: write `name=value`"));
+        }
+        if params.insert(name.to_string(), value.to_string()).is_some() {
+            return Err(format!("the parameter `{name}` is given twice"));
+        }
+    }
+    Ok(params)
 }

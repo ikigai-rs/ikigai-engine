@@ -64,6 +64,9 @@ Verified by reading the source on 2026-10-31:
   name; `cache_label_formats_single_and_mixed_outcomes` and
   `non_resolving_commands_have_no_cache_label` pin the verdict words;
   `a_sealed_session_refuses_login_and_logout_and_keeps_its_capability` pins the sealed refusal.
+- `crates/ikigai-engine/tests/script.rs`: `a_failing_line_of_a_stored_script_stops_both_and_names_its_line`
+  and `a_script_that_runs_itself_is_stopped` pin how a `script` command's refusal names the
+  script, its line and, for a script that runs itself, the chain of scripts running.
 - `crates/ikigai-engine/src/suggest.rs`'s unit tests pin when a suggestion is made and its
   wording; `src/engine/why.rs`'s `every_command_is_in_help_and_dispatched` holds `HELP` against
   the dispatcher.

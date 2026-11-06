@@ -41,6 +41,7 @@ pub const COMMANDS: &[&str] = &[
     "unbind",
     ":lisp",
     ":load",
+    "script",
     "cache",
     "cap",
     "login",
