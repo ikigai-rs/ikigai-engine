@@ -3524,10 +3524,13 @@ impl Parser {
                 // `… | sink <iri> [key=value …]` sinks the piped value into `<iri>`.
                 // (A source target is always a scheme'd IRI, never the bare word
                 // `sink`, so this keyword can't shadow a real resource.)
-                if words.first().map(|word| &**word) == Some("sink") {
-                    Ok(Node::Sink(words.split_off(1)))
-                } else {
-                    Ok(Node::Source(words))
+                // Likewise `… | source <iri>` (or `src`) names the default verb outright:
+                // the keyword goes, so the stage is `… | <iri>` (ledger #3171; it used to
+                // stay the target and fail as the IRI `source`, "No scheme found").
+                match words.first().map(|word| &**word) {
+                    Some("sink") => Ok(Node::Sink(words.split_off(1))),
+                    Some("source" | "src") => Ok(Node::Source(words.split_off(1))),
+                    _ => Ok(Node::Source(words)),
                 }
             }
             Some(Token::Close) => Err("empty fork branch or group `()`".to_string()),
@@ -7605,6 +7608,21 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_source_stage_drops_the_keyword() {
+        // `A | source <iri>` pipes into `<iri>` exactly as `A | <iri>` does (ledger #3171:
+        // the keyword stayed the stage's target, so the bare word `source` was parsed as
+        // an IRI → "No scheme found in an absolute IRI").
+        let engine = builtin_engine();
+        for line in [
+            "source urn:demo:echo/hi | source urn:test:upper",
+            "source urn:demo:echo/hi | src urn:test:upper",
+            "source urn:demo:echo/hi | urn:test:upper",
+        ] {
+            assert_eq!(output(engine.eval(line)).unwrap(), "HI", "{line}");
+        }
+    }
+
+    #[test]
     fn quotes_keep_a_pipe_literal_in_the_input() {
         // Without quoting this would split into two stages; the quotes make
         // `a | b` a single literal input to toUpper.
@@ -7834,6 +7852,14 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn parse_spec_strips_a_source_keyword_from_a_later_stage() {
+        // `a | source urn:x k=v` parses as `a | urn:x k=v` (ledger #3171).
+        let bare = parse_spec("urn:a | urn:x k=v").unwrap();
+        assert_eq!(parse_spec("urn:a | source urn:x k=v").unwrap(), bare);
+        assert_eq!(parse_spec("urn:a | src urn:x k=v").unwrap(), bare);
     }
 
     #[test]
