@@ -1770,8 +1770,8 @@ impl Resolver for Kernel {
         scope: Scope,
         attach: Option<(String, Body)>,
     ) -> Result<(Representation, CacheStatus), Error> {
-        let was_cached =
-            attach.is_none() && Kernel::is_cached_in(self, &request, capability, &scope);
+        let was_cached = attached_probe(&request, attach.as_ref())
+            .is_some_and(|probe| Kernel::is_cached_in(self, &probe, capability, &scope));
         let issue = body_issue(incoming, scope, attach);
         let representation = Kernel::issue_with(self, request, capability, issue).await?;
         let status = cache_status(was_cached, &representation);
@@ -1786,10 +1786,8 @@ impl Resolver for Kernel {
         scope: Scope,
         attach: Option<(String, Body)>,
     ) -> Result<(Representation<Body>, CacheStatus), Error> {
-        // The probe keys on the request as sent; an attached body's id is minted by the
-        // issue, so a request carrying one is not probed (a one-shot one is never cached).
-        let was_cached =
-            attach.is_none() && Kernel::is_cached_in(self, &request, capability, &scope);
+        let was_cached = attached_probe(&request, attach.as_ref())
+            .is_some_and(|probe| Kernel::is_cached_in(self, &probe, capability, &scope));
         let issue = body_issue(incoming, scope, attach);
         let representation = Kernel::issue_body_with(self, request, capability, issue).await?;
         let status = if representation.bytes.is_one_shot() {
@@ -1939,6 +1937,22 @@ fn cache_status<B>(was_cached: bool, representation: &Representation<B>) -> Cach
         CacheStatus::Hit
     } else {
         CacheStatus::Miss
+    }
+}
+
+/// The request a pipe stage is cached under, to probe the cache with before it is issued:
+/// `request` itself when nothing is attached, and with the attached body's content id as
+/// the argument when the body knows its digest (a [`Replay`](ikigai_core::Replay) with a
+/// validator, such as a file's), which is the id core attaches it under, so the stage's
+/// answer can be served from the cache (ledger #3187). `None` for any other body: core
+/// attaches it under a fresh nonce, so the request never repeats and is never served cached.
+fn attached_probe(request: &Request, attach: Option<&(String, Body)>) -> Option<Request> {
+    match attach {
+        None => Some(request.clone()),
+        Some((name, Body::Replay(replay))) => replay
+            .validator()
+            .map(|id| request.clone().with_arg(name.clone(), ArgRef::Content(id))),
+        Some(_) => None,
     }
 }
 
