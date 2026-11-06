@@ -275,3 +275,36 @@ fn quit_ends_a_script_without_error() {
     assert!(run.succeeded());
     assert_eq!(*log.lock().unwrap(), vec!["one".to_string()]);
 }
+
+#[test]
+fn a_doubled_brace_is_template_text_not_a_capture() {
+    // Ledger #3186: a script that writes a template (`$h{{mag}}`) carries its placeholders
+    // through as they are, beside a parameter of its own on the same line.
+    let (engine, _) = engine();
+    let script = "# @param who = world\n\
+                  source urn:t:mark \"in=$h{{mag}} to {who}, {{ who }} {{who}}\"\n\
+                  source urn:t:mark in=$h{{mag}}\n";
+    let run = engine.run_script(script, &args(&[]));
+    assert!(run.succeeded(), "{:?}", run.error);
+    assert_eq!(
+        answers(&run),
+        vec![
+            (2, Ok("$h{{mag}} to world, {{ who }} {{who}}".to_string())),
+            (3, Ok("$h{{mag}}".to_string())),
+        ]
+    );
+}
+
+#[test]
+fn an_undeclared_capture_inside_quotes_is_refused_too() {
+    // Before #3186 only an unquoted capture was checked, so this one panicked the engine.
+    let (engine, log) = engine();
+    let run = engine.run_script("source urn:t:mark \"in=hi {x}\"\n", &args(&[]));
+    let error = run.error.expect("refused");
+    assert_eq!(error.line, Some(1));
+    assert!(
+        error.message.contains("`{x}` names no declared parameter"),
+        "{error}"
+    );
+    assert!(log.lock().unwrap().is_empty(), "no line may run");
+}
