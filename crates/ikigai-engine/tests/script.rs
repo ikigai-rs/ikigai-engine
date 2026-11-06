@@ -30,7 +30,8 @@ impl MetaRenderer for JsonRenderer {
 type Log = Arc<Mutex<Vec<String>>>;
 
 /// `urn:text:upper` upper-cases `in`, `urn:t:fail` always fails, and `urn:t:mark` records
-/// its `in`, so a test can see which lines ran.
+/// its `in`, so a test can see which lines ran. `urn:t:inner.iki` is a stored script
+/// ([`INNER`]) and `urn:t:loop.iki` one that runs itself.
 fn engine() -> (Engine, Log) {
     let log: Log = Arc::default();
     let marks = Arc::clone(&log);
@@ -62,6 +63,24 @@ fn engine() -> (Engine, Log) {
                 ))
             })
             .with_description(text("mark")),
+        )
+        .bind(
+            Exact::new("urn:t:inner.iki"),
+            FnEndpoint::new("inner", |_: &Invocation<'_>| {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    INNER.as_bytes().to_vec(),
+                ))
+            }),
+        )
+        .bind(
+            Exact::new("urn:t:loop.iki"),
+            FnEndpoint::new("loop", |_: &Invocation<'_>| {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"script urn:t:loop.iki\n".to_vec(),
+                ))
+            }),
         )
         .bind(
             Exact::new("urn:t:fail"),
@@ -99,6 +118,11 @@ const GREET: &str = "#!/usr/bin/env ikigai\n\
                      # Greet someone, loudly.\n\
                      # @param who = world\n\
                      \n\
+                     source urn:text:upper in={who}\n";
+
+/// A stored script another runs with `script`: it marks its parameter, then upper-cases it.
+const INNER: &str = "# @param who = world\n\
+                     source urn:t:mark in={who}\n\
                      source urn:text:upper in={who}\n";
 
 // --- comments ----------------------------------------------------------------------------
@@ -307,4 +331,89 @@ fn an_undeclared_capture_inside_quotes_is_refused_too() {
         "{error}"
     );
     assert!(log.lock().unwrap().is_empty(), "no line may run");
+}
+
+// --- a script that runs another (ledger #3185) -------------------------------------------
+
+#[test]
+fn a_script_runs_a_stored_script_as_the_repl_does() {
+    let (engine, log) = engine();
+    let script = "source urn:t:mark in=before\n\
+                  script urn:t:inner.iki who=\"two words\"\n\
+                  source urn:t:mark in=after\n";
+    let run = engine.run_script(script, &args(&[]));
+    assert!(run.succeeded(), "{:?}", run.error);
+    assert_eq!(
+        answers(&run),
+        vec![
+            (1, Ok("before".to_string())),
+            (2, Ok("two words\nTWO WORDS".to_string())),
+            (3, Ok("after".to_string())),
+        ]
+    );
+    assert_eq!(*log.lock().unwrap(), vec!["before", "two words", "after"]);
+}
+
+#[test]
+fn a_stored_script_takes_its_defaults_and_refuses_an_undeclared_parameter() {
+    let (engine, _) = engine();
+    match engine.eval("script urn:t:inner.iki") {
+        Action::Output(entry) => assert_eq!(entry.result, Ok("world\nWORLD".to_string())),
+        _ => panic!("expected output"),
+    }
+    let error = engine
+        .run_script("script urn:t:inner.iki nobody=x\n", &args(&[]))
+        .error
+        .expect("refused");
+    assert_eq!(error.line, Some(1));
+    assert!(
+        error.message.contains("declares no parameter `nobody`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_failing_line_of_a_stored_script_stops_both_and_names_its_line() {
+    let (engine, log) = engine();
+    let script = "script urn:t:inner.iki who=x\n\
+                  script urn:t:inner.iki who\n\
+                  source urn:t:mark in=never\n";
+    let error = engine
+        .run_script(script, &args(&[]))
+        .error
+        .expect("stopped");
+    assert_eq!(error.line, Some(2));
+    assert!(
+        error.message.contains("`who` is not a parameter"),
+        "{error}"
+    );
+
+    let script = "source urn:t:mark in=one\nscript urn:t:missing.iki\nsource urn:t:mark in=two\n";
+    let error = engine
+        .run_script(script, &args(&[]))
+        .error
+        .expect("stopped");
+    assert_eq!(error.line, Some(2));
+    assert!(error.message.contains("urn:t:missing.iki"), "{error}");
+    assert_eq!(*log.lock().unwrap(), vec!["x", "one"]);
+}
+
+#[test]
+fn a_script_that_runs_itself_is_stopped() {
+    let (engine, _) = engine();
+    let error = engine
+        .run_script("script urn:t:loop.iki\n", &args(&[]))
+        .error
+        .expect("stopped");
+    assert_eq!(error.line, Some(1));
+    assert_eq!(
+        error.message,
+        "the script urn:t:loop.iki stopped at line 1: the script urn:t:loop.iki is already \
+         running, so it would run itself without end: urn:t:loop.iki → urn:t:loop.iki"
+    );
+    // The refusal unwound the run: the same engine runs the stored script again.
+    match engine.eval("script urn:t:inner.iki") {
+        Action::Output(entry) => assert_eq!(entry.result, Ok("world\nWORLD".to_string())),
+        _ => panic!("expected output"),
+    }
 }

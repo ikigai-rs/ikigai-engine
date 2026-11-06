@@ -128,7 +128,10 @@ script of REPL lines (a `.iki` file) in file order: `# @param <name>` or `# @par
 <default>` declares a parameter a line uses as `{name}`, an undeclared `{x}` or parameter is
 refused before any line runs, a doubled brace (`{{` through `}}`, as in `$h{{mag}}`) is template
 text copied as it is, and the run stops at the first failing line, reporting its
-number and error. A script does not compile to a plan yet: the process vocabulary has no term
+number and error. The `script <iri> [key=value …]` command runs a script stored at `<iri>`
+the same way, so one script can run another and a script run as a file accepts every command
+the REPL does; a script that runs itself is refused, naming the scripts running. A script does
+not compile to a plan yet: the process vocabulary has no term
 for ordered, independent steps (`ik:step` is unordered, and the runner runs only what the one
 `ik:result` depends on).
 

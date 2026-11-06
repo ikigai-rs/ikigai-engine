@@ -216,6 +216,8 @@ commands:
   (<sexpr>)                  evaluate a Lisp form (leading `(` routes to urn:lisp:eval)
   :lisp                      enter multi-line Lisp mode; a blank line evaluates, `:lisp` cancels
   :load <uri> [cap=<scope>]  read a script resource and evaluate it as Lisp (cap= narrows first)
+  script <iri> [k=v …]       run the `.iki` script stored at <iri>: its REPL lines in order, each
+                             k=v one of its `# @param`s, stopping at its first failing line
   cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
   cap [scope|profile…]       show the session capability, narrow it, or `cap reset`
                              (profiles combine: `cap read-only lisp`);
@@ -455,6 +457,10 @@ pub struct Engine {
     /// (cancel). `None` in the normal verb-grammar mode. Interior-mutable so the
     /// `&self` eval path can toggle and accumulate; the REPL is single-threaded.
     lisp_buffer: RefCell<Option<Vec<String>>>,
+    /// The IRIs of the `script` commands running inside one another now, outermost first, so
+    /// a script that runs itself (or one deeper than [`crate::script::MAX_DEPTH`]) is refused
+    /// instead of recursing without end.
+    pub(crate) scripts: RefCell<Vec<String>>,
     /// Whether an automatic fan-out width hint may be appended to the requests of a
     /// fork/map whose target declares it reads `needs=` (see [`crate::fanout`]).
     /// **Off unless a host turns it on**: routing by width changes *which backend*
@@ -634,6 +640,7 @@ impl Engine {
             fan_out: RefCell::new(None),
             contract_notes: RefCell::new(Vec::new()),
             lisp_buffer: RefCell::new(None),
+            scripts: RefCell::new(Vec::new()),
             piped_input: RefCell::new(None),
             as_of_doors: None,
             scope: RefCell::new(Scope::empty()),
@@ -1118,6 +1125,7 @@ impl Engine {
             "show" => output(self, self.run_show(rest).await),
             ":lisp" => output(self, self.enter_lisp_mode()),
             ":load" => output(self, self.run_load(rest).await),
+            "script" => output(self, self.run_script_command(rest).await),
             "source" | "src" => output(self, self.run_source_command(rest).await),
             "plan" => output(self, self.run_plan(rest).await),
             "execute" => output(self, self.run_stored_plan(rest).await),
@@ -2732,7 +2740,7 @@ impl Engine {
     /// representation as UTF-8 text for display. The resolver reports the
     /// [`CacheStatus`] directly — for a remote kernel the server knows it without
     /// a probe.
-    async fn run(&self, request: Request) -> Result<String, String> {
+    pub(crate) async fn run(&self, request: Request) -> Result<String, String> {
         // No pipe upstream (sink / meta / a single source): resolve on its own merits.
         self.run_staged(request, None).await?.into_text()
     }
