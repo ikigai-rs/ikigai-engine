@@ -12,6 +12,9 @@
 //!   identifier (`^[A-Za-z_][A-Za-z0-9_-]*$`, the pattern of a plan's `ik:inputName`). An
 //!   undeclared `{x}` is refused before any line runs, naming the line; a parameter with no
 //!   default must be given; a parameter the script does not declare is refused by name.
+//!   A doubled brace is template text, not a parameter: `{{` through the next `}}` is copied
+//!   as it is (ledger #3186), so a script that writes a template (`$h{{mag}}`) carries its
+//!   placeholders through untouched.
 //! * **Stop on error.** The run stops at the first line that fails and reports that line's
 //!   number and error ([`ScriptError`]); a host exits non-zero on it.
 //!
@@ -258,12 +261,13 @@ fn unquote(default: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// Each `{name}` in `line` whose inside is an identifier, in order. A brace around anything
-/// else (`{"a":1}`, `{}`) is not a capture and is left alone.
+/// Each `{name}` in `line` whose inside is an identifier, in order, quoted or not. A brace
+/// around anything else (`{"a":1}`, `{}`) is not a capture and is left alone, and neither is
+/// a doubled brace (`{{mag}}`), which is template text.
 fn captures(line: &str) -> Vec<String> {
     let mut found = Vec::new();
     scan(line, |piece| {
-        if let Piece::Capture(name) = piece {
+        if let Piece::Capture(name) | Piece::QuotedCapture(name) = piece {
             found.push(name.to_string());
         }
     });
@@ -279,10 +283,12 @@ enum Piece<'a> {
 }
 
 /// Walk `line` into text and captures, tracking the engine's `"…"` quoting (with its `\"`
-/// and `\\` escapes) so a substitution knows which spelling keeps the value one word.
+/// and `\\` escapes) so a substitution knows which spelling keeps the value one word. Nothing
+/// from a `{{` through the next `}}` (or the line's end) is a capture.
 fn scan<'a>(line: &'a str, mut each: impl FnMut(Piece<'a>)) {
     let bytes = line.as_bytes();
     let mut quoted = false;
+    let mut template = false;
     let mut start = 0;
     let mut i = 0;
     while i < bytes.len() {
@@ -292,7 +298,15 @@ fn scan<'a>(line: &'a str, mut each: impl FnMut(Piece<'a>)) {
                 quoted = !quoted;
                 i += 1;
             }
-            b'{' => {
+            b'{' if bytes.get(i + 1) == Some(&b'{') => {
+                template = true;
+                i += 2;
+            }
+            b'}' if template && bytes.get(i + 1) == Some(&b'}') => {
+                template = false;
+                i += 2;
+            }
+            b'{' if !template => {
                 let close = line[i + 1..].find('}').map(|offset| i + 1 + offset);
                 match close {
                     Some(close) if is_identifier(&line[i + 1..close]) => {

@@ -126,7 +126,8 @@ A line whose first non-blank character is `#` is a comment (so a `#!` shebang is
 `#` anywhere else keeps its meaning. `ikigai_engine::script` and `Engine::run_script` run a
 script of REPL lines (a `.iki` file) in file order: `# @param <name>` or `# @param <name> =
 <default>` declares a parameter a line uses as `{name}`, an undeclared `{x}` or parameter is
-refused before any line runs, and the run stops at the first failing line, reporting its
+refused before any line runs, a doubled brace (`{{` through `}}`, as in `$h{{mag}}`) is template
+text copied as it is, and the run stops at the first failing line, reporting its
 number and error. A script does not compile to a plan yet: the process vocabulary has no term
 for ordered, independent steps (`ik:step` is unordered, and the runner runs only what the one
 `ik:result` depends on).
