@@ -193,11 +193,12 @@ impl Engine {
                 return Ok(Vec::new())
             }
             Err(e) => {
+                self.note_failure(&e);
                 return Err(format!(
                     "the names atom <{}> could not be read: {}",
                     atom.as_str(),
                     describe(&*self.resolver, &e, self.host_build.as_ref())
-                ))
+                ));
             }
         };
         let text = String::from_utf8(bytes)

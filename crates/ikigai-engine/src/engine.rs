@@ -303,6 +303,19 @@ pub struct Entry {
     pub input: String,
     pub result: Result<String, String>,
     pub cache: CacheStats,
+    /// The typed error behind a failed `result`, when a resolution failed (ledger #3080).
+    ///
+    /// `result`'s `Err` is the message a face prints, with the engine's help added (a
+    /// near-name suggestion, the argument a contract declares). A face that says errors in
+    /// its own words (a door that turns a [`Conflict`](ikigai_core::Error::Conflict) into a
+    /// sentence for a player) reads the variant here instead of wrapping the `Resolver` to
+    /// capture it.
+    ///
+    /// `Some` only when `result` is `Err` and that message carries a resolver error the
+    /// line hit; when several failed (fork branches), the last one the message carries.
+    /// `None` on success, and on an error the engine raised itself (an unknown command, a
+    /// line that does not parse), which has no typed error behind it.
+    pub error: Option<ikigai_core::Error>,
 }
 
 /// A tally of the cache outcomes across the (possibly many) requests one input
@@ -477,6 +490,9 @@ pub struct Engine {
     /// [`last_contract_notes`](Self::last_contract_notes) (ledger #98). Argument routing
     /// fails open without a contract, so this is the only place that says it happened.
     contract_notes: RefCell<Vec<ContractNote>>,
+    /// The resolver errors this line explained, in order, for [`Entry::error`] (ledger
+    /// #3080). Cleared with the rest of the line's state.
+    failures: RefCell<Vec<ikigai_core::Error>>,
     /// A one-shot piped-stdin payload for a batch (`-c`) run. When the CLI is fed content on a
     /// non-TTY stdin (`… | ikigai -c 'sink <iri>'`), the first content-less `sink` uses this as
     /// its `content` — so a secret can be piped in and never touch the command line (argv/`ps`)
@@ -639,6 +655,7 @@ impl Engine {
             width_routing: false,
             fan_out: RefCell::new(None),
             contract_notes: RefCell::new(Vec::new()),
+            failures: RefCell::new(Vec::new()),
             lisp_buffer: RefCell::new(None),
             scripts: RefCell::new(Vec::new()),
             piped_input: RefCell::new(None),
@@ -883,6 +900,36 @@ impl Engine {
         self.cache.set(CacheStats::default());
         *self.fan_out.borrow_mut() = None;
         self.contract_notes.borrow_mut().clear();
+        self.failures.borrow_mut().clear();
+    }
+
+    /// Note a resolver error this line hit, for [`Entry::error`].
+    pub(crate) fn note_failure(&self, error: &ikigai_core::Error) {
+        self.failures.borrow_mut().push(error.clone());
+    }
+
+    /// The typed error behind `result`: the last resolver error this line noted whose own
+    /// words the failure message carries. A noted error the line recovered from (a probe,
+    /// a fallback) is not in the message, so it is not reported.
+    fn typed_error(&self, result: &Result<String, String>) -> Option<ikigai_core::Error> {
+        let message = result.as_ref().err()?;
+        self.failures
+            .borrow()
+            .iter()
+            .rev()
+            .find(|error| message.contains(&error.to_string()))
+            .cloned()
+    }
+
+    /// Wrap an evaluated line as [`Action::Output`], with this line's cache tally and the
+    /// typed error behind a failure.
+    fn output_entry(&self, input: String, result: Result<String, String>) -> Action {
+        Action::Output(Entry {
+            input,
+            error: self.typed_error(&result),
+            result,
+            cache: self.cache.get(),
+        })
     }
 
     /// The targets whose argument contract the last evaluated line could NOT read, one per
@@ -1054,11 +1101,7 @@ impl Engine {
         // `urn:cap:lisp` is denied cleanly by the endpoint.
         self.reset_line_stats();
         let result = self.run_lisp(src).await;
-        Action::Output(Entry {
-            input: src.to_string(),
-            result,
-            cache: self.cache.get(),
-        })
+        self.output_entry(src.to_string(), result)
     }
 
     /// The resources bound in the kernel's space, or `None` if it can't enumerate —
@@ -1090,13 +1133,7 @@ impl Engine {
         // Each `run` during this line accumulates into `self.cache`; reset it
         // first, then read it back into the entry once the command has resolved.
         self.reset_line_stats();
-        let output = |this: &Self, result| {
-            Action::Output(Entry {
-                input: line.to_string(),
-                result,
-                cache: this.cache.get(),
-            })
-        };
+        let output = |this: &Self, result| this.output_entry(line.to_string(), result);
 
         // Paren-sniff: a line whose first non-whitespace char is `(` is a Lisp
         // form — route it to `urn:lisp:eval` instead of the verb grammar. Every
@@ -1230,6 +1267,7 @@ impl Engine {
                 input: line.to_string(),
                 result: Ok("lisp mode cancelled".to_string()),
                 cache: CacheStats::default(),
+                error: None,
             });
         }
         if !line.is_empty() && line != ":end" {
@@ -1246,11 +1284,7 @@ impl Engine {
         let src = program.join("\n");
         self.reset_line_stats();
         let result = self.run_lisp(&src).await;
-        Action::Output(Entry {
-            input: src,
-            result,
-            cache: self.cache.get(),
-        })
+        self.output_entry(src, result)
     }
 
     /// `:load <uri> [cap=<scope>]` — read a script *resource* through the kernel
@@ -2714,6 +2748,7 @@ impl Engine {
     /// no JSON Meta renderer, a target that does not declare the argument — leaves the
     /// message exactly as [`describe`] gives it.
     async fn explain_failure(&self, shape: &RequestShape, error: &ikigai_core::Error) -> String {
+        self.note_failure(error);
         let text = describe(&*self.resolver, error, self.host_build.as_ref());
         let (name, missing) = match error {
             ikigai_core::Error::MissingArgument(name) => (name, true),
