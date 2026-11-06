@@ -436,8 +436,9 @@ impl ForwardingEndpoint {
     }
 
     /// The request to send the peer: the one this endpoint was resolved for, with every
-    /// content id ([`ArgRef::Content`]) replaced by the bytes it names, collected under the
-    /// run's byte budget (ledger #2286).
+    /// content id ([`ArgRef::Content`]) and every reference ([`ArgRef::Reference`])
+    /// replaced by the bytes it names, collected under the run's byte budget (ledger #2286,
+    /// ledger #2964).
     ///
     /// ★ A content id does not cross a wire. It names a body held in THIS process: one an
     /// engine attached to the request (`BodyIssue::attach`), or the local content store's,
@@ -447,17 +448,32 @@ impl ForwardingEndpoint {
     /// handed an id it cannot resolve. Until ledger #2467 decides how a live body crosses a
     /// mount, a mounted stage takes the collected path: what the peer receives is what a
     /// by-value pipe sent it. Past the budget the forward is refused (`OverBudget`), never
-    /// sent shorter. A request with no content id is forwarded as it was.
+    /// sent shorter.
+    ///
+    /// ★ A reference does not cross a wire either (ledger #2964). It names a resource in
+    /// THIS kernel's namespace, and the peer would resolve the same IRI in its own: where
+    /// both bind the name, the peer silently reads its resource, not the one the caller
+    /// meant. So a reference is settled here, by value, whatever the peer's contract says
+    /// of it. One the kernel already settled by that contract (a by-value input read here,
+    /// an `xsd:anyURI` input given the IRI's text) arrives in the invocation's request
+    /// inline and is taken from there; any other (an input read as a body, an argument the
+    /// contract does not declare, a peer with no contract) is read here, under the
+    /// caller's capability. A referent this side cannot read refuses the forward; it is
+    /// never handed to the peer to read instead. A reference into the mount's own
+    /// namespace is read through the mount, so the peer's bytes still arrive, by value.
+    ///
+    /// A request with no content id and no reference is forwarded as it was.
     async fn wire_request(&self, inv: &Invocation<'_>) -> Result<Request, Error> {
         let mut request = self.request.clone();
         let ids: Vec<String> = request
             .args
             .iter()
-            .filter(|(_, value)| matches!(value, ArgRef::Content(_)))
+            .filter(|(_, value)| matches!(value, ArgRef::Content(_) | ArgRef::Reference(_)))
             .map(|(name, _)| name.clone())
             .collect();
         for name in ids {
-            // The kernel may already have collected it into the invocation's request.
+            // The kernel may already have collected or settled it into the invocation's
+            // request.
             let bytes = match inv.request.args.get(&name) {
                 Some(ArgRef::Inline(bytes)) => bytes.clone(),
                 _ => inv.collect(inv.content_body(&name).await?).await?.to_vec(),
@@ -3959,5 +3975,175 @@ mod tests {
             CacheStatus::Uncacheable,
             "one-shot content is never cached"
         );
+    }
+
+    /// The peer's endpoints in [`two_kernels_sharing_a_name`], one per way a contract takes
+    /// a reference: a by-value input, a `reads_body` input, an open set's undeclared
+    /// argument, and a closed set's undeclared argument (the endpoint's own to read).
+    const KINDS: [&str; 4] = [
+        "urn:peer:value",
+        "urn:peer:body",
+        "urn:peer:open",
+        "urn:peer:closed",
+    ];
+
+    /// The two-kernel shape of ledger #2964: `urn:data:x` is bound on BOTH sides, to
+    /// different bytes, and the peer serves `urn:peer:<kind>` endpoints that answer with what
+    /// their `src` argument names, one per way a contract can take a reference. A `described`
+    /// peer serves its contracts ([`JsonMeta`]), so the local kernel settles a reference by
+    /// the peer's contract before the mount forwards; an undescribed one does not.
+    fn two_kernels_sharing_a_name(described: bool) -> Kernel {
+        use ikigai_core::{ArgSpec, AsyncFnEndpoint, Fallback};
+        let data = |text: &'static str| {
+            FnEndpoint::new("data", move |_inv| {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    text.as_bytes().to_vec(),
+                ))
+            })
+            .with_description(Description::new("data").verb(Verb::Source))
+        };
+        // What the endpoint was given for `src`, read the way an endpoint reads one: an
+        // inline value as itself, a reference by sourcing it in the endpoint's own kernel.
+        let echo = |description: Description| {
+            AsyncFnEndpoint::new("echo", |inv| {
+                Box::pin(async move {
+                    let body = inv.content_body("src").await?;
+                    let bytes = inv.collect(body).await?.to_vec();
+                    Ok(Representation::new(ReprType::new("text/plain"), bytes))
+                })
+            })
+            .with_description(description)
+        };
+        let space: Arc<dyn Space> = Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:data:x"), data("the peer's x"))
+                .bind(Exact::new("urn:peer:y"), data("the peer's y"))
+                .bind(Exact::new("urn:data:peer-only"), data("the peer's own"))
+                .bind(
+                    Exact::new("urn:peer:value"),
+                    echo(
+                        Description::new("value")
+                            .verb(Verb::Source)
+                            .input(ArgSpec::new("src")),
+                    ),
+                )
+                .bind(
+                    Exact::new("urn:peer:body"),
+                    echo(
+                        Description::new("body")
+                            .verb(Verb::Source)
+                            .input(ArgSpec::new("src").reads_body()),
+                    ),
+                )
+                .bind(
+                    Exact::new("urn:peer:open"),
+                    echo(
+                        Description::new("open")
+                            .verb(Verb::Source)
+                            .open_arguments("anything"),
+                    ),
+                )
+                .bind(
+                    Exact::new("urn:peer:name"),
+                    echo(
+                        Description::new("name")
+                            .verb(Verb::Source)
+                            .input(ArgSpec::new("src").class("xsd:anyURI")),
+                    ),
+                )
+                .bind(
+                    Exact::new("urn:peer:closed"),
+                    echo(Description::new("closed").verb(Verb::Source)),
+                ),
+        );
+        let peer = Arc::new(if described {
+            Kernel::with_meta_renderer(space, Arc::new(JsonMeta))
+        } else {
+            Kernel::new(space)
+        });
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(MountedRemote::overriding(
+                Arc::new(Forwarding(peer)),
+                "urn:peer:",
+                "test://peer",
+            )),
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:data:x"), data("the local x"))),
+        ])))
+    }
+
+    /// ★ Ledger #2964. A reference the caller passes through a mount names a resource in the
+    /// CALLER's namespace, so the peer must receive what that reference names HERE, never
+    /// the bare IRI to resolve against its own namespace. Before the fix, every way of
+    /// taking a reference sent the peer `urn:data:x`, and the peer answered with its own:
+    /// a by-value input lost the value the local kernel had already read (`wire_request`
+    /// rebuilt the request from the one captured at resolve time), and a `reads_body`, an
+    /// open set's or a closed set's undeclared argument was never read here at all.
+    #[test]
+    fn a_reference_through_a_mount_is_read_on_the_callers_side() {
+        for described in [true, false] {
+            settles_on_the_callers_side(&two_kernels_sharing_a_name(described), described);
+        }
+    }
+
+    fn settles_on_the_callers_side(local: &Kernel, described: bool) {
+        let through = |kind: &str, src: &str| {
+            let request = Request::new(Verb::Source, Iri::parse(kind).unwrap())
+                .with_arg("src", ArgRef::Reference(Iri::parse(src).unwrap()));
+            let answer = block_on(local.issue(request, &Capability::root()))
+                .unwrap_or_else(|error| panic!("{kind} src=<{src}>: {error}"));
+            String::from_utf8(answer.bytes).unwrap()
+        };
+        let wrong: Vec<String> = KINDS
+            .iter()
+            .map(|kind| (kind, through(kind, "urn:data:x")))
+            .filter(|(_, answer)| answer != "the local x")
+            .map(|(kind, answer)| format!("{kind} answered {answer:?}"))
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "a reference is settled on the caller's side (described peer: {described}): {wrong:?}"
+        );
+        // A reference into the mount's own namespace still names the peer's resource: it is
+        // read through the mount, so the peer's bytes arrive by value.
+        for kind in KINDS {
+            assert_eq!(
+                through(kind, "urn:peer:y"),
+                "the peer's y",
+                "{kind}, described peer: {described}"
+            );
+        }
+        // A described name input is given the reference's own text, as it is off a mount.
+        if described {
+            assert_eq!(through("urn:peer:name", "urn:data:x"), "urn:data:x");
+        }
+        // An inline value is unchanged.
+        let inline = Request::new(Verb::Source, Iri::parse("urn:peer:value").unwrap())
+            .with_arg("src", ArgRef::Inline(b"as typed".to_vec()));
+        let answer = block_on(local.issue(inline, &Capability::root())).unwrap();
+        assert_eq!(answer.bytes, b"as typed");
+    }
+
+    /// A reference whose referent the caller's side does not hold is refused here, naming
+    /// the argument; it is not handed to the peer to resolve in its own namespace.
+    #[test]
+    fn a_reference_the_caller_cannot_read_is_refused_not_forwarded() {
+        for (described, kind) in [true, false]
+            .into_iter()
+            .flat_map(|described| KINDS.map(|kind| (described, kind)))
+        {
+            let local = two_kernels_sharing_a_name(described);
+            let request = Request::new(Verb::Source, Iri::parse(kind).unwrap()).with_arg(
+                "src",
+                ArgRef::Reference(Iri::parse("urn:data:peer-only").unwrap()),
+            );
+            let answer = block_on(local.issue(request, &Capability::root()));
+            assert!(
+                matches!(&answer, Err(Error::Unresolved(_) | Error::NotFound(_))),
+                "{kind}, described peer {described}: the peer's own `urn:data:peer-only` \
+                 must not answer: {:?}",
+                answer.map(|a| String::from_utf8_lossy(&a.bytes).into_owned())
+            );
+        }
     }
 }
