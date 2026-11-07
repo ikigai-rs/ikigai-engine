@@ -49,7 +49,8 @@ Verified by reading the source on 2026-10-31:
   value in or pass <name>=…`; an ambiguous value by the target and its arguments; a parse error
   by the token, with a hint when the line used `'…'` quotes the engine does not honor.
 - Under an unresolved name, a near name is suggested only when one is actually bound, and a host
-  that named its build says what it is and how to upgrade.
+  that named its build says what it is and how to upgrade if a newer release is available.
+  It does not claim that another release binds the name.
 - Every command the engine dispatches is listed in `HELP`.
 
 ## How it is tested
@@ -77,8 +78,6 @@ Verified by reading the source on 2026-10-31:
 
 Found by reading the source on 2026-10-31, not by testing:
 
-- The line under an unresolved name says `a name newer than this build needs an upgrade`, even
-  when the name is a typo that no release binds.
 - The intray's recovery line prints the outcome in Rust's debug form (`{:?}`), not in words.
 - Messages wrap names in backticks (`` `name` ``), Markdown punctuation that a screen reader may
   read aloud in a terminal.
@@ -107,3 +106,4 @@ through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-en
 | Date | Change |
 |---|---|
 | 2026-10-31 | First version. |
+| 2026-11-06 | Made unresolved-name upgrade advice conditional on a newer release being available; pinned the wording in an engine unit test. |

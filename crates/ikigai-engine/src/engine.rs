@@ -653,13 +653,14 @@ impl Engine {
 
     /// Name this host's build under every unresolved name (ledger #288): `version` is how the
     /// running binary names itself (`ikigai 0.1.63`) and `upgrade` the command that installs
-    /// a newer one. An unresolved name is most often a name the binary predates, a resource
-    /// added (or renamed) after it was built, and the bare message names the resource, not
-    /// that reason.
+    /// a newer one. An unresolved name may be a typo or a resource this build does not
+    /// bind. A newer release may bind it; the message recommends upgrading only if a
+    /// newer release is available.
     ///
     /// ```text
     /// error: no endpoint resolved for urn:iki:fn:toUpper
-    ///        this host is ikigai 0.1.18; a name newer than this build needs an upgrade: cargo install --locked ikigai-cli
+    ///        this host is ikigai 0.1.18, and it binds no such name
+    ///        a newer release may bind it; if a release newer than this build is available: cargo install --locked ikigai-cli
     /// ```
     ///
     /// It does not guess WHICH version introduced the name: that needs an index of names by
@@ -2801,7 +2802,8 @@ const SUGGESTION_INDENT: &str = "       ";
 /// ```text
 /// error: no endpoint resolved for urn:iki:fn:toUpper
 ///        did you mean `urn:fn:toUpper`? (bound here)
-///        this host is ikigai 0.1.18; a name newer than this build needs an upgrade: cargo install --locked ikigai-cli
+///        this host is ikigai 0.1.18, and it binds no such name
+///        a newer release may bind it; if a release newer than this build is available: cargo install --locked ikigai-cli
 /// ```
 ///
 /// [`ikigai_core::Error::Unresolved`] is deliberately untouched — it carries the fact
@@ -2809,7 +2811,8 @@ const SUGGESTION_INDENT: &str = "       ";
 /// here, where the resolver (and so the catalog) is in hand. With no candidate the
 /// returned string is byte-identical to `error.to_string()` on an engine that named no
 /// build, which is the property that keeps this from making every error noisier. The build
-/// line is one line, and only under an unresolved name.
+/// lines appear only under an unresolved name. The upgrade advice is conditional: this
+/// build cannot know whether another release binds the name.
 fn describe(
     resolver: &dyn Resolver,
     error: &ikigai_core::Error,
@@ -2829,8 +2832,9 @@ fn describe(
     }
     if let Some(host) = host {
         text.push_str(&format!(
-            "\n{SUGGESTION_INDENT}this host is {}; a name newer than this build needs an \
-             upgrade: {}",
+            "\n{SUGGESTION_INDENT}this host is {}, and it binds no such name\n\
+             {SUGGESTION_INDENT}a newer release may bind it; if a release newer than this \
+             build is available: {}",
             host.version, host.upgrade
         ));
     }
@@ -4624,8 +4628,9 @@ mod tests {
             Arc::new(JsonRenderer),
         ))
         .with_host_build("ikigai 9.9.9", "cargo install --locked ikigai-cli");
-        let build = "       this host is ikigai 9.9.9; a name newer than this build needs an \
-                     upgrade: cargo install --locked ikigai-cli";
+        let build = "       this host is ikigai 9.9.9, and it binds no such name\n       \
+                     a newer release may bind it; if a release newer than this build is \
+                     available: cargo install --locked ikigai-cli";
         let err = output(engine.eval("source urn:iki:fn:toUpper hi")).unwrap_err();
         assert_eq!(
             err,
