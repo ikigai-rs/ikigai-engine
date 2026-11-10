@@ -36,7 +36,9 @@ oxrdf = { workspace = true, optional = true }
 # reader, so a wasm build (plan-reader off) does not get oxigraph.
 # 0.3.0 was the release on core 0.2 (ledger #2349). 0.4.0 is the release on core 0.3 (ledger
 # #3061); it carries every 0.2 floor.
-ikigai-store = { version = "0.4.0", optional = true }
+# 0.5.0 (ledger #3364) adds graph-written resources and shares one store with shacl 0.6.1.
+# The requirement is also a ceiling below 0.6.0 (`<0.6.0`).
+ikigai-store = { version = "0.5.0", optional = true }
 # Only for the `RdfFormat` that scan takes (the store re-exports none of oxigraph's io types),
 # so it is the store's own oxigraph line. Without default features: the default is RocksDB.
 oxigraph = { version = "0.5", default-features = false, optional = true }
