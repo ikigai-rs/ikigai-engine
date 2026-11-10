@@ -60,7 +60,9 @@ spargebra = { version = "0.4", features = ["sep-0006"] }
 # at start. A real FILTER closing a group now counts that group into the enclosing join. No signature changed.
 # 0.3.0 was the release on core 0.2 (ledger #2349). 0.4.0 is the release on core 0.3 (ledger
 # #3061); it carries every floor above.
-ikigai-store = "0.4.0"
+# 0.5.0 (ledger #3364) adds graph-written resources and shares one store with shacl 0.6.1.
+# The requirement is also a ceiling below 0.6.0 (`<0.6.0`).
+ikigai-store = "0.5.0"
 # 0.2.1 first exports check_turtle_nesting and MAX_TURTLE_NESTING.
 # The host already resolves 0.2.6; intray needs only this API floor.
 # 0.3.0 was the release on core 0.2 (ledger #2349). 0.5.0 is the release on core 0.3 (ledger
