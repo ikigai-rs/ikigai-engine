@@ -76,7 +76,7 @@ members = ["crates/*"]
 # 0.4.0 (ledger #3081): `Engine::with_scope` runs every request in a host's corridor, in place of
 # a `Resolver` wrapper. Additive, and the patches above took additive API; the item that asked
 # for this names a minor bump for a public API change, and this follows the item.
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 # Measured 2026-10-26, not assumed: 1.89 is the first toolchain that builds the workspace.
 # `ikigai-intray` takes the lease with `std::fs::File::try_lock` (stable in 1.89; 1.88 refuses
@@ -159,7 +159,7 @@ ikigai-fs = "0.4.0"
 # #3061). 0.6.1 (ledger #3364) moves to store 0.5.0 so the graph links one store.
 # The requirement is also a ceiling below 0.7.0 (`<0.7.0`).
 ikigai-shacl = "0.6.1"
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.4.0" }
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.5.0" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face, reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins
