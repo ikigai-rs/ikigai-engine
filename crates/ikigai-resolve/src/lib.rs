@@ -1371,6 +1371,22 @@ impl Space for MountedRemote {
     }
 }
 
+/// Host context for a request, separate from its identity and resolution authority.
+///
+/// The engine supplies this to [`Resolver::prepare_request`] immediately before dispatch.
+/// A contract is the same description used to route the request's arguments, read under
+/// the session's capability and resolution scope. It is advisory, never authorization.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestContext<'a> {
+    /// The routing contract, if it was available. `None` also covers a lookup that failed;
+    /// a policy should leave the request alone rather than issue another Meta request.
+    pub contract: Option<&'a Description>,
+    /// This request's answer contributes directly to the command's displayed output.
+    /// False for upstream pipe stages, internal reads, and stored-plan steps. A final
+    /// fork or map marks each branch's or item's final request as output.
+    pub is_output: bool,
+}
+
 /// What the REPL engine needs of a kernel, local or remote.
 ///
 /// Synchronous by design (the REPL loop is blocking). Errors are surfaced as
@@ -1378,6 +1394,31 @@ impl Space for MountedRemote {
 /// error type can replace `String` when the wire protocol lands.
 #[async_trait]
 pub trait Resolver: Send + Sync {
+    /// Whether a host policy needs a contract even when argument routing did not need
+    /// one. The engine reuses any routing lookup, including an unsuccessful one; otherwise
+    /// it reads Meta once under the session capability and scope. The default adds no reads.
+    /// A terminal adapter can return true for output Source requests without an explicit
+    /// `as`, and inspect the available faces in [`prepare_request`](Self::prepare_request).
+    fn needs_request_contract(&self, request: &Request, is_output: bool) -> bool {
+        let _ = (request, is_output);
+        false
+    }
+
+    /// Apply host presentation policy to an engine request before dispatch. The default
+    /// leaves it unchanged, so existing resolvers retain their behavior. For example, a
+    /// terminal adapter may select `as=text/plain` only when `context.is_output`, the
+    /// contract offers that face, and the user did not supply `as`.
+    ///
+    /// This hook performs no resolution. The engine then uses the existing issue method,
+    /// retaining capability, provenance, scope, attachments, and body streaming. Transports
+    /// need no protocol change. Wrappers that own presentation policy override this hook;
+    /// ordinary kernel sub-requests do not pass through it. A wrapper forwarding another
+    /// adapter's policy must forward both this and [`needs_request_contract`](Self::needs_request_contract).
+    fn prepare_request(&self, request: Request, context: RequestContext<'_>) -> Request {
+        let _ = context;
+        request
+    }
+
     /// Resolve `request` under the resolver's default authority, and report its
     /// representation and cache outcome.
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error>;
@@ -2002,6 +2043,14 @@ async fn attached_by_value(
 /// resolver's overrides (e.g. the kernel's `issue_as`/`transport`) are preserved.
 #[async_trait]
 impl<R: Resolver + ?Sized> Resolver for Arc<R> {
+    fn needs_request_contract(&self, request: &Request, is_output: bool) -> bool {
+        (**self).needs_request_contract(request, is_output)
+    }
+
+    fn prepare_request(&self, request: Request, context: RequestContext<'_>) -> Request {
+        (**self).prepare_request(request, context)
+    }
+
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
         (**self).issue(request)
     }
