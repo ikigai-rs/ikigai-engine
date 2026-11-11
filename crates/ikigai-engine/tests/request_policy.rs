@@ -110,13 +110,14 @@ fn fixture_with_json(json: bool) -> (Engine, Calls) {
     let producer = FnEndpoint::new("producer", |inv: &Invocation<'_>| {
         let face = inv.inline_str("as").unwrap_or("text/html");
         Ok(Representation::new(
-            ReprType::new("text/plain"),
+            ReprType::new(face),
             face.as_bytes().to_vec(),
         ))
     })
     .with_description(
         Description::new("producer")
             .input(ArgSpec::new("in").optional())
+            .output("text/html")
             .output("text/plain"),
     );
     let consumer = FnEndpoint::new("consumer", |inv: &Invocation<'_>| {
@@ -142,7 +143,7 @@ fn fixture_with_json(json: bool) -> (Engine, Calls) {
     .with_description(
         Description::new("reference")
             .input(ArgSpec::new("content"))
-            .transreptor(["text/plain"], ["text/plain"])
+            .transreptor(["text/html", "text/plain"], ["text/plain"])
             .output("text/plain")
             .incremental(),
     );
@@ -208,7 +209,7 @@ impl Endpoint for StreamProducer {
     async fn invoke_body(&self, inv: &Invocation<'_>) -> ikigai_core::Result<Representation<Body>> {
         let face = inv.inline_str("as").unwrap_or("text/html").to_string();
         Ok(Representation::from_body(
-            ReprType::new("text/plain"),
+            ReprType::new(&face),
             Body::once(futures::stream::once(async move {
                 Ok(ikigai_core::Bytes::from(face))
             })),
@@ -218,7 +219,9 @@ impl Endpoint for StreamProducer {
         "stream"
     }
     fn describe(&self) -> Description {
-        Description::new("stream").output("text/plain")
+        Description::new("stream")
+            .output("text/html")
+            .output("text/plain")
     }
 }
 
