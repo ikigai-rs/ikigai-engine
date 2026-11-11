@@ -2357,7 +2357,10 @@ impl Engine {
         }
         let mut pipeline = parse_spec(spec)?;
         let parameters = self.take_plan_parameters(&mut pipeline).await;
-        let turtle = self.run_parsed_pipeline(pipeline).await?.into_text()?;
+        let turtle = self
+            .run_parsed_pipeline(pipeline, false)
+            .await?
+            .into_text()?;
         let plan = Plan::from_turtle(&turtle)?;
         execute(self, &plan, &parameters)
             .await

@@ -296,11 +296,10 @@ impl Engine {
     #[cfg(feature = "plan-reader")]
     async fn plan_parameters(&self, plan: &FixedValue) -> Result<Vec<ArgSpec>, String> {
         let turtle = match plan {
-            FixedValue::Reference(iri) => {
-                self.run(Request::new(Verb::Source, iri.clone()))
-                    .await
-                    .map_err(|e| format!("the plan <{}> could not be read: {e}", iri.as_str()))?
-            }
+            FixedValue::Reference(iri) => self
+                .run_internal(Request::new(Verb::Source, iri.clone()))
+                .await
+                .map_err(|e| format!("the plan <{}> could not be read: {e}", iri.as_str()))?,
             FixedValue::Value(text) => text.clone(),
             _ => return Ok(Vec::new()),
         };
