@@ -2304,7 +2304,8 @@ impl PlanHost for Engine {
     type Error = String;
 
     async fn issue(&self, request: Request, incoming: Provenance) -> Result<Staged, String> {
-        self.run_staged(request, Some(incoming)).await
+        self.run_staged_for(request.into(), Some(incoming), false)
+            .await
     }
 
     async fn issue_flow(
@@ -2356,7 +2357,10 @@ impl Engine {
         }
         let mut pipeline = parse_spec(spec)?;
         let parameters = self.take_plan_parameters(&mut pipeline).await;
-        let turtle = self.run_parsed_pipeline(pipeline).await?.into_text()?;
+        let turtle = self
+            .run_parsed_pipeline(pipeline, false)
+            .await?
+            .into_text()?;
         let plan = Plan::from_turtle(&turtle)?;
         execute(self, &plan, &parameters)
             .await

@@ -210,7 +210,7 @@ impl Engine {
         let text = render_names(&in_table_order(rules)?)?;
         let request = Request::new(Verb::Sink, atom.clone())
             .with_arg("content", ArgRef::Inline(text.into_bytes()));
-        self.run(request).await.map(drop)
+        self.run_internal(request).await.map(drop)
     }
 
     /// `rule`, checked against its target's contract — and, for a plan binding, with the
@@ -296,11 +296,10 @@ impl Engine {
     #[cfg(feature = "plan-reader")]
     async fn plan_parameters(&self, plan: &FixedValue) -> Result<Vec<ArgSpec>, String> {
         let turtle = match plan {
-            FixedValue::Reference(iri) => {
-                self.run(Request::new(Verb::Source, iri.clone()))
-                    .await
-                    .map_err(|e| format!("the plan <{}> could not be read: {e}", iri.as_str()))?
-            }
+            FixedValue::Reference(iri) => self
+                .run_internal(Request::new(Verb::Source, iri.clone()))
+                .await
+                .map_err(|e| format!("the plan <{}> could not be read: {e}", iri.as_str()))?,
             FixedValue::Value(text) => text.clone(),
             _ => return Ok(Vec::new()),
         };

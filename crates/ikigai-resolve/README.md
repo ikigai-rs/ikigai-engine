@@ -18,6 +18,8 @@ knows directly — no client-side cache probing across the wire.
 
 | method | role |
 |--------|------|
+| `needs_request_contract(&request, is_output) -> bool` | opt into a contract read when argument routing did not need one (default false) |
+| `prepare_request(request, RequestContext) -> Request` | apply host presentation policy using the routing contract and output role (default unchanged) |
 | `issue(request) -> (Representation, CacheStatus)` | resolve under the resolver's default authority |
 | `issue_as(request, &Capability)` | resolve under an explicit capability (the local kernel enforces it; a wire resolver carries it for the server to clamp) |
 | `issue_as_async(request, &Capability)` *(async)* | what the engine `await`s when driving a stage on the scheduler, so a spawned fork/map branch **parks** rather than blocking a worker |
@@ -30,6 +32,28 @@ knows directly — no client-side cache probing across the wire.
 
 The async, capability, tracer, and provenance methods have sensible defaults, so a
 minimal remote resolver implements only `issue`, `is_cached`, and `entries`.
+
+## Presentation policy without another Meta read
+
+The engine calls `prepare_request` before dispatch, with `RequestContext::contract`
+(the same description it used for argument routing) and `is_output`. A final stage
+is output; an intermediate pipe stage is not. A final fork or map passes output
+through to each branch's or item's final stage, including scheduled branches.
+Reference dependencies and stored-plan steps are internal data, not output requests.
+
+A terminal adapter can select `as=text/plain` when the request is output, the
+contract offers that face, and no explicit `as` is present. It returns true from
+`needs_request_contract` for the output requests whose faces it needs to inspect.
+For a bare request, the engine then reads Meta once under the same capability and
+scope as the answer. A routing lookup, including a failed one, is reused instead.
+With no contract the policy can leave the request alone; it need not retry Meta.
+Contracts live with individual requests, not in a persistent presentation cache.
+
+The hook runs before the existing issue methods, so adapters keep forwarding their
+capability, scope, provenance, and body methods as before. `Arc<R>` forwards both
+policy methods. Other wrappers that forward an inner presentation policy must
+forward both methods too. Kernel sub-requests do not invoke presentation policy,
+and neither transports nor the wire protocol need to carry this host context.
 
 ## A mount that cannot enumerate says so
 

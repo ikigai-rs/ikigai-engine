@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::StreamExt;
 use ikigai_core::{
-    ArgSpec, AsyncFnEndpoint, Body, Bytes, Capability, Description, Endpoint, EndpointSpace, Exact,
-    FnEndpoint, Invocation, Kernel, MetaRenderer, ReprType, Representation, Request, Resolution,
-    Result, Scope, Space, SpaceEntry, TraceEvent, Tracer, Verb, COLLECTED_NOTE,
+    ArgSpec, AsyncFnEndpoint, Body, ByteStream, Bytes, Capability, ContentId, Description,
+    Endpoint, EndpointSpace, Exact, FnEndpoint, Invocation, Kernel, MetaRenderer, Replay, ReprType,
+    Representation, Request, Resolution, Result, Scope, Space, SpaceEntry, TraceEvent, Tracer,
+    Verb, COLLECTED_NOTE,
 };
 use ikigai_engine::engine::{Action, Engine};
 use ikigai_resolve::{CacheStatus, RemoteSpace, Resolver};
@@ -412,6 +413,106 @@ fn a_mounted_stage_still_answers_on_the_collected_path() {
             output(&engine, line).as_deref(),
             Ok("line 0\nline 1\n"),
             "{line}"
+        );
+    }
+}
+
+/// A file's bytes as a [`Replay`] with a strong validator: what `urn:file:` answers, a body
+/// read afresh on every read whose content id is known before it is read.
+struct FileBytes(&'static [u8]);
+impl Replay for FileBytes {
+    fn open(&self) -> ByteStream {
+        Box::pin(futures::stream::iter([Ok(Bytes::from_static(self.0))]))
+    }
+
+    fn len_hint(&self) -> Option<u64> {
+        Some(self.0.len() as u64)
+    }
+
+    fn validator(&self) -> Option<ContentId> {
+        Some(ContentId::of(self.0))
+    }
+}
+
+/// `urn:test:file`: a cacheable answer whose body is [`FileBytes`].
+struct File;
+
+#[async_trait]
+impl Endpoint for File {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let body = self.invoke_body(inv).await?;
+        let budget = inv.memory_budget().expect("the kernel mints one");
+        body.collect_within(budget).await
+    }
+
+    async fn invoke_body(&self, _: &Invocation<'_>) -> Result<Representation<Body>> {
+        Ok(Representation::from_body(
+            ReprType::new("text/plain"),
+            Body::replay(FileBytes(b"line 0\nline 1\nline 2\n")),
+        )
+        .cacheable())
+    }
+
+    fn name(&self) -> &str {
+        "file"
+    }
+}
+
+/// Ledger #3187: a stage piped a replayable body with a validator is attached under that
+/// content id, so its request repeats and the kernel serves it from the cache. The tally
+/// said `computed` for it anyway, on every run: the resolver skipped the cache probe for
+/// any request with a body attached. `urn:file:… | urn:sparql:select` printed
+/// `[1 cached · 1 computed]` on every run after the first, though the select ran once.
+#[test]
+fn a_stage_served_from_the_cache_through_an_attached_body_is_tallied_cached() {
+    let invoked = Arc::new(AtomicUsize::new(0));
+    let counted = invoked.clone();
+    let tail = AsyncFnEndpoint::new("tail", move |inv| {
+        let counted = counted.clone();
+        Box::pin(async move {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let body = inv.content_body("content").await?;
+            let bytes = inv.collect(body).await?;
+            let last = bytes.split(|b| *b == b'\n').rfind(|line| !line.is_empty());
+            Ok(
+                Representation::new(ReprType::new("text/plain"), last.unwrap_or(&[]).to_vec())
+                    .cacheable(),
+            )
+        })
+    })
+    .with_description(
+        Description::new("tail")
+            .verb(Verb::Source)
+            .input(ArgSpec::new("content").reads_body()),
+    );
+    let space = EndpointSpace::new()
+        .bind(Exact::new("urn:test:file"), File)
+        .bind(Exact::new("urn:test:tail"), tail);
+    let engine = Engine::new(Kernel::with_meta_renderer(
+        Arc::new(space),
+        Arc::new(JsonRenderer),
+    ));
+    let line = "source urn:test:file | urn:test:tail";
+    let run = |engine: &Engine| match engine.eval(line) {
+        Action::Output(entry) => (entry.result, entry.cache.label()),
+        _ => panic!("`{line}` should produce output"),
+    };
+
+    let (answer, first) = run(&engine);
+    assert_eq!(answer.as_deref(), Ok("line 2"));
+    assert_eq!(first.as_deref(), Some("2 computed"));
+    for _ in 0..2 {
+        let (answer, again) = run(&engine);
+        assert_eq!(answer.as_deref(), Ok("line 2"));
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            1,
+            "the stage is served from the cache after its first run"
+        );
+        assert_eq!(
+            again.as_deref(),
+            Some("2 cached"),
+            "a stage the kernel served from the cache is tallied `cached`"
         );
     }
 }

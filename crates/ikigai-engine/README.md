@@ -27,6 +27,14 @@ its own crate for the browser build to reuse unchanged.
   `Engine::last_contract_notes` names each target and the reason, and the CLI prints
   `[contract unavailable for …]` on stderr. A target that does not resolve has no
   contract to read and is not noted; its own request reports that.
+- **Host presentation policy.** Before dispatch, the engine offers the resolver the
+  contract it already used for routing and whether this request produces the command's
+  output (`Resolver::prepare_request`, `RequestContext`). Intermediate pipe stages stay
+  data on both value and reference paths. Final fork branches and mapped items inherit
+  the output role; stored-plan steps remain internal. Existing resolvers keep compiling
+  through defaults and perform no additional contract reads. See
+  [the resolver policy seam](../ikigai-resolve/README.md#presentation-policy-without-another-meta-read)
+  for an adapter's opt-in contract lookup and terminal face selection.
 - **A pipeline grammar**, parsed by one recursive-descent parser:
 
   | connector | meaning |
@@ -126,8 +134,12 @@ A line whose first non-blank character is `#` is a comment (so a `#!` shebang is
 `#` anywhere else keeps its meaning. `ikigai_engine::script` and `Engine::run_script` run a
 script of REPL lines (a `.iki` file) in file order: `# @param <name>` or `# @param <name> =
 <default>` declares a parameter a line uses as `{name}`, an undeclared `{x}` or parameter is
-refused before any line runs, and the run stops at the first failing line, reporting its
-number and error. A script does not compile to a plan yet: the process vocabulary has no term
+refused before any line runs, a doubled brace (`{{` through `}}`, as in `$h{{mag}}`) is template
+text copied as it is, and the run stops at the first failing line, reporting its
+number and error. The `script <iri> [key=value …]` command runs a script stored at `<iri>`
+the same way, so one script can run another and a script run as a file accepts every command
+the REPL does; a script that runs itself is refused, naming the scripts running. A script does
+not compile to a plan yet: the process vocabulary has no term
 for ordered, independent steps (`ik:step` is unordered, and the runner runs only what the one
 `ik:result` depends on).
 
