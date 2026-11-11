@@ -27,6 +27,14 @@ its own crate for the browser build to reuse unchanged.
   `Engine::last_contract_notes` names each target and the reason, and the CLI prints
   `[contract unavailable for …]` on stderr. A target that does not resolve has no
   contract to read and is not noted; its own request reports that.
+- **Host presentation policy.** Before dispatch, the engine offers the resolver the
+  contract it already used for routing and whether this request produces the command's
+  output (`Resolver::prepare_request`, `RequestContext`). Intermediate pipe stages stay
+  data on both value and reference paths. Final fork branches and mapped items inherit
+  the output role; stored-plan steps remain internal. Existing resolvers keep compiling
+  through defaults and perform no additional contract reads. See
+  [the resolver policy seam](../ikigai-resolve/README.md#presentation-policy-without-another-meta-read)
+  for an adapter's opt-in contract lookup and terminal face selection.
 - **A pipeline grammar**, parsed by one recursive-descent parser:
 
   | connector | meaning |

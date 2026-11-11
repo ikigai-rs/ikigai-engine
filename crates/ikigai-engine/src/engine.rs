@@ -29,12 +29,43 @@ use ikigai_core::{
     Provenance, ReprType, Representation, Request, Scope, Space, Spawner, Thread, TraceEvent,
     Tracer, Verb,
 };
-use ikigai_resolve::{CacheStatus, Resolver};
+use ikigai_resolve::{CacheStatus, RequestContext, Resolver};
 use std::panic::AssertUnwindSafe;
 
 use crate::fanout::{self, FanOut};
 use crate::suggest;
 use std::collections::BTreeSet;
+
+/// A request and the exact contract lookup used to route it. The outer option
+/// distinguishes a skipped lookup from an unsuccessful one, so a host policy never
+/// retries Meta merely because routing could not read it. This lives only until dispatch.
+#[derive(Clone)]
+pub(crate) struct RoutedRequest {
+    request: Request,
+    contract: Option<Option<Description>>,
+}
+
+impl From<Request> for RoutedRequest {
+    fn from(request: Request) -> Self {
+        Self {
+            request,
+            contract: None,
+        }
+    }
+}
+
+impl std::ops::Deref for RoutedRequest {
+    type Target = Request;
+    fn deref(&self) -> &Request {
+        &self.request
+    }
+}
+
+impl std::ops::DerefMut for RoutedRequest {
+    fn deref_mut(&mut self) -> &mut Request {
+        &mut self.request
+    }
+}
 
 /// A pipe stage's output: its raw bytes plus the cache provenance (expiry + golden
 /// threads) to hand the next stage, so cacheability flows down the pipeline. The
@@ -670,13 +701,14 @@ impl Engine {
 
     /// Name this host's build under every unresolved name (ledger #288): `version` is how the
     /// running binary names itself (`ikigai 0.1.63`) and `upgrade` the command that installs
-    /// a newer one. An unresolved name is most often a name the binary predates, a resource
-    /// added (or renamed) after it was built, and the bare message names the resource, not
-    /// that reason.
+    /// a newer one. An unresolved name may be a typo or a resource this build does not
+    /// bind. A newer release may bind it; the message recommends upgrading only if a
+    /// newer release is available.
     ///
     /// ```text
     /// error: no endpoint resolved for urn:iki:fn:toUpper
-    ///        this host is ikigai 0.1.18; a name newer than this build needs an upgrade: cargo install --locked ikigai-cli
+    ///        this host is ikigai 0.1.18, and it binds no such name
+    ///        a newer release may bind it; if a release newer than this build is available: cargo install --locked ikigai-cli
     /// ```
     ///
     /// It does not guess WHICH version introduced the name: that needs an index of names by
@@ -1193,18 +1225,19 @@ impl Engine {
     /// `source`, so routing, the binding-only error, and caching all come from
     /// [`run_source`](Self::run_source).
     async fn run_pipeline_staged(&self, spec: &str) -> Result<Staged, String> {
-        self.run_parsed_pipeline(parse_spec(spec)?).await
+        self.run_parsed_pipeline(parse_spec(spec)?, true).await
     }
 
     /// [`run_pipeline_staged`](Self::run_pipeline_staged) over a spec already parsed.
     pub(crate) async fn run_parsed_pipeline(
         &self,
         mut pipeline: Pipeline,
+        is_output: bool,
     ) -> Result<Staged, String> {
         let scope = self.as_of_scope(take_as_of(&mut pipeline)?.as_ref())?;
         self.in_scope(
             scope,
-            self.run_pipeline_node(&pipeline, None, root_provenance()),
+            self.run_pipeline_node(&pipeline, None, root_provenance(), is_output),
         )
         .await
     }
@@ -1327,7 +1360,7 @@ impl Engine {
         // Read the script through the kernel, then evaluate it — both under the
         // (possibly narrowed) session capability.
         let outcome = async {
-            let script = self.run(Request::new(Verb::Source, iri)).await?;
+            let script = self.run_internal(Request::new(Verb::Source, iri)).await?;
             self.run_lisp(&script).await
         }
         .await;
@@ -1346,10 +1379,14 @@ impl Engine {
         pipeline: &'a Pipeline,
         incoming: Option<&'a [u8]>,
         prov: Provenance,
+        is_output: bool,
     ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
         Box::pin(async move {
             let mut rest = pipeline.rest.iter().peekable();
-            let mut flow = match self.pipe_by_reference(pipeline, incoming).await? {
+            let mut flow = match self
+                .pipe_by_reference(pipeline, incoming, is_output && pipeline.rest.len() == 1)
+                .await?
+            {
                 // The first two stages ran as one request: carry on after the second.
                 Some(staged) => {
                     rest.next();
@@ -1358,27 +1395,42 @@ impl Engine {
                 None if hands_on_a_body(rest.peek().copied()) => {
                     self.run_node_body(&pipeline.first, incoming, prov).await?
                 }
-                None => Flow::Staged(self.run_node(&pipeline.first, incoming, prov).await?),
+                None => Flow::Staged(
+                    self.run_node(
+                        &pipeline.first,
+                        incoming,
+                        prov,
+                        is_output && pipeline.rest.is_empty(),
+                    )
+                    .await?,
+                ),
             };
             while let Some(step) = rest.next() {
                 // Each `|` hands the prior stage's provenance down as the next stage's
                 // upstream, so cacheability flows along the pipe; `..` does the same per
                 // mapped item.
                 let body_out = hands_on_a_body(rest.peek().copied());
+                let step_output = is_output && rest.peek().is_none();
                 flow = match (step.connector, flow) {
                     (Connector::Pipe, Flow::Staged(staged)) if body_out => {
                         self.run_node_body(&step.node, Some(&staged.bytes), staged.provenance())
                             .await?
                     }
                     (Connector::Pipe, Flow::Staged(staged)) => Flow::Staged(
-                        self.run_node(&step.node, Some(&staged.bytes), staged.provenance())
-                            .await?,
+                        self.run_node(
+                            &step.node,
+                            Some(&staged.bytes),
+                            staged.provenance(),
+                            step_output,
+                        )
+                        .await?,
                     ),
                     (Connector::Pipe, Flow::Piped(piped)) => {
-                        self.run_attached(&step.node, piped, body_out).await?
+                        self.run_attached(&step.node, piped, body_out, step_output)
+                            .await?
                     }
                     (Connector::Map, Flow::Staged(staged)) => {
-                        Flow::Staged(self.run_map(&step.node, &staged).await?)
+                        Flow::Staged(self.run_map(&step.node, &staged, step_output).await?)
                     }
                     (Connector::Map, Flow::Piped(_)) => {
                         unreachable!("a stage feeding `..` answers collected bytes")
@@ -1410,9 +1462,13 @@ impl Engine {
                 let (target, args) = words.split_first().ok_or("`sink` needs a target IRI")?;
                 self.sink_request(target, args, incoming).await?
             }
-            Node::Fork(_) => return Ok(Flow::Staged(self.run_node(node, incoming, prov).await?)),
+            Node::Fork(_) => {
+                return Ok(Flow::Staged(
+                    self.run_node(node, incoming, prov, false).await?,
+                ))
+            }
         };
-        self.issue_stage(request, prov, None, true).await
+        self.issue_stage_for(request, prov, None, true, false).await
     }
 
     /// Run `node` with the previous stage's body `piped` as the value the pipe fills
@@ -1430,6 +1486,7 @@ impl Engine {
         node: &Node,
         piped: Piped,
         body_out: bool,
+        is_output: bool,
     ) -> Result<Flow, String> {
         let prov = piped.provenance();
         let body = match piped.body {
@@ -1437,7 +1494,9 @@ impl Engine {
                 return if body_out {
                     self.run_node_body(node, Some(&bytes), prov).await
                 } else {
-                    Ok(Flow::Staged(self.run_node(node, Some(&bytes), prov).await?))
+                    Ok(Flow::Staged(
+                        self.run_node(node, Some(&bytes), prov, is_output).await?,
+                    ))
                 };
             }
             body => body,
@@ -1461,7 +1520,7 @@ impl Engine {
         let mut request = request;
         // The empty placeholder the pipe's routing left: the body takes its place.
         request.args.remove(&name);
-        self.issue_stage(request, prov, Some((name, body)), body_out)
+        self.issue_stage_for(request, prov, Some((name, body)), body_out, is_output)
             .await
     }
 
@@ -1469,6 +1528,7 @@ impl Engine {
     /// argument, and `body_out` answers its body unread ([`Flow::Piped`]) instead of
     /// collected under the run's byte budget ([`Flow::Staged`]). A stored plan's piped
     /// steps are issued through it too (the session as a plan host, in `plan.rs`).
+    #[cfg(feature = "plan-reader")]
     pub(crate) async fn issue_stage(
         &self,
         request: Request,
@@ -1476,6 +1536,19 @@ impl Engine {
         attach: Option<(String, Body)>,
         body_out: bool,
     ) -> Result<Flow, String> {
+        self.issue_stage_for(request.into(), prov, attach, body_out, false)
+            .await
+    }
+
+    async fn issue_stage_for(
+        &self,
+        request: RoutedRequest,
+        prov: Provenance,
+        attach: Option<(String, Body)>,
+        body_out: bool,
+        is_output: bool,
+    ) -> Result<Flow, String> {
+        let request = self.prepare_request(request, is_output).await;
         let capability = self.capability.borrow().clone();
         let shape = RequestShape::of(&request);
         let scope = self.line_scope();
@@ -1528,6 +1601,7 @@ impl Engine {
         &self,
         pipeline: &Pipeline,
         incoming: Option<&[u8]>,
+        is_output: bool,
     ) -> Result<Option<Staged>, String> {
         if incoming.is_some() || self.stdin_may_offer() {
             return Ok(None);
@@ -1549,10 +1623,9 @@ impl Engine {
         };
         // Without the note `describe_struct` records: a contract this probe could not read
         // is noted by the by-value path that then routes without it, exactly as before.
-        let incremental = self
-            .fetch_contract(&iri)
-            .await
-            .ok()
+        let description = self.fetch_contract(&iri).await.ok();
+        let incremental = description
+            .as_ref()
             .and_then(|description| description.transreption().map(|t| t.is_incremental()))
             .unwrap_or(false);
         if !incremental || args.iter().any(|arg| arg.starts_with("content=")) {
@@ -1560,12 +1633,17 @@ impl Engine {
         }
         // Route as the by-value pipe would, with an empty placeholder for the piped value:
         // when it lands on `content`, the upstream's name takes its place.
-        let request = self.source_request(target, args, Some(&[])).await?;
+        let mut request = self
+            .source_request_routed_using(target, args, Some(&[]), description)
+            .await?
+            .0;
         if !matches!(request.args.get("content"), Some(ArgRef::Inline(value)) if value.is_empty()) {
             return Ok(None);
         }
-        let request = request.with_arg("content", ArgRef::Reference(upstream));
-        self.run_staged(request, Some(root_provenance()))
+        request.request = request
+            .request
+            .with_arg("content", ArgRef::Reference(upstream));
+        self.run_staged_for(request, Some(root_provenance()), is_output)
             .await
             .map(Some)
     }
@@ -1578,17 +1656,19 @@ impl Engine {
         node: &'a Node,
         incoming: Option<&'a [u8]>,
         prov: Provenance,
+        is_output: bool,
     ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
         Box::pin(async move {
             match node {
                 Node::Source(words) => {
                     let (target, args) = words.split_first().ok_or("expected an IRI")?;
-                    self.run_source(target, args, incoming, prov).await
+                    self.run_source(target, args, incoming, prov, is_output)
+                        .await
                 }
                 Node::Sink(words) => {
                     let (target, args) = words.split_first().ok_or("`sink` needs a target IRI")?;
                     let request = self.sink_request(target, args, incoming).await?;
-                    self.run_staged(request, Some(prov)).await
+                    self.run_staged_for(request, Some(prov), is_output).await
                 }
                 Node::Fork(branches) => {
                     // Concurrent path: when every branch is a lone `source` stage and a
@@ -1601,8 +1681,9 @@ impl Engine {
                                     words.split_first().ok_or("expected an IRI")?;
                                 requests.push(self.source_request(target, args, incoming).await?);
                             }
-                            let outputs =
-                                self.run_parallel(spawner, requests, prov.clone()).await?;
+                            let outputs = self
+                                .run_parallel(spawner, requests, prov.clone(), is_output)
+                                .await?;
                             return Ok(combine_outputs(outputs));
                         }
                     }
@@ -1612,7 +1693,7 @@ impl Engine {
                     let mut outputs = Vec::with_capacity(branches.len());
                     for branch in branches {
                         outputs.push(
-                            self.run_pipeline_node(branch, incoming, prov.clone())
+                            self.run_pipeline_node(branch, incoming, prov.clone(), is_output)
                                 .await?,
                         );
                     }
@@ -1632,6 +1713,7 @@ impl Engine {
         &'a self,
         node: &'a Node,
         value: &'a Staged,
+        is_output: bool,
     ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
         Box::pin(async move {
             // `..` is the one connector that must read the piped value: it splits on
@@ -1657,7 +1739,7 @@ impl Engine {
                     );
                 }
                 let outputs = self
-                    .run_parallel(spawner, requests, root_provenance())
+                    .run_parallel(spawner, requests, root_provenance(), is_output)
                     .await?;
                 return Ok(combine_outputs(outputs).depending_on(prov));
             }
@@ -1667,7 +1749,7 @@ impl Engine {
             let mut outputs = Vec::new();
             for item in text.split_terminator('\n') {
                 outputs.push(
-                    self.run_node(node, Some(item.as_bytes()), root_provenance())
+                    self.run_node(node, Some(item.as_bytes()), root_provenance(), is_output)
                         .await?,
                 );
             }
@@ -1685,8 +1767,9 @@ impl Engine {
     async fn run_parallel(
         &self,
         spawner: &Arc<dyn Spawner>,
-        requests: Vec<Request>,
+        requests: Vec<RoutedRequest>,
         prov: Provenance,
+        is_output: bool,
     ) -> Result<Vec<Staged>, String> {
         // The branch error stays TYPED across the join: the near-name suggestion needs the
         // catalog, and reading it can be a blocking round-trip on a remote resolver — which
@@ -1703,6 +1786,11 @@ impl Engine {
         // is measurably ~1.8x SLOWER, so widening on ignorance is the one unsafe guess.
         let nominal = requests.len();
         let effective = fanout::effective_width(nominal, spawner.width());
+        let mut prepared = Vec::with_capacity(requests.len());
+        for request in requests {
+            prepared.push(self.prepare_request(request, is_output).await);
+        }
+        let requests = prepared;
         let hints = self.width_hints(effective, &requests).await;
         self.record_fan_out(FanOut {
             nominal,
@@ -1847,9 +1935,10 @@ impl Engine {
         args: &[Word],
         incoming: Option<&[u8]>,
         prov: Provenance,
+        is_output: bool,
     ) -> Result<Staged, String> {
         let request = self.source_request(target, args, incoming).await?;
-        self.run_staged(request, Some(prov)).await
+        self.run_staged_for(request, Some(prov), is_output).await
     }
 
     /// `sink` command: write a representation *into* a resource — the write half
@@ -1983,7 +2072,7 @@ impl Engine {
     /// the same rules as `content="…"` ([`unquote_whole`]). When `content=` is named the
     /// remainder fallback is skipped entirely (it would otherwise overwrite it), and a
     /// remainder alongside `content=` is refused rather than silently resolved.
-    async fn write_request(&self, verb: Verb, rest: &str) -> Result<Request, String> {
+    async fn write_request(&self, verb: Verb, rest: &str) -> Result<RoutedRequest, String> {
         let (target, mut tail) = split_first_word(rest);
         if target.is_empty() {
             return Err(format!(
@@ -2002,7 +2091,8 @@ impl Engine {
         // might take the batch's piped stdin, which only a Delete that DECLARES `content`
         // does (see `delete_takes_content`).
         let stdin_for_delete = verb == Verb::Delete && self.stdin_may_offer();
-        let description = if split_first_word(tail).0.contains('=') || stdin_for_delete {
+        let needs_contract = split_first_word(tail).0.contains('=') || stdin_for_delete;
+        let description = if needs_contract {
             self.describe_struct(&iri).await
         } else {
             None
@@ -2041,7 +2131,10 @@ impl Engine {
                     iri.as_str()
                 ));
             }
-            return Ok(request);
+            return Ok(RoutedRequest {
+                request,
+                contract: needs_contract.then_some(description),
+            });
         }
         // The verbatim remainder is the content. When a `sink` carries none, a one-shot piped
         // stdin payload feeds it instead — so a value (e.g. a secret) can be piped in without
@@ -2054,7 +2147,12 @@ impl Engine {
             match piped.map(|piped| piped.read("content")) {
                 Some(Some(bytes)) => bytes,
                 // An idle stdin: no content at all (see `set_piped_input_polled`).
-                Some(None) => return Ok(request),
+                Some(None) => {
+                    return Ok(RoutedRequest {
+                        request,
+                        contract: needs_contract.then_some(description),
+                    })
+                }
                 None => Vec::new(),
             }
         } else if tail.is_empty() && stdin_for_delete && delete_takes_content(description.as_ref())
@@ -2079,7 +2177,10 @@ impl Engine {
         } else {
             tail.as_bytes().to_vec()
         };
-        Ok(request.with_arg("content", ArgRef::Inline(content)))
+        Ok(RoutedRequest {
+            request: request.with_arg("content", ArgRef::Inline(content)),
+            contract: needs_contract.then_some(description),
+        })
     }
 
     /// Build the `Source` [`Request`] for a stage without issuing it — shared by
@@ -2095,7 +2196,7 @@ impl Engine {
         target: &str,
         args: &[Word],
         incoming: Option<&[u8]>,
-    ) -> Result<Request, String> {
+    ) -> Result<RoutedRequest, String> {
         Ok(self.source_request_routed(target, args, incoming).await?.0)
     }
 
@@ -2106,7 +2207,18 @@ impl Engine {
         target: &str,
         args: &[Word],
         incoming: Option<&[u8]>,
-    ) -> Result<(Request, Option<String>), String> {
+    ) -> Result<(RoutedRequest, Option<String>), String> {
+        self.source_request_routed_using(target, args, incoming, None)
+            .await
+    }
+
+    async fn source_request_routed_using(
+        &self,
+        target: &str,
+        args: &[Word],
+        incoming: Option<&[u8]>,
+        known_contract: Option<Description>,
+    ) -> Result<(RoutedRequest, Option<String>), String> {
         let iri = parse_target(target)?;
 
         // The contract is only needed to recognise named arguments and route the
@@ -2115,7 +2227,11 @@ impl Engine {
         // `stdin_for_the_required_argument`). A stdin KNOWN to be empty is not waiting
         // (ledger #1305): it can fill nothing, so its contract is not worth fetching.
         let stdin_waiting = incoming.is_none() && self.stdin_may_offer();
-        let description = if !args.is_empty() || incoming.is_some() || stdin_waiting {
+        let needs_contract =
+            known_contract.is_some() || !args.is_empty() || incoming.is_some() || stdin_waiting;
+        let description = if known_contract.is_some() {
+            known_contract
+        } else if needs_contract {
             self.describe_struct(&iri).await
         } else {
             None
@@ -2205,7 +2321,13 @@ impl Engine {
             routed = Some(name.to_string());
             request = request.with_arg(name, ArgRef::Inline(value.to_vec()));
         }
-        Ok((request, routed))
+        Ok((
+            RoutedRequest {
+                request,
+                contract: needs_contract.then_some(description),
+            },
+            routed,
+        ))
     }
 
     /// The batch's one-shot piped stdin, taken for a `source` stage that would otherwise
@@ -2259,12 +2381,13 @@ impl Engine {
         target: &str,
         args: &[Word],
         incoming: Option<&[u8]>,
-    ) -> Result<Request, String> {
+    ) -> Result<RoutedRequest, String> {
         let iri = parse_target(target)?;
 
         // The contract is only consulted to recognise named arguments; a bare
         // `… | sink <iri>` (content-only, the common case) skips the lookup.
-        let description = if args.iter().any(|arg| arg.contains('=')) {
+        let needs_contract = args.iter().any(|arg| arg.contains('='));
+        let description = if needs_contract {
             self.describe_struct(&iri).await
         } else {
             None
@@ -2320,19 +2443,25 @@ impl Engine {
                     iri.as_str()
                 ));
             }
-            return Ok(request);
+            return Ok(RoutedRequest {
+                request,
+                contract: needs_contract.then_some(description),
+            });
         }
 
         // The piped upstream value is the content (empty if nothing flows in).
         let content = incoming.unwrap_or(&[]);
-        Ok(request.with_arg("content", ArgRef::Inline(content.to_vec())))
+        Ok(RoutedRequest {
+            request: request.with_arg("content", ArgRef::Inline(content.to_vec())),
+            contract: needs_contract.then_some(description),
+        })
     }
 
     /// Report whether resolving `spec` would be served from the cache, without
     /// resolving it. `spec` is a single `<iri> [key=value …] [input]` — the same
-    /// surface as one `source` stage, but no pipelines (there's nothing to thread
-    /// through). Read-only except that naming arguments fetches the target's
-    /// contract (a `Meta`), which is itself cacheable.
+    /// surface and presentation policy as one `source` stage, but no pipelines
+    /// (there is nothing to thread through). Contract reads for routing or
+    /// presentation may themselves be cached.
     async fn run_cache(&self, spec: &str) -> Result<String, String> {
         let mut pipeline = parse_spec(spec)?;
         // `cache … as-of=<instant>` probes the corridor's partition — the question "would this
@@ -2354,6 +2483,7 @@ impl Engine {
         };
         let (target, args) = words.split_first().ok_or("expected an IRI")?;
         let request = self.source_request(target, args, None).await?;
+        let request = self.prepare_request(request, true).await;
         let scope = self.line_scope();
         Ok(
             if self
@@ -2501,8 +2631,11 @@ impl Engine {
             }
         };
         let (target, args) = words.split_first().ok_or("expected an IRI")?;
-        let iri = parse_target(target)?;
         let request = self.source_request(target, args, None).await?;
+        // Finish policy and its optional contract read before tracing the resolution.
+        // The returned request is also the identity the trace must describe.
+        let request = self.prepare_request(request, false).await;
+        let iri = request.target.clone();
         let capability = self.capability.borrow().clone();
         // A scoped (non-root) session annotates each node with the authority it ran
         // under — `cap ✓` on success, `cap ✗` on a denial; a root session has nothing
@@ -2771,13 +2904,42 @@ impl Engine {
         out
     }
 
+    /// Offer presentation policy the routing contract without another lookup. A bare
+    /// request fetches one only if the resolver opts in. Failed lookups are not retried.
+    async fn prepare_request(&self, routed: RoutedRequest, is_output: bool) -> Request {
+        let RoutedRequest { request, contract } = routed;
+        let description = match contract {
+            Some(description) => description,
+            None if self.resolver.needs_request_contract(&request, is_output) => {
+                // This optional read did not route arguments. A failed presentation
+                // lookup must not claim that arguments were routed without a contract.
+                self.fetch_contract(&request.target).await.ok()
+            }
+            None => None,
+        };
+        self.resolver.prepare_request(
+            request,
+            RequestContext {
+                contract: description.as_ref(),
+                is_output,
+            },
+        )
+    }
+
     /// Issue a request, record how the resolver's cache served it, and decode the
     /// representation as UTF-8 text for display. The resolver reports the
     /// [`CacheStatus`] directly — for a remote kernel the server knows it without
     /// a probe.
-    pub(crate) async fn run(&self, request: Request) -> Result<String, String> {
+    pub(crate) async fn run(&self, request: impl Into<RoutedRequest>) -> Result<String, String> {
         // No pipe upstream (sink / meta / a single source): resolve on its own merits.
         self.run_staged(request, None).await?.into_text()
+    }
+
+    /// Issue a request whose answer the engine interprets or discards rather than displays.
+    pub(crate) async fn run_internal(&self, request: Request) -> Result<String, String> {
+        self.run_staged_for(request.into(), None, false)
+            .await?
+            .into_text()
     }
 
     /// Issue a request — optionally carrying the upstream pipe `incoming` provenance,
@@ -2787,10 +2949,21 @@ impl Engine {
     /// it without a probe).
     pub(crate) async fn run_staged(
         &self,
-        request: Request,
+        request: impl Into<RoutedRequest>,
         incoming: Option<Provenance>,
     ) -> Result<Staged, String> {
-        Ok(Staged::from(self.run_repr(request, incoming).await?))
+        self.run_staged_for(request.into(), incoming, true).await
+    }
+
+    pub(crate) async fn run_staged_for(
+        &self,
+        request: RoutedRequest,
+        incoming: Option<Provenance>,
+        is_output: bool,
+    ) -> Result<Staged, String> {
+        Ok(Staged::from(
+            self.run_repr_for(request, incoming, is_output).await?,
+        ))
     }
 
     /// Issue a request in the line's chain under the session capability, record how the cache
@@ -2798,9 +2971,19 @@ impl Engine {
     /// needs and a pipe stage does not.
     pub(crate) async fn run_repr(
         &self,
-        request: Request,
+        request: impl Into<RoutedRequest>,
         incoming: Option<Provenance>,
     ) -> Result<Representation, String> {
+        self.run_repr_for(request.into(), incoming, true).await
+    }
+
+    async fn run_repr_for(
+        &self,
+        request: RoutedRequest,
+        incoming: Option<Provenance>,
+        is_output: bool,
+    ) -> Result<Representation, String> {
+        let request = self.prepare_request(request, is_output).await;
         let capability = self.capability.borrow().clone();
         // The empty chain takes the unscoped path inside `issue_as_async_in` on every resolver,
         // so a line with no `as-of=` and no host scope issues exactly what it issued before
@@ -2836,7 +3019,8 @@ const SUGGESTION_INDENT: &str = "       ";
 /// ```text
 /// error: no endpoint resolved for urn:iki:fn:toUpper
 ///        did you mean `urn:fn:toUpper`? (bound here)
-///        this host is ikigai 0.1.18; a name newer than this build needs an upgrade: cargo install --locked ikigai-cli
+///        this host is ikigai 0.1.18, and it binds no such name
+///        a newer release may bind it; if a release newer than this build is available: cargo install --locked ikigai-cli
 /// ```
 ///
 /// [`ikigai_core::Error::Unresolved`] is deliberately untouched — it carries the fact
@@ -2844,7 +3028,8 @@ const SUGGESTION_INDENT: &str = "       ";
 /// here, where the resolver (and so the catalog) is in hand. With no candidate the
 /// returned string is byte-identical to `error.to_string()` on an engine that named no
 /// build, which is the property that keeps this from making every error noisier. The build
-/// line is one line, and only under an unresolved name.
+/// lines appear only under an unresolved name. The upgrade advice is conditional: this
+/// build cannot know whether another release binds the name.
 fn describe(
     resolver: &dyn Resolver,
     error: &ikigai_core::Error,
@@ -2864,8 +3049,9 @@ fn describe(
     }
     if let Some(host) = host {
         text.push_str(&format!(
-            "\n{SUGGESTION_INDENT}this host is {}; a name newer than this build needs an \
-             upgrade: {}",
+            "\n{SUGGESTION_INDENT}this host is {}, and it binds no such name\n\
+             {SUGGESTION_INDENT}a newer release may bind it; if a release newer than this \
+             build is available: {}",
             host.version, host.upgrade
         ));
     }
@@ -2991,7 +3177,7 @@ fn run_config(rest: &str) -> Result<String, String> {
 /// `urn:kernel:scheduler` reports the LIVE one, this reports the CONFIGURED one.
 fn config_summary() -> String {
     let location = config::path().map_or_else(
-        || "(no config directory — set $XDG_CONFIG_HOME, $HOME or $USERPROFILE)".to_string(),
+        || "(no config directory — set $XDG_CONFIG_HOME, $HOME or $USERPROFILE to an absolute path)".to_string(),
         |path| path.display().to_string(),
     );
     let keybindings = config::get("keybindings").unwrap_or_else(|| "emacs (default)".to_string());
@@ -4659,8 +4845,9 @@ mod tests {
             Arc::new(JsonRenderer),
         ))
         .with_host_build("ikigai 9.9.9", "cargo install --locked ikigai-cli");
-        let build = "       this host is ikigai 9.9.9; a name newer than this build needs an \
-                     upgrade: cargo install --locked ikigai-cli";
+        let build = "       this host is ikigai 9.9.9, and it binds no such name\n       \
+                     a newer release may bind it; if a release newer than this build is \
+                     available: cargo install --locked ikigai-cli";
         let err = output(engine.eval("source urn:iki:fn:toUpper hi")).unwrap_err();
         assert_eq!(
             err,

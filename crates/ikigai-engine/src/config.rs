@@ -90,8 +90,9 @@ pub fn keybindings_supported(value: &str) -> bool {
 
 /// `<--config-home>/config.toml` when the flag named one ([`set_config_home`]), else
 /// `$XDG_CONFIG_HOME/ikigai/config.toml`, or `$HOME/.config/...` when
-/// `XDG_CONFIG_HOME` is unset, or `%USERPROFILE%\.config\...` when `HOME` is unset too.
-/// `None` if no base directory is known. The
+/// `XDG_CONFIG_HOME` is unset, or `%USERPROFILE%\.config\...` when `HOME` is unset too. An
+/// empty or relative value counts as unset, so the path is never relative to the working
+/// directory. `None` if no base directory is known. The
 /// same file the host reads `mail.*` from — one shared config home.
 pub fn path() -> Option<PathBuf> {
     if let Some(home) = FLAG_HOME.get() {
@@ -107,22 +108,22 @@ pub fn path() -> Option<PathBuf> {
 
 /// The config home from the environment values passed in, so the rule is testable without
 /// `set_var` (the environment is process-global and races the test harness's threads).
-/// `$XDG_CONFIG_HOME` (when non-empty), else `$HOME/.config`, else `%USERPROFILE%\.config` — the last only when
-/// `HOME` is unset or empty, which is plain PowerShell and cmd on Windows. ikigai-cli's
-/// `ikigai_embedded::config` resolves the config home too; keep the two in step.
+/// `$XDG_CONFIG_HOME`, else `$HOME/.config`, else `%USERPROFILE%\.config` — the last only when
+/// `HOME` is not usable, which is plain PowerShell and cmd on Windows. Only an absolute value
+/// counts: an empty or relative one is treated as unset and the next variable is tried, and
+/// when none is absolute there is no config home. ikigai-cli's `ikigai_embedded::config`
+/// resolves the config home too; keep the two in step.
 fn config_home_from(
     xdg: Option<OsString>,
     home: Option<OsString>,
     userprofile: Option<OsString>,
 ) -> Option<PathBuf> {
-    let non_empty = |value: Option<OsString>| value.filter(|value| !value.is_empty());
-    non_empty(xdg)
-        .map(PathBuf::from)
+    let absolute = |value: Option<OsString>| value.map(PathBuf::from).filter(|p| p.is_absolute());
+    absolute(xdg)
         .or_else(|| {
-            non_empty(home.clone())
-                .or_else(|| non_empty(userprofile))
-                .or(home)
-                .map(|home| PathBuf::from(home).join(".config"))
+            absolute(home)
+                .or_else(|| absolute(userprofile))
+                .map(|home| home.join(".config"))
         })
         .map(|base| base.join("ikigai"))
 }
@@ -143,7 +144,7 @@ pub fn set(key: &str, value: &str) -> std::io::Result<PathBuf> {
     let path = path().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "no config directory (set $XDG_CONFIG_HOME, $HOME or $USERPROFILE)",
+            "no config directory (set $XDG_CONFIG_HOME, $HOME or $USERPROFILE to an absolute path)",
         )
     })?;
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
@@ -205,38 +206,85 @@ fn value_for(text: &str, key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Order: `XDG_CONFIG_HOME`, then `HOME`, then `USERPROFILE` (only when `HOME` is unset
-    /// or empty), else nothing. Pure, so it cannot race other tests on the process env.
+    /// Order: `XDG_CONFIG_HOME`, then `HOME`, then `USERPROFILE` (only when `HOME` is not
+    /// usable), else nothing. Pure, so it cannot race other tests on the process env.
     #[test]
     fn config_home_resolution_order() {
         let os = |text: &str| Some(OsString::from(text));
+        let abs = |path: &str| Some(absolute(path).into_os_string());
         let home = |xdg, home, profile| config_home_from(xdg, home, profile);
         assert_eq!(
-            home(os("/xdg"), os("/h"), os("C:/u")),
-            Some(PathBuf::from("/xdg/ikigai"))
+            home(abs("/xdg"), abs("/h"), abs("/u")),
+            Some(absolute("/xdg").join("ikigai"))
         );
         assert_eq!(
-            home(None, os("/h"), os("C:/u")),
-            Some(PathBuf::from("/h/.config/ikigai"))
+            home(None, abs("/h"), abs("/u")),
+            Some(absolute("/h").join(".config").join("ikigai"))
         );
         assert_eq!(
-            home(None, None, os("C:/u")),
-            Some(PathBuf::from("C:/u/.config/ikigai"))
+            home(None, None, abs("/u")),
+            Some(absolute("/u").join(".config").join("ikigai"))
         );
         assert_eq!(
-            home(None, os(""), os("C:/u")),
-            Some(PathBuf::from("C:/u/.config/ikigai"))
+            home(None, os(""), abs("/u")),
+            Some(absolute("/u").join(".config").join("ikigai"))
         );
         // An empty `XDG_CONFIG_HOME` is unset, as in the embedded twin.
         assert_eq!(
-            home(os(""), os("/h"), os("C:/u")),
-            Some(PathBuf::from("/h/.config/ikigai"))
+            home(os(""), abs("/h"), abs("/u")),
+            Some(absolute("/h").join(".config").join("ikigai"))
         );
         assert_eq!(
-            home(os(""), None, os("C:/u")),
-            Some(PathBuf::from("C:/u/.config/ikigai"))
+            home(os(""), None, abs("/u")),
+            Some(absolute("/u").join(".config").join("ikigai"))
         );
         assert_eq!(home(None, None, None), None);
+    }
+
+    /// A value absolute on the platform running the test: a rooted path has no drive on
+    /// Windows, and a drive-prefixed one is relative everywhere else.
+    fn absolute(path: &str) -> PathBuf {
+        PathBuf::from(if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        })
+    }
+
+    /// An empty value counts as unset and a relative one is ignored, in all three variables,
+    /// so the config home is absolute or there is none.
+    #[test]
+    fn a_config_home_is_never_relative_to_the_working_directory() {
+        let os = |text: &str| Some(OsString::from(text));
+        let abs = |path: &str| Some(absolute(path).into_os_string());
+        let under = |path: &str, rest: &str| Some(absolute(path).join(rest).join("ikigai"));
+
+        // Nothing usable: no config home, rather than one under the working directory.
+        assert_eq!(config_home_from(None, os(""), None), None);
+        assert_eq!(config_home_from(os(""), os(""), os("")), None);
+        assert_eq!(config_home_from(os("relative"), None, None), None);
+        assert_eq!(config_home_from(os("."), os(""), None), None);
+        assert_eq!(config_home_from(None, os("relative"), None), None);
+        assert_eq!(config_home_from(None, None, os("relative")), None);
+        assert_eq!(
+            config_home_from(os("a"), os("./b"), os("../c")),
+            None,
+            "every value relative"
+        );
+
+        // A relative value is passed over for the next variable that is absolute.
+        assert_eq!(
+            config_home_from(os("relative"), abs("/h"), None),
+            under("/h", ".config")
+        );
+        assert_eq!(
+            config_home_from(None, os("relative"), abs("/u")),
+            under("/u", ".config")
+        );
+        assert_eq!(
+            config_home_from(os("a"), os("b"), abs("/u")),
+            under("/u", ".config")
+        );
     }
 
     #[test]
