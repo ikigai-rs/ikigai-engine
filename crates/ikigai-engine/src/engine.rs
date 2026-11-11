@@ -2900,7 +2900,7 @@ impl Engine {
         self.run_staged(request, None).await?.into_text()
     }
 
-    /// Read data for the engine to interpret, marking its answer as internal.
+    /// Issue a request whose answer the engine interprets or discards rather than displays.
     pub(crate) async fn run_internal(&self, request: Request) -> Result<String, String> {
         self.run_staged_for(request.into(), None, false)
             .await?

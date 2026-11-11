@@ -10,6 +10,7 @@ use ikigai_engine::engine::{Action, Engine};
 use ikigai_resolve::{CacheStatus, RequestContext, Resolver};
 
 type Calls = Arc<Mutex<Vec<Request>>>;
+type Roles = Arc<Mutex<Vec<(Request, bool)>>>;
 
 struct Json;
 impl MetaRenderer for Json {
@@ -28,6 +29,7 @@ impl MetaRenderer for Json {
 struct Terminal {
     kernel: Kernel,
     calls: Calls,
+    roles: Roles,
 }
 
 #[async_trait::async_trait]
@@ -82,6 +84,10 @@ impl Resolver for Terminal {
     }
 
     fn prepare_request(&self, mut request: Request, context: RequestContext<'_>) -> Request {
+        self.roles
+            .lock()
+            .unwrap()
+            .push((request.clone(), context.is_output));
         if context.is_output
             && request.verb == Verb::Source
             && !request.args.contains_key("as")
@@ -115,6 +121,10 @@ fn fixture_with_json(json: bool) -> (Engine, Calls) {
 }
 
 fn fixture_with_document(json: bool, document: &str) -> (Engine, Calls) {
+    fixture_recording_roles(json, document, Arc::default())
+}
+
+fn fixture_recording_roles(json: bool, document: &str, roles: Roles) -> (Engine, Calls) {
     let document = document.to_string();
     let producer = FnEndpoint::new("producer", |inv: &Invocation<'_>| {
         let face = inv.inline_str("as").unwrap_or("text/html");
@@ -209,6 +219,7 @@ fn fixture_with_document(json: bool, document: &str) -> (Engine, Calls) {
                 Kernel::new(Arc::new(space))
             },
             calls: calls.clone(),
+            roles,
         }),
         calls,
     )
@@ -649,4 +660,49 @@ fn trace_excludes_policy_contract_reads() {
             .all(|line| !line.contains("urn:test:before")),
         "{result}"
     );
+}
+
+#[test]
+fn a_bindings_discarded_write_reply_is_internal() {
+    let roles = Roles::default();
+    let (engine, _) = fixture_recording_roles(true, "", roles.clone());
+    let engine = engine.with_names_atom(ikigai_core::Iri::parse("urn:test:names").unwrap());
+    assert!(
+        output(&engine, "bind urn:test:bound = source urn:test:producer").starts_with("bound in")
+    );
+    let roles = roles.lock().unwrap();
+    let (_, is_output) = roles
+        .iter()
+        .find(|(r, _)| r.verb == Verb::Sink && r.target.as_str() == "urn:test:names")
+        .unwrap();
+    assert!(
+        !is_output,
+        "bind discards the atom's reply and formats its own result"
+    );
+}
+
+#[test]
+fn diagnostic_reads_parsed_by_the_engine_are_internal() {
+    let roles = Roles::default();
+    let (engine, _) = fixture_recording_roles(true, "", roles.clone());
+    output(&engine, "why urn:test:producer");
+    output(&engine, "explain urn:test:producer");
+    let roles = roles.lock().unwrap();
+    let internal: Vec<_> = roles
+        .iter()
+        .filter(|(r, _)| {
+            matches!(
+                r.target.as_str(),
+                "urn:kernel:cached" | "urn:kernel:uncached"
+            )
+        })
+        .collect();
+    assert_eq!(internal.len(), 3);
+    assert!(
+        internal.iter().all(|(_, is_output)| !is_output),
+        "{internal:?}"
+    );
+    assert!(roles
+        .iter()
+        .any(|(r, is_output)| r.target.as_str() == "urn:kernel:explain" && *is_output));
 }

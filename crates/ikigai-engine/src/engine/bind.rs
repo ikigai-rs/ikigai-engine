@@ -210,7 +210,7 @@ impl Engine {
         let text = render_names(&in_table_order(rules)?)?;
         let request = Request::new(Verb::Sink, atom.clone())
             .with_arg("content", ArgRef::Inline(text.into_bytes()));
-        self.run(request).await.map(drop)
+        self.run_internal(request).await.map(drop)
     }
 
     /// `rule`, checked against its target's contract — and, for a plan binding, with the
