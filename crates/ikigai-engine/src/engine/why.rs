@@ -189,7 +189,7 @@ impl Engine {
         };
         let target = parse_target(target)?;
         let log = self
-            .run(Request::new(
+            .run_internal(Request::new(
                 Verb::Source,
                 parse_target("urn:kernel:uncached")?,
             ))
@@ -282,7 +282,7 @@ impl Engine {
     /// be served from the cache right now, in the line's chain.
     async fn cached_now(&self, target: &str, verb: &str) -> Result<String, String> {
         let answer = self
-            .run(
+            .run_internal(
                 Request::new(Verb::Source, parse_target("urn:kernel:cached")?)
                     .with_arg("target", inline(target))
                     .with_arg("verb", inline(verb)),

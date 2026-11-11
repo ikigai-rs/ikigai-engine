@@ -454,7 +454,7 @@ impl Engine {
             ));
         }
         let text = self
-            .run(Request::new(Verb::Source, target))
+            .run_internal(Request::new(Verb::Source, target))
             .await
             .map_err(|e| format!("cannot read the script {iri}: {e}"))?;
         let lines = Script::parse(&text)

@@ -1188,18 +1188,19 @@ impl Engine {
     /// `source`, so routing, the binding-only error, and caching all come from
     /// [`run_source`](Self::run_source).
     async fn run_pipeline_staged(&self, spec: &str) -> Result<Staged, String> {
-        self.run_parsed_pipeline(parse_spec(spec)?).await
+        self.run_parsed_pipeline(parse_spec(spec)?, true).await
     }
 
     /// [`run_pipeline_staged`](Self::run_pipeline_staged) over a spec already parsed.
     pub(crate) async fn run_parsed_pipeline(
         &self,
         mut pipeline: Pipeline,
+        is_output: bool,
     ) -> Result<Staged, String> {
         let scope = self.as_of_scope(take_as_of(&mut pipeline)?.as_ref())?;
         self.in_scope(
             scope,
-            self.run_pipeline_node(&pipeline, None, root_provenance(), true),
+            self.run_pipeline_node(&pipeline, None, root_provenance(), is_output),
         )
         .await
     }
@@ -1325,7 +1326,7 @@ impl Engine {
         // Read the script through the kernel, then evaluate it — both under the
         // (possibly narrowed) session capability.
         let outcome = async {
-            let script = self.run(Request::new(Verb::Source, iri)).await?;
+            let script = self.run_internal(Request::new(Verb::Source, iri)).await?;
             self.run_lisp(&script).await
         }
         .await;
@@ -2424,9 +2425,9 @@ impl Engine {
 
     /// Report whether resolving `spec` would be served from the cache, without
     /// resolving it. `spec` is a single `<iri> [key=value …] [input]` — the same
-    /// surface as one `source` stage, but no pipelines (there's nothing to thread
-    /// through). Read-only except that naming arguments fetches the target's
-    /// contract (a `Meta`), which is itself cacheable.
+    /// surface and presentation policy as one `source` stage, but no pipelines
+    /// (there is nothing to thread through). Contract reads for routing or
+    /// presentation may themselves be cached.
     async fn run_cache(&self, spec: &str) -> Result<String, String> {
         let mut pipeline = parse_spec(spec)?;
         // `cache … as-of=<instant>` probes the corridor's partition — the question "would this
@@ -2448,6 +2449,7 @@ impl Engine {
         };
         let (target, args) = words.split_first().ok_or("expected an IRI")?;
         let request = self.source_request(target, args, None).await?;
+        let request = self.prepare_request(request, true).await;
         let scope = self.line_scope();
         Ok(
             if self
@@ -2595,8 +2597,11 @@ impl Engine {
             }
         };
         let (target, args) = words.split_first().ok_or("expected an IRI")?;
-        let iri = parse_target(target)?;
         let request = self.source_request(target, args, None).await?;
+        // Finish policy and its optional contract read before tracing the resolution.
+        // The returned request is also the identity the trace must describe.
+        let request = self.prepare_request(request, false).await;
+        let iri = request.target.clone();
         let capability = self.capability.borrow().clone();
         // A scoped (non-root) session annotates each node with the authority it ran
         // under — `cap ✓` on success, `cap ✗` on a denial; a root session has nothing
@@ -2632,12 +2637,7 @@ impl Engine {
         self.resolver.set_tracer(collector.clone());
         let result = self
             .resolver
-            .issue_as_async_in(
-                self.prepare_request(request, false).await,
-                &capability,
-                None,
-                scope,
-            )
+            .issue_as_async_in(request, &capability, None, scope)
             .await;
         self.resolver.clear_tracer();
 
@@ -2898,6 +2898,13 @@ impl Engine {
     pub(crate) async fn run(&self, request: impl Into<RoutedRequest>) -> Result<String, String> {
         // No pipe upstream (sink / meta / a single source): resolve on its own merits.
         self.run_staged(request, None).await?.into_text()
+    }
+
+    /// Issue a request whose answer the engine interprets or discards rather than displays.
+    pub(crate) async fn run_internal(&self, request: Request) -> Result<String, String> {
+        self.run_staged_for(request.into(), None, false)
+            .await?
+            .into_text()
     }
 
     /// Issue a request — optionally carrying the upstream pipe `incoming` provenance,
