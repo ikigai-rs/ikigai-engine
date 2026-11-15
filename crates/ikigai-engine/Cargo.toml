@@ -31,7 +31,7 @@ oxrdf = { workspace = true, optional = true }
 # triple term recursively, so a few thousand levels of `<<( … )>>` aborted the host at every
 # plan door. `ikigai_store::depth::check_rdf_nesting` is the scan that mirrors oxttl's STRICT
 # Turtle lexer, which is how `TurtleParser::new()` parses a plan. Its API floor is 0.2.10; the
-# version is the root's and `ikigai-intray`'s so the pins cannot resolve apart. No features:
+# version matches `ikigai-intray`'s requirement in this workspace. No features:
 # `persistent` (RocksDB) is the host's, and nothing here opens a store. Optional with the
 # reader, so a wasm build (plan-reader off) does not get oxigraph.
 # 0.3.0 was the release on core 0.2 (ledger #2349). 0.4.0 is the release on core 0.3 (ledger
@@ -53,8 +53,8 @@ futures = { workspace = true }
 # plan back pulls oxrdf → `rand` → `getrandom`, which **fails to compile** on
 # wasm32-unknown-unknown without a rustflag only the final consumer can set. Rendering a
 # plan (`plan <spec>`) costs nothing and is always available; executing a stored one
-# (`run <spec>`) needs the parser, so it is a feature the host asks for — `ikigai-cli`
-# does. A wasm build keeps the default and gets a `run` that says which feature is off,
+# (`execute <spec>`) needs the parser, so a host that reads stored plans must enable
+# `plan-reader`. A wasm build keeps the default and gets an `execute` that names the feature,
 # rather than a build that does not link.
 #
 # Measured 2026-09-13, not assumed: `cargo check -p ikigai-engine --target
