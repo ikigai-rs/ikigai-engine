@@ -1476,7 +1476,7 @@ pub trait Resolver: Send + Sync {
     /// let read = Request::new(Verb::Source, Iri::parse("urn:x").unwrap());
     /// let narrowed = Capability::scoped(["urn:cap:x"]);
     /// match IssueOnly.issue_as(read, &narrowed) {
-    ///     Err(Error::Denied(message)) => assert!(message.contains("IssueOnly")),
+    ///     Err(Error::Denied(message)) => assert!(message.message().contains("IssueOnly")),
     ///     other => panic!("a resolver that cannot carry a capability refuses it: {other:?}"),
     /// }
     /// ```
@@ -1488,13 +1488,16 @@ pub trait Resolver: Send + Sync {
         if capability.is_root() {
             return self.issue(request);
         }
-        Err(Error::Denied(format!(
-            "{} cannot carry a narrowed capability: it does not override \
+        Err(Error::Denied(
+            format!(
+                "{} cannot carry a narrowed capability: it does not override \
              `Resolver::issue_as`, and resolving through `issue` would answer under the \
              peer's own authority instead of the caller's. Forward the capability in an \
              `issue_as` override",
-            std::any::type_name::<Self>()
-        )))
+                std::any::type_name::<Self>()
+            )
+            .into(),
+        ))
     }
 
     /// Async resolution under an explicit `capability` — what the engine `await`s
@@ -2895,7 +2898,7 @@ mod tests {
             Exact::new("urn:peer:scoped"),
             FnEndpoint::new("scoped", |inv| {
                 if !inv.capability.allows(SECRET) {
-                    return Err(Error::Denied(format!("the peer wants {SECRET}")));
+                    return Err(Error::Denied(format!("the peer wants {SECRET}").into()));
                 }
                 let seen = match inv.capability.scopes() {
                     None => "root".to_string(),
@@ -2990,7 +2993,7 @@ mod tests {
         let refused = Resolver::issue_as(&local, scoped_read(), &narrowed)
             .expect_err("a narrowed read through an issue-only wrapper must not succeed");
         assert!(
-            matches!(&refused, Error::Denied(message) if message.contains("IssueOnly")),
+            matches!(&refused, Error::Denied(message) if message.message().contains("IssueOnly")),
             "a typed Denied naming the resolver that dropped the capability: {refused:?}"
         );
         // Even a capability that WOULD satisfy the peer is refused: the wrapper cannot carry
@@ -3021,7 +3024,7 @@ mod tests {
         );
         let refused = Resolver::issue_as(&local, scoped_read(), &Capability::scoped(["urn:x"]));
         assert!(
-            matches!(&refused, Err(Error::Denied(message)) if message.contains("the peer wants")),
+            matches!(&refused, Err(Error::Denied(message)) if message.message().contains("the peer wants")),
             "an insufficient one is refused BY THE PEER: {refused:?}"
         );
     }
@@ -3898,7 +3901,7 @@ mod tests {
         ))));
         let refused = block_on(local.issue_body(scoped_read(), &Capability::scoped(["urn:x"])));
         assert!(
-            matches!(&refused, Err(Error::Denied(message)) if message.contains("the peer wants")),
+            matches!(&refused, Err(Error::Denied(message)) if message.message().contains("the peer wants")),
             "refused by the peer through the body path: {:?}",
             refused.as_ref().map(|_| "a body")
         );
@@ -3914,7 +3917,7 @@ mod tests {
         let forgetting = mounting(Arc::new(IssueOnly(peer_checking_at_runtime())));
         let refused = block_on(forgetting.issue_body(scoped_read(), &Capability::scoped([SECRET])));
         assert!(
-            matches!(&refused, Err(Error::Denied(message)) if message.contains("IssueOnly")),
+            matches!(&refused, Err(Error::Denied(message)) if message.message().contains("IssueOnly")),
             "the body path's default inherits the refusal: {:?}",
             refused.as_ref().map(|_| "a body")
         );

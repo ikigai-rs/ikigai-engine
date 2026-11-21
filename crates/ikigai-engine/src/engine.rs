@@ -9065,7 +9065,7 @@ mod tests {
             let now = inv.now().map(|t| t.as_millis()).unwrap_or(0);
             let repr =
                 Representation::new(ReprType::new("text/plain"), now.to_string().into_bytes());
-            Ok(if inv.scope().clock().is_some() {
+            Ok(if inv.clock_pinned() {
                 repr.cacheable()
             } else {
                 repr
