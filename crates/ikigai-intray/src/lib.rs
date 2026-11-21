@@ -1476,9 +1476,9 @@ impl Endpoint for SpaceEndpoint {
             // each drop after a pass to mean "review the file as it is now".
             Verb::Sink => {
                 if !inv.capability.allows(CAP_OUT) {
-                    return Err(Error::Denied(format!(
-                        "dropping into a space needs `{CAP_OUT}`"
-                    )));
+                    return Err(Error::Denied(
+                        format!("dropping into a space needs `{CAP_OUT}`").into(),
+                    ));
                 }
                 // `retry=<id>` moves a dead-lettered tuple back to the inbox for another
                 // pass, and drops its stale `.err` note. A failure is often ENVIRONMENTAL —
@@ -1495,10 +1495,13 @@ impl Endpoint for SpaceEndpoint {
                     // learn which ids are dead letters. The verb's `requires` cannot say this (a
                     // plain drop must not need it), so the `retry` input's summary does.
                     if !inv.capability.allows(CAP_RETRY) {
-                        return Err(Error::Denied(format!(
+                        return Err(Error::Denied(
+                            format!(
                             "re-arming a dead letter with `retry=` needs `{CAP_RETRY}` as well \
                              as `{CAP_OUT}`"
-                        )));
+                        )
+                            .into(),
+                        ));
                     }
                     if !is_tuple_id(id) {
                         return Err(Error::InvalidArgument {
@@ -1570,10 +1573,13 @@ impl Endpoint for SpaceEndpoint {
             Verb::Source => {
                 if !inv.capability.allows(CAP_READ) && !inv.capability.allows(&cap_read_space(name))
                 {
-                    return Err(Error::Denied(format!(
-                        "reading space `{name}` needs `{CAP_READ}` or `{}`",
-                        cap_read_space(name)
-                    )));
+                    return Err(Error::Denied(
+                        format!(
+                            "reading space `{name}` needs `{CAP_READ}` or `{}`",
+                            cap_read_space(name)
+                        )
+                        .into(),
+                    ));
                 }
                 self.requeue_stale_claims(name);
                 // `state=` selects which stage of the machine to read: the live `inbox`
@@ -1679,9 +1685,9 @@ impl Endpoint for SpaceEndpoint {
             // take: remove a tuple and return its content (Linda's `in`). Atomic per tuple.
             Verb::Delete => {
                 if !inv.capability.allows(CAP_TAKE) {
-                    return Err(Error::Denied(format!(
-                        "taking from a space needs `{CAP_TAKE}`"
-                    )));
+                    return Err(Error::Denied(
+                        format!("taking from a space needs `{CAP_TAKE}`").into(),
+                    ));
                 }
                 self.requeue_stale_claims(name);
                 // A specific tuple by id: claim it, or NotFound if already taken/absent.

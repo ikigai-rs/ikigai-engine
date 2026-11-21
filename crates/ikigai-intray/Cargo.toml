@@ -61,13 +61,14 @@ spargebra = { version = "0.4", features = ["sep-0006"] }
 # 0.3.0 was the release on core 0.2 (ledger #2349). 0.4.0 is the release on core 0.3 (ledger
 # #3061); it carries every floor above.
 # 0.5.0 (ledger #3364) adds graph-written resources and shares one store with shacl 0.6.1.
-# The requirement is also a ceiling below 0.6.0 (`<0.6.0`).
-ikigai-store = "0.5.0"
+# 0.6.0 is the release on core 0.4 (ledger #3966).
+# The requirement is also a ceiling below 0.7.0 (`<0.7.0`).
+ikigai-store = "0.6.0"
 # 0.2.1 first exports check_turtle_nesting and MAX_TURTLE_NESTING.
 # The host already resolves 0.2.6; intray needs only this API floor.
 # 0.3.0 was the release on core 0.2 (ledger #2349). 0.5.0 is the release on core 0.3 (ledger
-# #3061), the line ikigai-store 0.4 takes.
-ikigai-rdf = "0.5.0"
+# #3061), the line ikigai-store 0.4 takes. 0.6.0 is the release on core 0.4 (ledger #3966).
+ikigai-rdf = "0.6.0"
 
 # The disk module's `openat` family (ledger #2959): every operation below the root is made
 # relative to a held directory handle, refusing a symlinked name, with no gap between a check and
@@ -91,5 +92,5 @@ oxigraph = { version = "0.5", features = ["http-client", "rdf-12"] }
 # engine's write path, and a hand-built request would only restate what we believe it sends.
 # serde_json renders the Meta the engine reads to route named arguments (without a JSON Meta
 # renderer the engine fails open and a routing defect is invisible — field guide).
-ikigai-engine = { path = "../ikigai-engine", version = "0.5.0" }
+ikigai-engine = { path = "../ikigai-engine", version = "0.6.0" }
 serde_json = { workspace = true }

@@ -82,7 +82,7 @@ fn dropping_authority_cannot_re_arm_a_parked_dead_letter() {
         Capability::scoped([CAP_OUT, CAP_READ, CAP_TAKE]),
     ] {
         match retry(&k, &cap, &id) {
-            Err(Error::Denied(why)) => assert!(why.contains(CAP_RETRY), "{why}"),
+            Err(Error::Denied(why)) => assert!(why.message().contains(CAP_RETRY), "{why}"),
             other => panic!("`retry=` under {cap:?} must be denied, got {other:?}"),
         }
         assert!(in_error(&root, &id), "the dead letter stays parked");
