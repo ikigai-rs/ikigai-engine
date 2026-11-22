@@ -1566,7 +1566,6 @@ impl Engine {
                         .into_iter()
                         .map(|(name, iri)| (name.to_string(), RefTo::Resource(iri)))
                         .collect();
-                    let positional = positional.join(" ");
                     if has_input && !positional.is_empty() {
                         return Err(format!(
                             "`{}` takes its input from the pipe — drop the literal input",
@@ -1582,7 +1581,7 @@ impl Engine {
                             .map(String::as_str)
                             .collect();
                         let name = route_value_name(&iri, description.as_ref(), &named)?;
-                        arguments.insert(name, positional);
+                        arguments.insert(name, positional.join(" "));
                     }
                     Ok(push_step(
                         builder,
