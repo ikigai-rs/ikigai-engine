@@ -24,8 +24,10 @@ mod common;
 
 use common::{drop_tuple, iri, scratch};
 use futures::executor::block_on;
-use ikigai_core::{ArgRef, Capability, Error, Kernel, Request, Verb};
-use ikigai_intray::{space, space_with_budget, CAP_OUT, CAP_READ, CAP_TAKE};
+use ikigai_core::{ArgRef, Bindings, Capability, Error, Invocation, Kernel, Request, Verb};
+use ikigai_intray::{
+    space, space_with_budget, tuple_id, SpaceEndpoint, CAP_OUT, CAP_READ, CAP_TAKE,
+};
 use ikigai_store::budget::{cap_budget, EvaluationBudget, TimeBudget};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -148,6 +150,38 @@ fn rd_match_is_answered_at_its_budget_and_the_worker_is_counted_until_it_ends() 
     // the abandoned worker (or the worker already stopped at the token).
     let ended = settles(&budget);
     eprintln!("rd: answered after {answered:?}; the worker ended {ended:?} later");
+}
+
+#[test]
+fn a_slow_supplied_tuple_times_out_the_read_instead_of_returning_stored_hits() {
+    let budget = EvaluationBudget::new(TimeBudget::new(ms(50)));
+    let root = scratch("budget-supplied");
+    let k = Kernel::new(Arc::new(space_with_budget(root.clone(), budget.clone())));
+    let stored = b"<urn:t:s> <urn:t:p0> \"quick\" .";
+    let stored_id = drop_tuple(&k, &Capability::scoped([CAP_OUT]), "urn:space:q", stored)
+        .expect("dropping the tuple");
+    // The one-triple graph matches its only row. The supplied graph has only failing
+    // rows, so the ASK runs through the expensive cross product used by the rd test.
+    let query = template(7).replace(
+        "\"never\"",
+        &format!("\"{}\"", "urn:t:surn:t:p0quick".repeat(7)),
+    );
+    let endpoint = SpaceEndpoint::new(root).with_evaluation_budget(budget.clone());
+    let request = Request::new(Verb::Source, iri("urn:space:q"))
+        .with_arg("match", ArgRef::Inline(query.into_bytes()));
+    let mut bindings = Bindings::new();
+    bindings.insert("name", "q");
+    let cap = Capability::scoped([CAP_READ]);
+    let inv = Invocation::detached(&request, &bindings, &cap);
+    let matching = |extra| {
+        endpoint
+            .invoke_with_match_candidates(&inv, extra)
+            .map(|r| String::from_utf8(r.bytes).unwrap())
+    };
+    assert_eq!(matching(Vec::new()), Ok(stored_id));
+    let slow = tuple_turtle();
+    assert_timeout(matching(vec![(tuple_id(&slow), slow)]), 50);
+    settles(&budget);
 }
 
 #[test]
