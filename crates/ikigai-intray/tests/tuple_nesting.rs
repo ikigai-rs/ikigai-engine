@@ -19,8 +19,8 @@ mod common;
 
 use common::{drop_tuple, iri, scratch};
 use futures::executor::block_on;
-use ikigai_core::{ArgRef, Capability, Kernel, Request, Verb};
-use ikigai_intray::{space, tuple_id, CAP_OUT, CAP_READ, CAP_TAKE};
+use ikigai_core::{ArgRef, Bindings, Capability, Invocation, Kernel, Request, Verb};
+use ikigai_intray::{space, tuple_id, SpaceEndpoint, CAP_OUT, CAP_READ, CAP_TAKE};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -194,4 +194,39 @@ fn binary_tuples_keep_their_bytes_and_cannot_hide_deep_nesting() {
         .to_string();
     assert!(refused.starts_with("invalid argument `content`"));
     assert!(refused.contains("MAX_RDF_NESTING"));
+}
+
+#[test]
+fn supplied_tuples_must_pass_the_nesting_check_before_parsing() {
+    use oxigraph::io::{RdfFormat, RdfParser};
+    use oxigraph::store::Store;
+
+    let deep = nested(BOUND + 1);
+    // Establish that the parser accepts this RDF. The nesting pre-check must
+    // exclude it from an ASK that accepts every parsed graph.
+    Store::new()
+        .unwrap()
+        .load_from_slice(RdfParser::from_format(RdfFormat::Turtle), &deep)
+        .unwrap();
+    let shallow = nested(BOUND);
+    let shallow_id = tuple_id(&shallow);
+    let non_rdf = b"ordinary text";
+    let endpoint = SpaceEndpoint::new(scratch("nesting-supplied"));
+    let request = Request::new(Verb::Source, iri("urn:space:q"))
+        .with_arg("match", ArgRef::Inline(b"ASK {}".to_vec()));
+    let mut bindings = Bindings::new();
+    bindings.insert("name", "q");
+    let cap = Capability::scoped([CAP_READ]);
+    let inv = Invocation::detached(&request, &bindings, &cap);
+    let hits = endpoint
+        .invoke_with_match_candidates(
+            &inv,
+            vec![
+                (tuple_id(&deep), deep),
+                (tuple_id(non_rdf), non_rdf.to_vec()),
+                (shallow_id.clone(), shallow),
+            ],
+        )
+        .unwrap();
+    assert_eq!(hits.bytes, shallow_id.as_bytes());
 }
