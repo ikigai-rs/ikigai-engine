@@ -373,16 +373,34 @@ enum Contract {
     Read(Box<Description>),
     /// The peer did not answer with a contract, for this reason. Not "unbound": a peer
     /// that says nothing binds the name is [`Lookup::Unbound`], and never gets this far.
-    Unavailable(String),
+    Unavailable(ContractFailure),
 }
 
-/// Why a contract could not be read — split because the two answers mean different
-/// things to a resolution (ledger #1146).
+enum ContractFailure {
+    /// The peer answered, but its answer did not supply a contract.
+    Answer(String),
+    /// The transport failed before the peer could answer.
+    Transport(Error),
+}
+
+impl ContractFailure {
+    fn reason(&self) -> String {
+        match self {
+            Self::Answer(reason) => reason.clone(),
+            Self::Transport(error) => format!("it refused the Meta request: {error}"),
+        }
+    }
+}
+
+/// Why a contract could not be read (ledger #1146).
 enum Lookup {
     /// The peer resolved nothing at that name: it is not offered there.
     Unbound,
-    /// The peer answered something other than a contract, or did not answer at all.
-    Unavailable(String),
+    Unavailable(ContractFailure),
+}
+
+fn is_transport_failure(error: &Error) -> bool {
+    matches!(error, Error::Timeout(_) | Error::Unavailable(_))
 }
 
 impl ForwardingEndpoint {
@@ -409,16 +427,20 @@ impl ForwardingEndpoint {
     ///
     /// It costs no round-trip: every caller that `Meta`-resolves describes the hit
     /// next, and the contract read here is what [`describe`](Endpoint::describe)
-    /// returns, so the one forward moves from describe to resolve. A peer already known
-    /// to be silent is not asked here either — [`DescribeHealth`] — and describes as
-    /// [`unavailable`] exactly as before.
+    /// returns, so the one forward moves from describe to resolve. A transport failure
+    /// is returned by [`Endpoint::meta_failure`], including a remembered failure during
+    /// the [`DescribeHealth`] cooldown. Catalog walks still get the placeholder from
+    /// [`Endpoint::describe`].
     fn resolution(mut self, request: &Request) -> Resolution {
-        let silent = self.health.as_ref().is_some_and(|h| h.failing().is_some());
-        if request.verb == Verb::Meta && !silent {
+        if request.verb == Verb::Meta {
             // ★ A `Meta` is the "describe it NOW" operation, so it never takes the memo's
             // word for it — it refreshes the memo instead (see `ContractMemo`).
             let target = self.request.target.as_str().to_string();
-            match self.lookup() {
+            let lookup = match self.health.as_ref().and_then(|health| health.failing()) {
+                Some(error) => Err(Lookup::Unavailable(ContractFailure::Transport(error))),
+                None => self.lookup(),
+            };
+            match lookup {
                 Ok(description) => {
                     self.contracts.put(&target, &description, self.now());
                     self.contract = Some(Contract::Read(Box::new(description)))
@@ -427,8 +449,8 @@ impl ForwardingEndpoint {
                     self.contracts.forget(&target);
                     return Limit::new(request.target.as_str()).resolve(request, &Scope::empty());
                 }
-                Err(Lookup::Unavailable(reason)) => {
-                    self.contract = Some(Contract::Unavailable(reason))
+                Err(Lookup::Unavailable(failure)) => {
+                    self.contract = Some(Contract::Unavailable(failure))
                 }
             }
         }
@@ -503,31 +525,39 @@ impl ForwardingEndpoint {
                 // TURTLE, and the parse fails here — so the media type is named, because
                 // "expected JSON, got text/turtle" is the whole diagnosis.
                 |error| {
-                    Lookup::Unavailable(format!(
+                    Lookup::Unavailable(ContractFailure::Answer(format!(
                         "its Meta answer is {} ({} byte(s)), not a JSON Description: {error}",
                         repr.repr_type,
                         repr.bytes.len()
-                    ))
+                    )))
                 },
             ),
             // The peer's own words for "nothing binds that name here".
             Err(Error::Unresolved(_)) => Err(Lookup::Unbound),
-            Err(error) => {
+            Err(error) if is_transport_failure(&error) => {
                 // Silence here is the same silence an enumeration would meet, so it counts
                 // against the same health — one row's timeout spares every later row.
                 if let Some(health) = &self.health {
                     health.record(&error, self.clock.as_ref());
                 }
-                Err(Lookup::Unavailable(format!(
-                    "it refused the Meta request: {error}"
-                )))
+                Err(Lookup::Unavailable(ContractFailure::Transport(error)))
             }
+            Err(error) => Err(Lookup::Unavailable(ContractFailure::Answer(format!(
+                "it refused the Meta request: {error}"
+            )))),
         }
     }
 }
 
 #[async_trait]
 impl Endpoint for ForwardingEndpoint {
+    fn meta_failure(&self) -> Option<Error> {
+        match &self.contract {
+            Some(Contract::Unavailable(ContractFailure::Transport(error))) => Some(error.clone()),
+            _ => None,
+        }
+    }
+
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
         // Off the trace path: a plain forward. The resolver already yields a typed
         // Error, so a hung/unreachable remote surfaces as transient — a Retry or
@@ -604,14 +634,14 @@ impl Endpoint for ForwardingEndpoint {
         // A `Meta` resolution already asked (see `resolution`): its answer is the answer.
         let reason = match &self.contract {
             Some(Contract::Read(description)) => return (**description).clone(),
-            Some(Contract::Unavailable(reason)) => reason.clone(),
+            Some(Contract::Unavailable(failure)) => failure.reason(),
             None => {
                 let now = self.now();
-                if let Some(reason) = self.health.as_ref().and_then(|health| health.failing()) {
+                if let Some(error) = self.health.as_ref().and_then(|health| health.failing()) {
                     return unavailable(
                         self.origin.as_deref(),
                         self.request.target.as_str(),
-                        &reason,
+                        &error.to_string(),
                     );
                 }
                 // The floor and a routing read land here once per resolution, because each
@@ -632,7 +662,7 @@ impl Endpoint for ForwardingEndpoint {
                     Err(Lookup::Unbound) => {
                         format!("it resolves nothing at `{}`", self.request.target)
                     }
-                    Err(Lookup::Unavailable(reason)) => reason,
+                    Err(Lookup::Unavailable(failure)) => failure.reason(),
                 }
             }
         };
@@ -768,7 +798,7 @@ struct DescribeHealth {
 /// clocks whose millisecond readings differ, even when both are monotonic (ledger #2441).
 struct DescribeFailure {
     at: Time,
-    why: String,
+    error: Error,
     clock: Arc<dyn Clock>,
 }
 
@@ -806,7 +836,7 @@ impl DescribeHealth {
     /// Why the peer is currently considered undescribable, if it is — clearing a record
     /// that has aged past [`DESCRIBE_COOLDOWN`] so the next call tries the peer again.
     /// Read the same clock that stamped the failure, regardless of which mount asks.
-    fn failing(&self) -> Option<String> {
+    fn failing(&self) -> Option<Error> {
         let mut failed = match self.failed.lock() {
             Ok(failed) => failed,
             // A poisoned lock must cost knowledge, never a describe: forget the record.
@@ -814,7 +844,7 @@ impl DescribeHealth {
         };
         match &*failed {
             Some(failure) if within(failure.at, Some(failure.clock.now()), DESCRIBE_COOLDOWN) => {
-                Some(failure.why.clone())
+                Some(failure.error.clone())
             }
             Some(_) => {
                 *failed = None;
@@ -834,7 +864,7 @@ impl DescribeHealth {
     /// installed — a silence is not remembered and every describe asks the peer, which is
     /// what a mount did before it kept this record; there is no cooldown to measure.
     fn record(&self, error: &Error, clock: Option<&Arc<dyn Clock>>) {
-        if !matches!(error, Error::Timeout(_) | Error::Unavailable(_)) {
+        if !is_transport_failure(error) {
             return;
         }
         let Some(clock) = clock else {
@@ -847,7 +877,7 @@ impl DescribeHealth {
         };
         *failed = Some(DescribeFailure {
             at: now,
-            why: error.to_string(),
+            error: error.clone(),
             clock: Arc::clone(clock),
         });
     }
@@ -1279,7 +1309,7 @@ impl Space for MountedRemote {
                 Arc::new(MountUnavailable {
                     prefix: self.prefix.clone(),
                     origin: self.origin.clone(),
-                    reason: self.health.failing(),
+                    reason: self.health.failing().map(|error| error.to_string()),
                 }),
                 Bindings::new(),
             ));
@@ -1332,8 +1362,8 @@ impl Space for MountedRemote {
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         // A peer already known to be silent is not asked again for the cooldown — a
         // manifold read must cost ONE deadline per unhealthy mount, not one per attempt.
-        if let Some(reason) = self.health.failing() {
-            return Some(vec![self.unenumerated(&reason)]);
+        if let Some(error) = self.health.failing() {
+            return Some(vec![self.unenumerated(&error.to_string())]);
         }
         let entries = match self.resolver.try_entries() {
             Ok(Some(entries)) => {
@@ -2753,14 +2783,28 @@ mod tests {
         assert!(matches!(error, Error::Unresolved(_)), "got {error:?}");
     }
 
-    struct UnreachablePeer(std::sync::atomic::AtomicUsize);
+    struct UnreachablePeer {
+        calls: std::sync::atomic::AtomicUsize,
+        error: Error,
+    }
+
+    impl UnreachablePeer {
+        fn new(error: Error) -> Self {
+            Self {
+                calls: Default::default(),
+                error,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
 
     impl Resolver for UnreachablePeer {
         fn issue(&self, _request: Request) -> Result<(Representation, CacheStatus), Error> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(Error::Unavailable(
-                "dial test://peer: connection refused".into(),
-            ))
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(self.error.clone())
         }
 
         fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
@@ -2776,7 +2820,9 @@ mod tests {
     fn meta_through_an_unreachable_mount_returns_the_transport_error() {
         let kernel = Kernel::with_meta_renderer(
             Arc::new(MountedRemote::new(
-                Arc::new(UnreachablePeer(Default::default())),
+                Arc::new(UnreachablePeer::new(Error::Unavailable(
+                    "dial test://peer: connection refused".into(),
+                ))),
                 "urn:peer:",
                 "test://peer",
             )),
@@ -2793,6 +2839,47 @@ mod tests {
                 .as_ref()
                 .map(|repr| String::from_utf8_lossy(&repr.bytes))
         );
+    }
+
+    #[test]
+    fn a_mount_reuses_its_transport_error_until_the_describe_cooldown_expires() {
+        for error in [
+            Error::Unavailable("dial test://peer: connection refused".into()),
+            Error::Timeout("no answer".into()),
+        ] {
+            let peer = Arc::new(UnreachablePeer::new(error.clone()));
+            let clock = Stepped::at(1_000);
+            let kernel = Kernel::with_meta_renderer(
+                Arc::new(
+                    MountedRemote::new(peer.clone(), "urn:peer:", "test://peer")
+                        .with_clock(Arc::new(clock.clone())),
+                ),
+                Arc::new(JsonMeta),
+            );
+            let request =
+                meta("urn:peer:doc").with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
+            let read_meta =
+                || block_on(kernel.issue(request.clone(), &Capability::root())).unwrap_err();
+            assert_eq!(read_meta(), error);
+            assert_eq!(peer.calls(), 1);
+
+            clock.advance(DESCRIBE_COOLDOWN - std::time::Duration::from_millis(1));
+            assert_eq!(read_meta(), error);
+            let description = kernel.describe(&request.target).expect("catalog row");
+            assert_eq!(description.title, "contract unavailable");
+            assert!(description.summary.contains(&error.to_string()));
+            assert_eq!(peer.calls(), 1, "Meta and describe share the cooldown");
+
+            assert_eq!(
+                read_as(&kernel, "urn:peer:doc", &Capability::root()).unwrap_err(),
+                error
+            );
+            assert_eq!(peer.calls(), 2, "Source still asks the peer");
+
+            clock.advance(std::time::Duration::from_millis(1));
+            assert_eq!(read_meta(), error);
+            assert_eq!(peer.calls(), 3, "Meta dials again at cooldown expiry");
+        }
     }
 
     /// A peer that ANSWERS but not with a contract is still the placeholder — "unknown",
