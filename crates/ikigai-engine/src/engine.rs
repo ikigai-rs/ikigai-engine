@@ -8288,6 +8288,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unreachable_mount_names_the_connection_failure_for_a_named_argument() {
+        struct UnreachablePeer;
+        impl Resolver for UnreachablePeer {
+            fn issue(
+                &self,
+                _: Request,
+            ) -> Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+            {
+                Err(ikigai_core::Error::Unavailable(
+                    "dial test://peer: connection refused".into(),
+                ))
+            }
+
+            fn is_cached(&self, _: &Request, _: &Capability) -> bool {
+                false
+            }
+
+            fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+                None
+            }
+        }
+
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(ikigai_resolve::MountedRemote::new(
+                Arc::new(UnreachablePeer),
+                "urn:hub:",
+                "test://peer",
+            )),
+            Arc::new(JsonRenderer),
+        ));
+
+        let error = output(engine.eval("source urn:hub:iki:fn:toUpper in=hello")).unwrap_err();
+        assert_eq!(error, "unavailable: dial test://peer: connection refused");
+        let notes = engine.last_contract_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].target, "urn:hub:iki:fn:toUpper");
+        assert_eq!(notes[0].reason, error);
+        assert!(notes[0].to_string().starts_with(
+            "contract unavailable for urn:hub:iki:fn:toUpper: unavailable: dial test://peer: connection refused"
+        ));
+    }
+
     /// ledger #98: a contract fetch that FAILS is no longer silent. On a kernel with no Meta
     /// renderer the value still routes to `in` exactly as before (kept: such a kernel still
     /// works), and the line now carries a note naming the target and why. A contract that is

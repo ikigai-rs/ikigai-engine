@@ -1447,9 +1447,22 @@ fn tuple_matches(
     }
 }
 
-#[async_trait]
-impl Endpoint for SpaceEndpoint {
-    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+impl SpaceEndpoint {
+    /// Invoke the endpoint with additional candidates for an associative read (`Source`
+    /// with `match=` and no `tuple=`). Other requests use the ordinary endpoint behavior.
+    ///
+    /// Supply each candidate as its tuple ID (the lowercase BLAKE3 hex of its original stored
+    /// bytes) and its decoded bytes, such as the bytes returned by a take. Intray uses the
+    /// supplied ID as given and considers the candidate alongside the selected stage's tuples
+    /// without storing it. Both sets share one parsed ASK template, cancellation token, and
+    /// evaluation budget. The result is the usual newline-delimited list of matching IDs,
+    /// sorted in ID order with each ID appearing once. A timeout returns an error for the
+    /// entire read.
+    pub fn invoke_with_match_candidates(
+        &self,
+        inv: &Invocation<'_>,
+        candidates: Vec<(String, Vec<u8>)>,
+    ) -> Result<Representation> {
         let name = inv
             .bindings
             .get("name")
@@ -1660,6 +1673,19 @@ impl Endpoint for SpaceEndpoint {
                                     }
                                 }
                             }
+                            let stored_hits = hits.len();
+                            for (id, plain) in candidates {
+                                if token.is_cancelled() {
+                                    return Err(canceled());
+                                }
+                                if tuple_matches(template, &plain, token)? {
+                                    hits.push(id);
+                                }
+                            }
+                            if hits.len() > stored_hits {
+                                hits.sort_unstable();
+                                hits.dedup();
+                            }
                             // Rendering is part of the scan budget too: a large join must
                             // not block the caller after its evaluation has already ended.
                             Ok(hits.join("\n").into_bytes())
@@ -1778,6 +1804,13 @@ impl Endpoint for SpaceEndpoint {
                 "urn:space:* answers Source (rd), Sink (out), and Delete (take), not {v:?}"
             ))),
         }
+    }
+}
+
+#[async_trait]
+impl Endpoint for SpaceEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.invoke_with_match_candidates(inv, Vec::new())
     }
 
     fn describe(&self) -> Description {
@@ -3083,15 +3116,19 @@ fn inbox_tuple(root: &Path, path: &Path) -> Option<(String, String)> {
 mod tests {
     use super::*;
     use futures::executor::block_on;
-    use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request};
+    use ikigai_core::{ArgRef, Bindings, Capability, Iri, Kernel, Request};
     use std::sync::{Arc, Mutex};
 
-    fn kernel_at(sub: &str) -> Kernel {
+    fn test_root(sub: &str) -> PathBuf {
         let root = std::env::temp_dir()
             .join(format!("ikigai-intray-test-{}", std::process::id()))
             .join(sub);
         let _ = std::fs::remove_dir_all(&root);
-        Kernel::new(Arc::new(space(root)))
+        root
+    }
+
+    fn kernel_at(sub: &str) -> Kernel {
+        Kernel::new(Arc::new(space(test_root(sub))))
     }
 
     fn iri(s: &str) -> Iri {
@@ -3390,6 +3427,69 @@ mod tests {
             String::from_utf8(remaining.bytes).unwrap(),
             _place_id,
             "place remains"
+        );
+    }
+
+    #[test]
+    fn associative_read_can_see_a_matching_receipt_copy() {
+        let root = test_root("space-match-receipt");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped([CAP_OUT, CAP_READ, CAP_TAKE]);
+        let space_iri = "urn:space:people";
+        let mut people: [&[u8]; 2] = [
+            b"<urn:alice> a <urn:Person> .",
+            b"<urn:bob> a <urn:Person> .",
+        ];
+        people.sort_by_key(|bytes| tuple_id(bytes));
+        let [leased, stored] = people;
+        // The supplied match sorts first even though the stored match is evaluated first.
+        let id = out(&k, &cap, space_iri, leased);
+        let receipt = block_on(k.issue(Request::new(Verb::Delete, iri(space_iri)), &cap)).unwrap();
+        assert_eq!(receipt.bytes, leased);
+        let stored_id = out(&k, &cap, space_iri, stored);
+        let request = Request::new(Verb::Source, iri(space_iri)).with_arg(
+            "match",
+            ArgRef::Inline(b"ASK { ?s a <urn:Person> }".to_vec()),
+        );
+        let ordinary = block_on(k.issue(request.clone(), &cap)).unwrap();
+        assert_eq!(ordinary.bytes, stored_id.as_bytes());
+
+        let mut bindings = Bindings::new();
+        bindings.insert("name", "people");
+        let inv = Invocation::detached(&request, &bindings, &cap);
+        let nonmatch = b"<urn:cafe> a <urn:Place> .";
+        let hits = SpaceEndpoint::new(root)
+            .invoke_with_match_candidates(
+                &inv,
+                vec![
+                    (stored_id.clone(), stored.to_vec()),
+                    (tuple_id(nonmatch), nonmatch.to_vec()),
+                    (id.clone(), receipt.bytes),
+                ],
+            )
+            .unwrap();
+        assert_eq!(hits.bytes, format!("{id}\n{stored_id}").into_bytes());
+        let after = block_on(k.issue(request, &cap)).unwrap();
+        assert_eq!(after.bytes, stored_id.as_bytes());
+    }
+
+    #[test]
+    fn supplied_match_candidates_still_refuse_service() {
+        let endpoint = SpaceEndpoint::new(test_root("space-match-receipt-service"));
+        let query = b"ASK { SERVICE <http://127.0.0.1:1/> { ?s ?p ?o } }";
+        let request = Request::new(Verb::Source, iri("urn:space:q"))
+            .with_arg("match", ArgRef::Inline(query.to_vec()));
+        let mut bindings = Bindings::new();
+        bindings.insert("name", "q");
+        let cap = Capability::scoped([CAP_READ]);
+        let inv = Invocation::detached(&request, &bindings, &cap);
+        let tuple = b"<urn:s> <urn:p> <urn:o> .";
+        let result =
+            endpoint.invoke_with_match_candidates(&inv, vec![(tuple_id(tuple), tuple.to_vec())]);
+        assert!(
+            matches!(result, Err(Error::InvalidArgument { ref name, ref detail })
+                if name == "match" && detail.contains("SERVICE")),
+            "got: {result:?}"
         );
     }
 
