@@ -2753,6 +2753,48 @@ mod tests {
         assert!(matches!(error, Error::Unresolved(_)), "got {error:?}");
     }
 
+    struct UnreachablePeer(std::sync::atomic::AtomicUsize);
+
+    impl Resolver for UnreachablePeer {
+        fn issue(&self, _request: Request) -> Result<(Representation, CacheStatus), Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Unavailable(
+                "dial test://peer: connection refused".into(),
+            ))
+        }
+
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            None
+        }
+    }
+
+    #[test]
+    fn meta_through_an_unreachable_mount_returns_the_transport_error() {
+        let kernel = Kernel::with_meta_renderer(
+            Arc::new(MountedRemote::new(
+                Arc::new(UnreachablePeer(Default::default())),
+                "urn:peer:",
+                "test://peer",
+            )),
+            Arc::new(JsonMeta),
+        );
+        let request =
+            meta("urn:peer:doc").with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
+        let answer = block_on(kernel.issue(request, &Capability::root()));
+        assert!(
+            matches!(&answer, Err(Error::Unavailable(reason))
+                if reason == "dial test://peer: connection refused"),
+            "expected the original transport error, got {:?}",
+            answer
+                .as_ref()
+                .map(|repr| String::from_utf8_lossy(&repr.bytes))
+        );
+    }
+
     /// A peer that ANSWERS but not with a contract is still the placeholder — "unknown",
     /// not "absent" — because only the peer's `Unresolved` says nothing binds the name.
     #[test]
