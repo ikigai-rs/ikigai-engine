@@ -89,7 +89,10 @@ members = ["crates/*"]
 # 0.7.1 (ledger #4050): mounted Meta reads return the peer's transport error, including
 # during the describe cooldown. Catalog descriptions retain their placeholder. No public
 # type changed: a patch, with the core and vocab floor raised to 0.4.2.
-version = "0.7.1"
+# 0.7.2 (ledger #4031): an explicit empty quoted argument (`""`) is routed as an empty value
+# instead of being dropped, so it no longer falls through to waiting stdin. A grammar fix,
+# no public type changed: a patch.
+version = "0.7.2"
 edition = "2021"
 # Measured 2026-10-26, not assumed: 1.89 is the first toolchain that builds the workspace.
 # `ikigai-intray` takes the lease with `std::fs::File::try_lock` (stable in 1.89; 1.88 refuses
@@ -179,7 +182,7 @@ ikigai-fs = "0.6.0"
 # 0.7.0 is the release on core 0.4 (ledger #3966), on store 0.6.0.
 # The requirement is also a ceiling below 0.8.0 (`<0.8.0`).
 ikigai-shacl = "0.7.0"
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.7.1" }
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.7.2" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face, reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins

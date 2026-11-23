@@ -2282,11 +2282,11 @@ impl Engine {
             .map(|(name, _)| *name)
             .chain(references.iter().map(|(name, _)| *name))
             .collect();
-        let positional = positional.join(" ");
+        let positional = (!positional.is_empty()).then(|| positional.join(" "));
 
         // A batch's piped stdin, when this stage has no other value and a required
         // argument is left for it (ledger #1166).
-        let stdin = if incoming.is_none() && positional.is_empty() && stdin_waiting {
+        let stdin = if incoming.is_none() && positional.is_none() && stdin_waiting {
             self.stdin_for_the_required_argument(&iri, description.as_ref(), &names)
         } else {
             None
@@ -2295,16 +2295,16 @@ impl Engine {
         // The value to route comes from the pipe xor the positional text — never
         // both (a piped stage's input is the pipe, so a literal has nowhere else
         // to go).
-        let value: Option<&[u8]> = match (incoming, positional.is_empty()) {
-            (Some(_), false) => {
+        let value: Option<&[u8]> = match (incoming, positional.as_deref()) {
+            (Some(_), Some(_)) => {
                 return Err(format!(
                     "`{}` takes its input from the pipe — drop the literal input",
                     iri.as_str()
                 ))
             }
-            (Some(value), true) => Some(value),
-            (None, false) => Some(positional.as_bytes()),
-            (None, true) => stdin.as_deref(),
+            (Some(value), None) => Some(value),
+            (None, Some(value)) => Some(value.as_bytes()),
+            (None, None) => stdin.as_deref(),
         };
 
         let mut request = Request::new(Verb::Source, iri.clone());
@@ -8374,6 +8374,43 @@ mod tests {
         let greet = greet_engine();
         output(greet.eval("source urn:test:upper world | urn:demo:greet greeting=Hi")).unwrap();
         assert!(greet.last_contract_notes().is_empty());
+    }
+
+    #[test]
+    fn an_empty_quoted_source_argument_is_a_value() {
+        let engine = greet_engine();
+        assert_eq!(
+            output(engine.eval(r#"source urn:demo:greet greeting=Hi name="""#)).unwrap(),
+            "Hi, "
+        );
+        engine.set_piped_input(b"stdin".to_vec());
+        assert_eq!(
+            output(engine.eval(r#"source urn:demo:greet greeting=Hi """#)).unwrap(),
+            "Hi, "
+        );
+        assert_eq!(
+            output(engine.eval("source urn:demo:greet greeting=Hi")).unwrap(),
+            "Hi, stdin"
+        );
+    }
+
+    #[test]
+    fn an_empty_quoted_source_argument_conflicts_with_a_pipe() {
+        let err = output(
+            greet_engine().eval(r#"source urn:test:upper world | urn:demo:greet greeting=Hi """#),
+        )
+        .unwrap_err();
+        assert!(err.contains("drop the literal input"), "{err}");
+    }
+
+    #[test]
+    fn a_plan_records_an_empty_quoted_source_argument() {
+        let engine = greet_engine();
+        let positional = output(engine.eval(r#"plan urn:demo:greet greeting=Hi """#)).unwrap();
+        assert!(
+            positional.contains("ik:inputName \"name\" ;\n    ik:value \"\" ."),
+            "{positional}"
+        );
     }
 
     #[test]
