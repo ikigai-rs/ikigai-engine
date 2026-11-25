@@ -249,7 +249,7 @@ async fn plan_text(inv: &Invocation<'_>) -> Result<String> {
 
 /// The requested face of a report: `text/plain` unless `as` says `text/turtle`.
 fn report_face(inv: &Invocation<'_>, endpoint: &str) -> Result<bool> {
-    match inv.inline_str("as").ok().map(media_type_essence).as_deref() {
+    match inv.optional_str("as")?.map(media_type_essence).as_deref() {
         None | Some(TEXT) => Ok(false),
         Some(TURTLE) => Ok(true),
         Some(other) => Err(Error::InvalidArgument {
@@ -653,6 +653,8 @@ async fn validate_face(inv: &Invocation<'_>) -> Result<Representation> {
 // --- evaluation ------------------------------------------------------------------
 
 async fn eval(inv: &Invocation<'_>) -> Result<Representation> {
+    // Refuse unreadable arguments before a plan can run any steps, including writes.
+    let wanted = inv.optional_str("as")?.map(str::trim);
     let source = plan_text(inv).await?;
     let validation = validate(inv, &source).await?;
     if !validation.conforms() {
@@ -701,7 +703,7 @@ async fn eval(inv: &Invocation<'_>) -> Result<Representation> {
         .clone()
         .unwrap_or_else(|| ReprType::new(TEXT).with_param("charset", "utf-8"));
     let answer = Representation::new(media, staged.bytes).cacheable();
-    let Some(wanted) = inv.inline_str("as").ok().map(str::trim) else {
+    let Some(wanted) = wanted else {
         return Ok(answer);
     };
     let served = answer.repr_type.media_type.clone();
@@ -1004,4 +1006,44 @@ fn requires_turtle(plan: &Plan, steps: &[Needs]) -> String {
         out.push_str(" .\n");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+    use ikigai_core::{Bindings, Capability, ContentId, Endpoint};
+
+    fn assert_bad_faces(target: &str, endpoint: AsyncFnEndpoint) {
+        // Exercise the endpoint directly because kernel contract handling may resolve
+        // by-value references or reject a value before the endpoint reads it.
+        let bindings = Bindings::new();
+        let cap = Capability::root();
+        for (arg, reason) in [
+            (ArgRef::Inline(vec![0xff]), "UTF-8"),
+            (ArgRef::Reference(Iri::parse("urn:face").unwrap()), "inline"),
+            (ArgRef::Content(ContentId::of(b"text/plain")), "inline"),
+            (ArgRef::Inline(Vec::new()), "not a face"),
+        ] {
+            let request =
+                Request::new(Verb::Source, Iri::parse(target).unwrap()).with_arg("as", arg);
+            let inv = Invocation::detached(&request, &bindings, &cap);
+            let error = block_on(endpoint.invoke(&inv)).unwrap_err();
+            assert!(
+                matches!(&error, Error::InvalidArgument { name, detail }
+                    if name == "as" && detail.contains(reason)),
+                "{target}: expected a refusal of as explaining {reason}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_refuses_invalid_report_faces() {
+        assert_bad_faces(VALIDATE, validate_endpoint());
+    }
+
+    #[test]
+    fn requires_refuses_invalid_report_faces() {
+        assert_bad_faces(REQUIRES, requires_endpoint());
+    }
 }

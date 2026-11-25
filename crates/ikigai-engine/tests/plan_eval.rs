@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 
 use futures::executor::block_on;
 use ikigai_core::{
-    ArgRef, ArgSpec, Capability, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation,
-    Iri, Kernel, MetaRenderer, ReprType, Representation, Request, Verb,
+    ArgRef, ArgSpec, Capability, ContentId, Description, EndpointSpace, Error, Exact, FnEndpoint,
+    Invocation, Iri, Kernel, MetaRenderer, ReprType, Representation, Request, Verb,
 };
 use ikigai_engine::{Action, Engine};
 
@@ -610,6 +610,41 @@ fn a_pure_plan_is_cached_and_a_writing_one_is_not() {
         w.drain().iter().any(|line| line.starts_with("Sink ")),
         "a plan that writes runs again"
     );
+}
+
+#[test]
+fn eval_refuses_unreadable_faces_before_running_the_plan() {
+    let w = world();
+    let request = Request::new(Verb::Source, Iri::parse("urn:plan:eval").unwrap()).with_arg(
+        "in",
+        ArgRef::Inline(fixture("plan-linkcheck-strict").into_bytes()),
+    );
+    for (arg, reason) in [
+        (ArgRef::Inline(vec![0xff]), "UTF-8"),
+        (ArgRef::Content(ContentId::of(b"text/plain")), "inline"),
+    ] {
+        let error = block_on(
+            w.kernel
+                .issue(request.clone().with_arg("as", arg), &Capability::root()),
+        )
+        .expect_err("an unreadable face must not select the default");
+        assert!(
+            matches!(&error, Error::InvalidArgument { name, detail }
+                if name == "as" && detail.contains(reason)),
+            "{error}"
+        );
+        assert!(w.drain().is_empty(), "the plan must not run");
+    }
+}
+
+#[test]
+fn report_endpoints_default_to_plain_text_without_a_face() {
+    let w = world();
+    let plan = fixture("plan-linkcheck-strict");
+    for endpoint in ["urn:plan:validate", "urn:plan:requires"] {
+        let report = w.issue(endpoint, &plan, &[], &Capability::root()).unwrap();
+        assert_eq!(report.repr_type.media_type, "text/plain", "{endpoint}");
+    }
 }
 
 #[test]
