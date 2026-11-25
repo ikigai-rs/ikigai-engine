@@ -1202,22 +1202,6 @@ fn quarantine(root: &Root, space: &str, id: &str, claimed: &Rel, unfit: Unfit) -
     }
 }
 
-/// An optional inline string argument: `None` when it is absent, an error when it is present
-/// but unusable (not inline, or not UTF-8).
-///
-/// ⚠ Every selector goes through this rather than `inline_str(..).ok()`, because folding
-/// "present but unreadable" into "absent" changes what a request MEANS: a `tuple=` that is not
-/// UTF-8 read as no `tuple=`, and on take that is the no-selector work-queue pop, so a caller
-/// naming one tuple consumed another; a non-UTF-8 `state=` silently read the inbox (audit
-/// round 5, ledger #877).
-fn opt_str<'a>(inv: &'a Invocation<'_>, name: &str) -> Result<Option<&'a str>> {
-    match inv.inline_str(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(Error::MissingArgument(_)) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
 /// The tuple a take names, from `tuple=` or from `content` — or `None` for a take by
 /// `match=` or a work-queue pop.
 ///
@@ -1230,17 +1214,16 @@ fn opt_str<'a>(inv: &'a Invocation<'_>, name: &str) -> Result<Option<&'a str>> {
 /// whitespace is trimmed because a piped value keeps its trailing newline. Both forms naming
 /// DIFFERENT tuples is refused rather than resolved by picking one.
 fn take_id<'a>(inv: &'a Invocation<'_>) -> Result<Option<&'a str>> {
-    let named = opt_str(inv, "tuple")?;
-    let piped = match inv.inline_arg("content") {
-        Ok(bytes) => {
+    let named = inv.optional_str("tuple")?;
+    let piped = match inv.optional_arg("content")? {
+        Some(bytes) => {
             let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidArgument {
                 name: "content".to_string(),
                 detail: "a tuple id to take is not valid UTF-8".to_string(),
             })?;
             Some(text.trim()).filter(|id| !id.is_empty())
         }
-        Err(Error::MissingArgument(_)) => None,
-        Err(e) => return Err(e),
+        None => None,
     };
     match (named, piped) {
         (Some(a), Some(b)) if a != b => Err(Error::InvalidArgument {
@@ -1499,7 +1482,7 @@ impl SpaceEndpoint {
                 // lapsed — which says "not now", not "this tuple is poison". Before this,
                 // recovery meant knowing the on-disk layout and doing it by hand with `mv`,
                 // which is not something a system should ask of the person it just failed.
-                if let Some(id) = opt_str(inv, "retry")? {
+                if let Some(id) = inv.optional_str("retry")? {
                     // ★ Re-arming is the OPERATOR's call, so it needs more than the drop
                     // authority the Sink declares (ledger #887): a dead letter can be one the
                     // reactor parked on purpose (an interrupted pass it refused to run twice, a
@@ -1559,8 +1542,8 @@ impl SpaceEndpoint {
                     ));
                 }
                 let content = inv
-                    .inline_arg("content")
-                    .map_err(|_| Error::MissingArgument("content".to_string()))?;
+                    .optional_arg("content")?
+                    .ok_or_else(|| Error::MissingArgument("content".to_string()))?;
                 // The PLAINTEXT is bounded, since that is what every `match=` parses.
                 check_tuple_nesting(content)?;
                 let stored = self
@@ -1597,7 +1580,7 @@ impl SpaceEndpoint {
                 self.requeue_stale_claims(name);
                 // `state=` selects which stage of the machine to read: the live `inbox`
                 // (default), or the reactor's `outbox` (handled) / `error` (dead-letter).
-                let dir = self.state_dir(name, opt_str(inv, "state")?.unwrap_or("inbox"))?;
+                let dir = self.state_dir(name, inv.optional_str("state")?.unwrap_or("inbox"))?;
                 // A stage's tuples by id, and the file each is in: `<id>.tuple`, except in
                 // `.processing/`, where a pass's claim has a name of its own ([`list_claims`]).
                 let in_flight = dir.last() == Some(std::ffi::OsStr::new(PROCESSING_DIR));
@@ -1615,7 +1598,7 @@ impl SpaceEndpoint {
                     claims.sort_by(|a, b| a.0.cmp(&b.0));
                     claims
                 };
-                if let Some(id) = opt_str(inv, "tuple")? {
+                if let Some(id) = inv.optional_str("tuple")? {
                     if !is_tuple_id(id) {
                         return Err(Error::InvalidArgument {
                             name: "tuple".to_string(),
@@ -1645,7 +1628,7 @@ impl SpaceEndpoint {
                         ReprType::new("application/octet-stream"),
                         decode(self.codec.as_ref(), name, id, &bytes)?,
                     ))
-                } else if let Some(query) = opt_str(inv, "match")? {
+                } else if let Some(query) = inv.optional_str("match")? {
                     // Associative rd: the ids of tuples whose graph satisfies the ASK, the
                     // whole scan within the time budget (ledger #1327), decoding included: a
                     // template matches the PLAINTEXT, and a tuple that does not decode refuses
@@ -1740,7 +1723,7 @@ impl SpaceEndpoint {
                         bytes,
                     ))
                 };
-                let Some(query) = opt_str(inv, "match")? else {
+                let Some(query) = inv.optional_str("match")? else {
                     for id in Self::list_ids(&self.root, &inbox) {
                         // Lost the race, or a file that is not its tuple (now in `error/`): next.
                         if let Claim::Taken(bytes) = self.claim(name, &id)? {
@@ -3133,6 +3116,36 @@ mod tests {
 
     fn iri(s: &str) -> Iri {
         Iri::parse(s).unwrap()
+    }
+
+    #[test]
+    fn drop_requires_inline_content_unless_retrying() {
+        let endpoint = SpaceEndpoint::new(test_root("drop-inline-content"));
+        let mut bindings = Bindings::new();
+        bindings.insert("name", "q");
+        let cap = Capability::root();
+        let request = Request::new(Verb::Sink, iri("urn:space:q"));
+        let drop = |request| {
+            let inv = Invocation::detached(&request, &bindings, &cap);
+            block_on(endpoint.invoke(&inv))
+        };
+        assert!(matches!(
+            drop(request.clone()),
+            Err(Error::MissingArgument(name)) if name == "content"
+        ));
+        for arg in [
+            ArgRef::Reference(iri("urn:tuple")),
+            ArgRef::Content(ikigai_core::ContentId::of(b"tuple")),
+        ] {
+            let error = drop(request.clone().with_arg("content", arg)).unwrap_err();
+            assert!(
+                matches!(&error, Error::InvalidArgument { name, detail }
+                    if name == "content" && detail.contains("inline")),
+                "{error}"
+            );
+        }
+        // A drop reads bytes, so non-UTF-8 inline data is still a valid tuple.
+        assert!(drop(request.with_arg("content", ArgRef::Inline(vec![0xff]))).is_ok());
     }
 
     /// Drop a tuple into a space, returning its id.
